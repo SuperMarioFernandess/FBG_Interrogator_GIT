@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core:
+    name: Ядро (без Qt)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Установка зависимостей ядра
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pytest pytest-cov ruff
+
+      - name: Проверка стиля
+        run: ruff check fbg tests
+
+      - name: Проверка форматирования
+        run: ruff format --check fbg tests
+
+      - name: Тесты ядра
+        run: pytest tests -m "not ui and not slow" -q --cov=fbg --cov-report=term-missing
+
+  load:
+    name: Нагрузочный тест 2 кГц
+    runs-on: ubuntu-latest
+    needs: core
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pytest
+
+      - name: Симулятор 2000 кадров/с на loopback
+        run: pytest tests -m slow -q

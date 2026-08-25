@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Данные прибора — не в репозиторий
+data/
+captures/
+*.pcapng
+*.pcap
+logs/
+*.log
+
+# Настройки рабочей машины
+config.local.json
+settings.json
+
+# IDE
+.idea/
+.vscode/

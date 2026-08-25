@@ -1,0 +1,51 @@
+[project]
+name = "fbg-interrogator"
+version = "0.1.0"
+description = "Управление интеррогатором FBG-Interrogator GC-97001C-03-01-A-F"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "PySide6>=6.7",
+    "pyqtgraph>=0.13",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+    "ruff",
+    "pyinstaller",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["fbg*"]
+
+# --- Стиль: см. KB_05_conventions.md ---
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
+ignore = [
+    "RUF001",  # кириллица в строках — у нас интерфейс русский
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+# --- Тесты ---
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "ui: требует Qt, в CI ядра не запускается",
+    "slow: нагрузочные тесты, отдельная job",
+    "device: требует физического прибора, вручную",
+]
+addopts = "-ra --strict-markers"
