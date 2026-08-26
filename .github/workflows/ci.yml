@@ -54,4 +54,12 @@ jobs:
           pip install numpy pytest
 
       - name: Симулятор 2000 кадров/с на loopback
-        run: pytest tests -m slow -q
+        run: |
+          set +e
+          pytest tests -m slow -q
+          code=$?
+          if [ $code -eq 5 ]; then
+            echo "::notice::Нагрузочных тестов пока нет — симулятор появится в чате №2"
+            exit 0
+          fi
+          exit $code
