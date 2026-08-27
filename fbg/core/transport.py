@@ -110,6 +110,49 @@ class _Counters:
     icmp_resets: int = 0
 
 
+def _disable_udp_conn_reset_windows(fileno: int) -> bool:  # pragma: no cover — только Windows
+    """Зовёт `WSAIoctl(SIO_UDP_CONNRESET, FALSE)` для дескриптора сокета.
+
+    Через `ctypes`, а не через `socket.ioctl`: последний поддерживает ровно три
+    кода — `SIO_RCVALL`, `SIO_KEEPALIVE_VALS` и `SIO_LOOPBACK_FAST_PATH`, —
+    а на любом другом бросает `ValueError` (CPython, `Modules/socketmodule.c`,
+    ветка `default` в `sock_ioctl`). `SIO_UDP_CONNRESET` в этот список
+    не входит, поэтому единственный путь — системный вызов напрямую.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    socket_t = ctypes.c_uint64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_uint32
+    ws2 = ctypes.WinDLL("ws2_32", use_last_error=True)
+    wsa_ioctl = ws2.WSAIoctl
+    wsa_ioctl.restype = ctypes.c_int
+    wsa_ioctl.argtypes = [
+        socket_t,  # дескриптор сокета
+        wintypes.DWORD,  # код управления
+        ctypes.c_void_p,  # входной буфер
+        wintypes.DWORD,  # его размер
+        ctypes.c_void_p,  # выходной буфер
+        wintypes.DWORD,  # его размер
+        ctypes.POINTER(wintypes.DWORD),  # сколько байт возвращено
+        ctypes.c_void_p,  # OVERLAPPED
+        ctypes.c_void_p,  # completion routine
+    ]
+    disable = wintypes.BOOL(0)
+    returned = wintypes.DWORD(0)
+    result = wsa_ioctl(
+        socket_t(fileno),
+        SIO_UDP_CONNRESET,
+        ctypes.byref(disable),
+        ctypes.sizeof(disable),
+        None,
+        0,
+        ctypes.byref(returned),
+        None,
+        None,
+    )
+    return result == 0
+
+
 def disable_udp_conn_reset(sock: socket.socket) -> bool:
     """Отключает WSAECONNRESET на UDP-сокете. Возвращает True, если применилось.
 
@@ -118,16 +161,19 @@ def disable_udp_conn_reset(sock: socket.socket) -> bool:
     `recvfrom` — то есть приёмный поток умирает от ошибки, не относящейся
     к принимаемым данным. Лечится `SIO_UDP_CONNRESET` со значением False.
 
-    На остальных платформах делать нечего: `socket.ioctl` там отсутствует,
-    и функция возвращает False, ничего не трогая.
+    На остальных платформах делать нечего, и функция возвращает False,
+    ничего не трогая.
+
+    Неудача не считается фатальной: приёмный цикл ловит `ConnectionResetError`
+    отдельной веткой и продолжает работу. Этот вызов лишь убирает лишние
+    прерывания приёма, а не является единственной защитой от них.
     """
     if sys.platform != "win32":
         return False
     try:  # pragma: no cover — ветка исполняется только на Windows
-        sock.ioctl(SIO_UDP_CONNRESET, False)
-    except OSError:
+        return _disable_udp_conn_reset_windows(sock.fileno())
+    except (OSError, ValueError, AttributeError):
         return False
-    return True
 
 
 class UdpTransport:
@@ -186,7 +232,10 @@ class UdpTransport:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, endpoint.rcvbuf_bytes)
             sock.settimeout(endpoint.rx_poll_timeout_s)
             sock.bind(endpoint.bind_address)
-        except OSError:
+        except BaseException:
+            # Ловится не только OSError: платформенная ветка выше однажды уже
+            # бросила ValueError, и дескриптор не должен утекать ни при какой
+            # ошибке — исключение уходит наверх нетронутым.
             sock.close()
             raise
         self._rcvbuf_actual = int(sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))

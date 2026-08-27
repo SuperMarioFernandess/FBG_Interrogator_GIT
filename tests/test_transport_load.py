@@ -133,8 +133,7 @@ def _run(sink: LoadSink, seconds: float, rate_hz: int) -> Rig:
         # Долёт последних датаграмм и разбор очереди: иначе потери мнимые.
         time.sleep(1.0)
     finally:
-        rig.transport.close()
-        rig.sim.stop()
+        rig.close()
     return rig
 
 
