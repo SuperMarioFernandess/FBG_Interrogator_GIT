@@ -62,6 +62,14 @@ recorder занят, кадры копятся в кольце (10 секунд 
 процесса теряется хвост буфера: последняя строка может оказаться недописанной,
 все предыдущие целы.
 
+Кодировка
+---------
+Файл чисто ASCII, включая шапку. Не украшение: `numpy.genfromtxt` открывает
+файл в текстовом режиме с **локальной кодировкой ОС**, и на Windows это
+cp1252 — русский текст в шапке ронял бы наивную постобработку на целевой
+платформе. Поэтому пояснения в шапке английские, а поля конфигурации,
+попадающие в файл, проверяются на ASCII при создании `RecorderConfig`.
+
 Ошибка записи (диск заполнен, папка исчезла) останавливает **только запись**:
 recorder закрывает файл, запоминает причину в `RecorderStats.error`, зовёт
 `on_error` и завершает свой поток. Приём данных при этом не трогается — он
@@ -184,6 +192,19 @@ class RecorderConfig:
             raise ValueError(f"chunk_frames={self.chunk_frames} должен быть ≥ 1")
         if not self.prefix:
             raise ValueError("prefix не может быть пустым")
+        # Файл обязан остаться чисто ASCII, иначе `numpy.genfromtxt` не прочтёт
+        # его на Windows: он открывает файл в кодировке ОС, а не в UTF-8.
+        for name, text in (
+            ("app_version", self.app_version),
+            ("device_model", self.device_model),
+            ("firmware", self.firmware),
+            ("prefix", self.prefix),
+        ):
+            if text is not None and not text.isascii():
+                raise ValueError(
+                    f"{name}={text!r} содержит не-ASCII: файл данных обязан остаться "
+                    "чисто ASCII, иначе numpy.genfromtxt не прочтёт его на Windows"
+                )
 
 
 @dataclass(frozen=True)
@@ -285,11 +306,11 @@ def build_header(
         f"freq_divisor={divisor} decimation={config.decimation}",
         f"t_wall_start={t_wall_start.isoformat()}",
         f"t_wall_file={t_wall_file.isoformat()} file_part={part}",
-        "t_mono — perf_counter, с от старта процесса; t_wall — Unix epoch, с (UTC)",
-        "длина волны сырая, нм, без калибровки; nan — пик не найден",
-        f"frame_no — сквозной номер кадра прибора от старта записи, шаг {config.decimation}",
-        "шаг frame_no, равный decimation, — сознательный пропуск, потерей он не является;",
-        "скачок сверх шага и строка «# GAP frames=…» — потеря кадров",
+        "t_mono=perf_counter_seconds t_wall=unix_epoch_seconds_utc",
+        "wavelength=raw_nm uncalibrated nan=peak_not_found",
+        f"frame_no=device_frame_index_since_recording_start step={config.decimation}",
+        "a frame_no step equal to decimation is an intentional skip, not a loss;",
+        'a larger step and a "# GAP frames=..." line mean lost frames',
     ]
     comments = "".join(f"# {line}\n" for line in lines)
     return SEPARATOR.join(columns) + "\n" + comments
@@ -593,7 +614,13 @@ class Recorder:
     def _write(self, text: str) -> None:
         """Отдаёт текст файлу одним вызовом и учитывает объём."""
         assert self._file is not None
-        payload = text.encode("utf-8")
+        # Строго ASCII: `numpy.genfromtxt` открывает файл в текстовом режиме
+        # с локальной кодировкой ОС, и на Windows это cp1252. Кириллица
+        # в шапке роняла бы наивную постобработку на целевой платформе —
+        # ровно то, ради чего формат и выбирался. Проверка полей конфигурации
+        # стоит в `RecorderConfig.__post_init__`, поэтому `strict` здесь
+        # недостижим, а не задавлен.
+        payload = text.encode("ascii")
         self._file.write(payload)
         self._file_bytes += len(payload)
         self._bytes += len(payload)

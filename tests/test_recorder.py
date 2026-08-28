@@ -73,13 +73,13 @@ def feed(pipeline: Pipeline, frames: int, *, start_s: float, rate_hz: float = 20
 
 def data_lines(path: Path) -> list[str]:
     """Строки данных файла: без имён колонок и без комментариев."""
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = path.read_text(encoding="ascii").splitlines()
     return [line for line in lines[1:] if line and not line.startswith("#")]
 
 
 def comment_lines(path: Path) -> list[str]:
     """Строки-комментарии файла."""
-    return [line for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("#")]
+    return [line for line in path.read_text(encoding="ascii").splitlines() if line.startswith("#")]
 
 
 def gap_lines(path: Path) -> list[str]:
@@ -167,6 +167,40 @@ def test_шаблон_строки_совпадает_по_числу_полей
 # --------------------------------------------------------------------------------------
 
 
+def test_файл_целиком_ascii(pipeline: Pipeline, tmp_path: Path) -> None:
+    """Ни одного не-ASCII байта, включая шапку.
+
+    Охранник, а не придирка: `numpy.genfromtxt` открывает файл в текстовом
+    режиме с локальной кодировкой ОС, и на Windows — целевой платформе
+    приложения — это cp1252. Русские пояснения в шапке роняли бы наивную
+    постобработку с `UnicodeDecodeError`, то есть ровно то, ради чего
+    комментарии и выбраны форматом отметки разрыва. Тест нашёл это в CI
+    чата №7 и оставлен, чтобы следующая правка шапки не вернула проблему.
+    """
+    recorder = recorder_for(pipeline, tmp_path, serial=94401220, firmware="4.10")
+    recorder.open()
+    feed(pipeline, 5, start_s=0.0)
+    recorder.pump()
+    recorder.close()
+
+    raw = (recorder.path or tmp_path).read_bytes()
+    assert raw.isascii(), "файл данных обязан быть чисто ASCII"
+    # Та же проверка снаружи: файл читается любой однобайтовой кодировкой.
+    assert raw.decode("cp1252").startswith("frame_no;")
+
+
+def test_нельзя_положить_в_шапку_не_ascii(tmp_path: Path) -> None:
+    """Поля конфигурации, попадающие в файл, проверяются на ASCII при создании."""
+    for field, value in (
+        ("device_model", "прибор"),
+        ("firmware", "версия"),
+        ("app_version", "нулевая"),
+        ("prefix", "данные"),
+    ):
+        with pytest.raises(ValueError, match="ASCII"):
+            RecorderConfig(directory=tmp_path, **{field: value})  # type: ignore[arg-type]
+
+
 def test_шапка_содержит_все_поля(pipeline: Pipeline, tmp_path: Path) -> None:
     """Шапка делает файл самодостаточным: прибор, развёртка, единицы, децимация."""
     recorder = recorder_for(
@@ -196,6 +230,10 @@ def test_шапка_содержит_все_поля(pipeline: Pipeline, tmp_pat
         "t_wall_start=",
         "t_wall_file=",
         "file_part=1",
+        "frame_no=device_frame_index_since_recording_start step=5",
+        "t_wall=unix_epoch_seconds_utc",
+        "nan=peak_not_found",
+        "# GAP frames=...",
     ):
         assert token in text, f"в шапке нет «{token}»"
 
@@ -227,7 +265,7 @@ def test_шапка_повторяется_после_ротации(pipeline: P
         assert "fbg-interrogator" in text
         assert "sweep_speed_hz=2000" in text
         assert f"file_part={index}" in text
-        assert path.read_text(encoding="utf-8").splitlines()[0].startswith("frame_no;t_mono;")
+        assert path.read_text(encoding="ascii").splitlines()[0].startswith("frame_no;t_mono;")
 
 
 # --------------------------------------------------------------------------------------
@@ -446,7 +484,7 @@ def test_ограничение_числа_датчиков_отмечено_в_
     recorder.pump()
     recorder.close()
 
-    names = (recorder.path or tmp_path).read_text(encoding="utf-8").splitlines()[0].split(";")
+    names = (recorder.path or tmp_path).read_text(encoding="ascii").splitlines()[0].split(";")
     assert len(names) == 3 + 4 * 4 + 4
     assert "ch1_fbg4_nm" in names
     assert "ch1_fbg5_nm" not in names
@@ -652,7 +690,7 @@ def test_обрыв_на_середине_строки_портит_только
     truncated = tmp_path / "truncated.csv"
     truncated.write_bytes(raw[: len(raw) - 500])
 
-    lines = truncated.read_text(encoding="utf-8").splitlines()
+    lines = truncated.read_text(encoding="ascii").splitlines()
     rows = [line for line in lines[1:] if line and not line.startswith("#")]
     width = len(column_names(4, 30))
     assert all(len(row.split(";")) == width for row in rows[:-1]), "середина обязана быть цела"
