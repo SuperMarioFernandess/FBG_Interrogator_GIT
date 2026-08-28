@@ -6,15 +6,19 @@
 согласованность кодека с самим собой, и общая ошибка в понимании протокола
 осталась бы невидимой.
 
-⚠️ Тесты фиксируют **поведение симулятора**, а не факты о приборе. Раскладка
-кадра телеметрии (N4), единицы частоты (D1), код «пик не найден» (N3),
-раскладка тела ответа 30 03 (N14) и реакция на недопустимый аргумент (N10)
-остаются открытыми вопросами: захватов нет, KB_06 пуст.
+⚠️ Тесты фиксируют **поведение симулятора**, а не факты о приборе. После
+скрининга 27.08.2026 часть воспроизводимого поведения стала наблюдённой —
+раскладка кадра (N4), единицы частоты (D1), код «пик не найден» (N3),
+раскладка `30 03` и два ответа на одну команду (N14), ориентация массива
+АЦП (D9). Открытыми остаются реакция на мусор и на недопустимый аргумент
+(N10) и знаковость температуры (N2b): здесь симулятор по-прежнему
+воспроизводит выбранное нами поведение, а не наблюдённое.
 """
 
 import socket
 import time
 from collections.abc import Iterator
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -243,8 +247,10 @@ def test_10_05_параметры_развёртки(harness: Harness) -> None:
     sweep = codec.parse_sweep_params(reply, harness.sim.profile).unwrap()
     assert (sweep.start_param, sweep.step_param) == (1, 2)
     assert (sweep.stop_param, sweep.adc_step_param) == (5101, 2)
-    assert sweep.start_ghz == 196250
-    assert sweep.stop_ghz == 191150
+    # База развёртки 196250 (D8): заводские параметры 1 / 5101 дают 196249 / 191149,
+    # а круглые границы получаются при параметрах 0 / 5100.
+    assert sweep.start_ghz == 196249
+    assert sweep.stop_ghz == 191149
     assert sweep.adc_points == 2551
 
 
@@ -453,25 +459,67 @@ def test_30_07_молчит_на_несуществующий_канал(harness
     assert harness.ask(bytes([0x30, 0x07, 0x06, 0x00, 0x00, 0x05]), timeout=0.5) is None
 
 
-def test_30_03_отладка_однократна(harness: Harness, profile: DeviceProfile) -> None:
-    """Отладка отдаёт один ответ и не переводит прибор в поток.
+def test_30_03_порождает_два_ответа(harness: Harness, profile: DeviceProfile) -> None:
+    """✅ N14: сначала отдельная датаграмма 30 02, затем сам ответ 30 03.
 
-    🔴 Раскладка тела — открытый вопрос N14. Здесь проверяется только то,
-    что заголовок цел и разбирается кодеком, а тело отдаётся сырым.
-    Размер тела сверяется с оценкой KB_01 как признак вменяемости гипотезы,
-    но раскладкой это не является.
+    Скрининг показал, что кадр телеметрии в тело `30 03` не входит и приходит
+    непосредственно перед ним. Симулятор это воспроизводит, и порядок здесь
+    часть проверки: сессия обязана пережить незапрошенный `30 02`.
     """
-    reply = harness.ask(codec.build_debug_once())
-    assert reply is not None
-    debug = codec.parse_debug_once(reply, profile).unwrap()
+    harness.send(codec.build_debug_once())
 
-    expected = profile.frame_size + profile.channels * profile.adc_points * 2
-    assert len(debug.payload) == expected == 20902
+    first = harness.receive()
+    second = harness.receive()
+    assert first is not None and second is not None
+
+    assert codec.classify(first) == (codec.ID_MODE, codec.FC_STREAM)
+    assert len(first) == profile.frame_size
+    assert codec.parse_measurement(first, profile).ok
+
+    assert codec.classify(second) == (codec.ID_MODE, codec.FC_DEBUG)
+    assert len(second) == 20430
+    assert int.from_bytes(second[2:6], "big") == 0x00004FCE
 
     time.sleep(0.2)
     assert not harness.sim.streaming
     assert harness.sim.sim_state is SimState.IDLE
     assert SimState.DEBUG in harness.sim.state_history
+
+
+def test_30_03_тело_раскладывается_на_блоки_каналов(
+    harness: Harness, profile: DeviceProfile
+) -> None:
+    """✅ N14: [Канал(2) Усиление(2) ADC(2)×2551] × 4, частот в теле нет."""
+    harness.send(codec.build_debug_once())
+    harness.receive()  # кадр телеметрии 30 02
+    reply = harness.receive()
+    assert reply is not None
+
+    debug = codec.parse_debug_once(reply, profile).unwrap()
+    assert debug.channels == profile.channels
+    for index, block in enumerate(debug.blocks):
+        assert block.channel == index
+        assert block.points == profile.adc_points
+    # Канал 1 несёт решётки сцены, поэтому его спектр заметно выше полки.
+    assert debug.blocks[0].adc.max() > debug.blocks[3].adc.max() * 5
+
+
+def test_30_03_отдаёт_тот_же_спектр_что_и_30_07(harness: Harness, profile: DeviceProfile) -> None:
+    """Блок канала в 30 03 и ответ 30 07 — одна и та же раскладка блока.
+
+    Совпадают заголовок блока и число отсчётов; сами значения различаются,
+    потому что сцена шумит от вызова к вызову.
+    """
+    harness.send(codec.build_debug_once())
+    harness.receive()
+    debug = codec.parse_debug_once(harness.receive() or b"", profile).unwrap()
+    raw = codec.parse_raw_adc(
+        harness.ask(codec.build_read_raw_adc(1, profile)) or b"", profile
+    ).unwrap()
+
+    assert debug.blocks[1].channel == raw.channel == 1
+    assert debug.blocks[1].gain == raw.gain
+    assert debug.blocks[1].points == raw.points
 
 
 def test_неизвестная_команда_остаётся_без_ответа(harness: Harness) -> None:
@@ -543,6 +591,11 @@ def test_обе_гипотезы_единиц_частоты(
 
     Допуск разный не случайно: гипотеза A квантует поле шагом 8 пм,
     гипотеза B — 0.8 пм. Это и есть довод в пользу B из KB_01.
+
+    Разбор идёт профилем со **снятым** делителем: после скрининга умолчание
+    равно 10, и при нём гипотеза A не проверялась бы вовсе — кадр не прошёл бы
+    валидацию по диапазону. Автодетект остаётся страховкой на случай прибора
+    с другой прошивкой, и проверять его надо явно.
     """
     scene = Scene(profile, [Grating(0, 0, 1550.0)], divisor=divisor, jitter_pm=0.0)
     inbox = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -561,7 +614,8 @@ def test_обе_гипотезы_единиц_частоты(
         harness.send(codec.build_stop())
         assert frame is not None
 
-        measurement = codec.parse_measurement(frame, profile).unwrap()
+        autodetect = replace(profile, freq_divisor=None)
+        measurement = codec.parse_measurement(frame, autodetect).unwrap()
         assert measurement.freq_divisor == divisor
         assert measurement.wavelength_nm()[0, 0] == pytest.approx(1550.0, abs=tolerance_nm)
     finally:
@@ -1009,3 +1063,49 @@ def test_симулятор_не_тянет_qt() -> None:
     import sys
 
     assert "PySide6" not in sys.modules
+
+
+# ======================================================================================
+# Недокументированная команда 10 02 (N17) и ориентация спектра (D9)
+# ======================================================================================
+
+
+def test_10_02_недокументированная_команда(harness: Harness) -> None:
+    """✅ Симулятор отдаёт ровно те байты, что пришли с прибора (N17).
+
+    Смысл полей неизвестен, вычислять их не из чего, поэтому это литерал
+    из захвата. Команду мы не используем ни в опросе, ни в watchdog.
+    """
+    reply = harness.ask(codec.build_read_undocumented())
+    assert reply is not None
+    assert reply == bytes.fromhex("10020014" + "05DC0A80" + "0000" * 6)
+
+    response = codec.parse_undocumented(reply).unwrap()
+    assert response.words[:2] == (1500, 2688)
+
+
+def test_спектр_ориентирован_от_stop_к_start(profile: DeviceProfile) -> None:
+    """✅ D9: индекс 0 — нижняя частота, длина волны убывает с индексом.
+
+    Решётка ставится ближе к длинноволновому краю развёртки; её пик обязан
+    оказаться в первой половине массива. До скрининга ось шла в обратную
+    сторону, и этот же пик попал бы во вторую половину.
+    """
+    scene = Scene(profile, [Grating(0, 0, 1565.0)], jitter_pm=0.0)
+    axis = scene.freq_axis_ghz()
+
+    assert axis[0] == profile.stop_ghz
+    assert axis[-1] == profile.start_ghz
+    assert C_NM_GHZ / axis[0] > C_NM_GHZ / axis[-1]
+
+    peak_index = int(np.argmax(scene.spectrum(0, 5)))
+    assert peak_index < profile.adc_points // 2
+    assert profile.adc_index_to_nm(peak_index) == pytest.approx(1565.0, abs=0.02)
+
+
+def test_позиция_пика_согласована_с_профилем(profile: DeviceProfile) -> None:
+    """Пересчёт индекса в профиле и ось сцены описывают одно и то же."""
+    scene = Scene(profile, [Grating(0, 0, 1550.0)], jitter_pm=0.0)
+    peak_index = int(np.argmax(scene.spectrum(0, 5)))
+    expected = profile.ghz_to_adc_index(C_NM_GHZ / 1550.0)
+    assert peak_index == pytest.approx(expected, abs=1.0)

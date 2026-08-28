@@ -1,4 +1,4 @@
-"""Симулятор интеррогатора: UDP-сервер, отвечающий на все 14 команд протокола.
+"""Симулятор интеррогатора: UDP-сервер, отвечающий на все 15 команд протокола.
 
 Симулятор — не ядро: ему разрешены сокеты, потоки и часы. `fbg.core` он
 не импортирует ничего, кроме `DeviceProfile`, и ничего в нём не меняет.
@@ -11,12 +11,15 @@
   * прибор отвечает на **жёстко прописанный** адрес назначения, а не на
     source-порт запроса (KB_01, раздел «Сеть») — отсюда обязательный `reply_to`;
   * на `20 06` ответа нет (гипотеза D4);
-  * `30 02` не подтверждается ответом: сразу начинается поток.
+  * `30 02` не подтверждается ответом: сразу начинается поток;
+  * команда `30 03` порождает **два** ответа — кадр телеметрии `30 02`
+    отдельной датаграммой, затем сам ответ `30 03` (N14).
 
-Гипотезы, которые симулятор **не выдумывает, а параметризует**: единицы
-частоты (D1) — `Scene.divisor`; код «пик не найден» (N3) — `Scene.missing_raw`;
-раскладка кадра (N4) — та же, что в кодеке; знаковость и масштаб температуры
-(N2, N2b) — из профиля; ширина поля LEN в ответах 0x30 — `profile.mode_len_width`.
+После скрининга 27.08.2026 умолчания симулятора совпадают с наблюдённым
+поведением прибора: единицы частоты (D1), код «пик не найден» (N3), масштаб
+температуры (N2), раскладки `30 03` (N14) и ориентация массива АЦП (D9).
+Ручки сохранены — они нужны, чтобы воспроизвести прибор с другой прошивкой.
+Открытым остаётся N2b (знаковость температуры), он берётся из профиля.
 """
 
 import contextlib
@@ -36,6 +39,7 @@ from fbg.sim.encode import (
     SIM_ID_READ,
     SIM_ID_WRITE,
     SIM_SPEED_KEEP_CURRENT,
+    SIM_UNDOCUMENTED_BODY,
     MeasurementEncoder,
     encode_channel_setup,
     encode_debug,
@@ -44,6 +48,7 @@ from fbg.sim.encode import (
     encode_serial,
     encode_stop_ack,
     encode_sweep,
+    encode_undocumented,
     encode_version,
     encode_write_ack,
     sim_decode_speed_code,
@@ -646,6 +651,10 @@ class DeviceSimulator:
         state = self.state
         if fc == 0x01:
             return [encode_version(state.version_raw)]
+        if fc == 0x02:
+            # N17: недокументированная команда. Отдаются те же байты, что пришли
+            # с прибора, — смысл полей неизвестен, вычислять их не из чего.
+            return [encode_undocumented(SIM_UNDOCUMENTED_BODY)]
         if fc == 0x03:
             return [encode_serial(state.serial)]
         if fc == 0x04:
@@ -775,13 +784,21 @@ class DeviceSimulator:
     def _run_debug(self, width: int) -> list[bytes]:
         """30 03 — однократная развёртка: состояние возвращается в исходное.
 
-        🔴 Раскладка тела — гипотеза, вопрос N14. См. `Scene.debug_payload`.
+        ✅ Скрининг показал, что команда порождает **два** ответа с разными
+        парами (ID, FC): сначала отдельной датаграммой приходит кадр телеметрии
+        `30 02`, следом — сам ответ `30 03` с блоками АЦП всех каналов.
+        Раньше кадр телеметрии собирался внутрь тела `30 03`; это была
+        гипотеза N14, и она оказалась неверной.
+
+        Порядок здесь важен: сессия обязана пережить незапрошенный `30 02`,
+        не сломав корреляцию по (ID, FC), и симулятор её этим нагружает.
         """
         previous = self.sim_state
         self._set_state(SimState.DEBUG)
-        payload = self.scene.debug_payload(self.state.gain_levels)
+        telemetry = self.scene.measurement_frame()
+        payload = self.scene.debug_payload(self.state.gain_modes, self.state.gain_levels)
         self._set_state(previous)
-        return [encode_debug(payload, width)]
+        return [telemetry, encode_debug(payload, width)]
 
     def _read_raw_adc(self, request: bytes, width: int) -> list[bytes]:
         """30 07 — сырые отсчёты АЦП одного канала.

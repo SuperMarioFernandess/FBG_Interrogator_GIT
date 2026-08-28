@@ -26,6 +26,7 @@ from fbg.core.frames import (
     ParseErrorKind,
     ParseResult,
     SweepConfig,
+    UndocumentedResponse,
     fail,
     ok,
 )
@@ -40,6 +41,10 @@ ID_WRITE = 0x20
 ID_MODE = 0x30
 
 FC_VERSION = 0x01
+#: Недокументированная команда, ✅ обнаружена скринингом (KB_04, N17).
+#: Смысл полей ответа неизвестен; штатное ПО использует её как основной опрос
+#: конфигурации и как keepalive вместо 10 05 и 10 06.
+FC_UNDOCUMENTED = 0x02
 FC_SERIAL = 0x03
 FC_MODULE_PARAMS = 0x04
 FC_SWEEP = 0x05
@@ -67,9 +72,12 @@ GAIN_MANUAL_FLAG = 0x80
 WRITE_ACK_LEN = 6
 
 #: Полный список известных пар (ID, FC) — KB_02, «Полный список известных (ID, FC)».
+#: Пятнадцатая пара — (0x10, 0x02): команда в PDF отсутствует, но реально
+#: существует и отвечает (KB_04, N17).
 KNOWN_COMMANDS: frozenset[tuple[int, int]] = frozenset(
     {
         (ID_READ, FC_VERSION),
+        (ID_READ, FC_UNDOCUMENTED),
         (ID_READ, FC_SERIAL),
         (ID_READ, FC_MODULE_PARAMS),
         (ID_READ, FC_SWEEP),
@@ -186,6 +194,18 @@ def build_read_sweep() -> bytes:
 def build_read_channel_setup() -> bytes:
     """10 06 04 00 — пороги и усиления всех каналов."""
     return _read_request(FC_CHANNEL_SETUP)
+
+
+def build_read_undocumented() -> bytes:
+    """10 02 04 00 — недокументированная команда (KB_04, N17).
+
+    В PDF производителя её нет; обнаружена скринингом, где штатное ПО
+    отправляет её при старте третьей и повторяет в простое как keepalive.
+    Смысл ответа неизвестен, поэтому в наш пробник и watchdog команда
+    **не включена** — сборка и разбор существуют, чтобы можно было
+    воспроизвести обмен и опознать ответ в журнале, а не чтобы им пользоваться.
+    """
+    return _read_request(FC_UNDOCUMENTED)
 
 
 # --------------------------------------------------------------------------------------
@@ -471,6 +491,32 @@ def parse_channel_setup(
     return ok(tuple(setups))
 
 
+def parse_undocumented(frame: bytes) -> ParseResult[UndocumentedResponse]:
+    """10 02 — недокументированный ответ (KB_04, N17): тело отдаётся как есть.
+
+    Наблюдён единственный вариант: LEN = 0x0014 = 20 байт, тело
+    `05 DC | 0A 80 | 00 00 × 6`. Значения полей не интерпретируются —
+    что они означают, неизвестно, а догадка в коде хуже пробела (KB_05).
+
+    Длина кадра не фиксируется числом 20: единственный наблюдённый ответ
+    основанием для константы не является, проверяется лишь то, что тело
+    делится на 16-битные слова.
+    """
+    problem: ParseResult[UndocumentedResponse] | None = _check_frame(
+        frame, ID_READ, FC_UNDOCUMENTED, RESP_LEN_WIDTH
+    )
+    if problem is not None:
+        return problem
+    payload = frame[2 + RESP_LEN_WIDTH :]
+    if len(payload) % 2 != 0:
+        return fail(
+            ParseErrorKind.LEN_MISMATCH,
+            f"тело {len(payload)} байт не делится на 16-битные слова",
+        )
+    words = struct.unpack(f">{len(payload) // 2}H", payload)
+    return ok(UndocumentedResponse(payload=payload, words=words))
+
+
 # --------------------------------------------------------------------------------------
 # Разбор ответов на команды записи и режимов
 # --------------------------------------------------------------------------------------
@@ -505,6 +551,39 @@ def parse_stop_ack(frame: bytes, profile: DeviceProfile) -> ParseResult[bool]:
     return ok(status == 1)
 
 
+#: Заголовок блока АЦП внутри тела: Канал(2) + Усиление(2).
+#: Одинаков в ответах 30 07 и 30 03 — ✅ обе раскладки подтверждены скринингом.
+ADC_BLOCK_HEADER = 4
+
+
+def _parse_adc_block(
+    block: bytes, offset: int, points: int, profile: DeviceProfile, where: str
+) -> ParseResult[AdcBlock]:
+    """Разбирает Канал(2) Усиление(2) ADC(2)×points начиная с `offset`.
+
+    Общая часть ответов `30 07` (один канал) и `30 03` (все каналы подряд):
+    заголовок блока в них одинаковый, что и подтвердил скрининг.
+    `where` попадает в текст ошибки, чтобы по сообщению было видно,
+    в каком из двух ответов и в каком блоке нашлась проблема.
+    """
+    channel = int.from_bytes(block[offset : offset + 2], "big")
+    if not 0 <= channel < profile.channels:
+        return fail(
+            ParseErrorKind.BAD_VALUE,
+            f"{where}: номер канала {channel} вне диапазона 0…{profile.channels - 1}",
+        )
+    gain = _parse_gain(block[offset + 2 : offset + ADC_BLOCK_HEADER], profile)
+    if gain is None:
+        return fail(
+            ParseErrorKind.BAD_VALUE,
+            f"{where}: недопустимое поле усиления {block[offset + 2]:02X} {block[offset + 3]:02X}",
+        )
+    adc = np.frombuffer(block, dtype=">u2", count=points, offset=offset + ADC_BLOCK_HEADER).astype(
+        np.uint16
+    )
+    return ok(AdcBlock(channel=channel, gain=gain, adc=adc))
+
+
 def parse_raw_adc(frame: bytes, profile: DeviceProfile) -> ParseResult[AdcBlock]:
     """30 07 — сырые отсчёты АЦП канала: LEN(4) Канал(2) Усиление(2) ADC(2)×N.
 
@@ -526,34 +605,54 @@ def parse_raw_adc(frame: bytes, profile: DeviceProfile) -> ParseResult[AdcBlock]
     if body % 2 != 0:
         return fail(ParseErrorKind.LEN_MISMATCH, f"тело АЦП {body} байт не делится на 2")
 
-    channel = int.from_bytes(frame[2 + width : 4 + width], "big")
-    if not 0 <= channel < profile.channels:
-        return fail(
-            ParseErrorKind.BAD_VALUE,
-            f"номер канала {channel} вне диапазона 0…{profile.channels - 1}",
-        )
-    gain = _parse_gain(frame[4 + width : header], profile)
-    if gain is None:
-        return fail(
-            ParseErrorKind.BAD_VALUE,
-            f"недопустимое поле усиления {frame[4 + width]:02X} {frame[5 + width]:02X}",
-        )
-    adc = np.frombuffer(frame, dtype=">u2", count=body // 2, offset=header).astype(np.uint16)
-    return ok(AdcBlock(channel=channel, gain=gain, adc=adc))
+    return _parse_adc_block(frame, 2 + width, body // 2, profile, "30 07")
 
 
 def parse_debug_once(frame: bytes, profile: DeviceProfile) -> ParseResult[DebugResponse]:
-    """30 03 — одиночная развёртка. Проверяется только заголовок.
+    """30 03 — одиночная развёртка по всем каналам сразу.
 
-    Байтовая раскладка тела в KB_02 отсутствует: там она описана словами
-    «частоты + ADC всех каналов», без числового примера и без захвата.
-    Разбор тела не реализуется до появления захвата — см. вопрос N14.
+    Раскладка ✅ подтверждена скринингом (N14 закрыт)::
+
+        30 03 | LEN(4) | [ Канал(2) | Усиление(2) | ADC(2) × 2551 ] × N_каналов
+
+    Число точек берётся из профиля, а не из длины кадра: в отличие от `30 07`,
+    здесь блоки идут подряд без разделителей, и без известного размера блока
+    границы каналов определить нечем.
+
+    ⚠️ Частот в этом ответе нет. Кадр телеметрии приходит отдельной
+    датаграммой `30 02` перед `30 03` и разбирается `parse_measurement`.
     """
     width = profile.mode_len_width
     problem: ParseResult[DebugResponse] | None = _check_frame(frame, ID_MODE, FC_DEBUG, width)
     if problem is not None:
         return problem
-    return ok(DebugResponse(payload=frame[2 + width :]))
+
+    payload = frame[2 + width :]
+    points = profile.adc_points
+    block_size = ADC_BLOCK_HEADER + points * 2
+    if len(payload) % block_size != 0 or not payload:
+        return fail(
+            ParseErrorKind.LEN_MISMATCH,
+            f"тело {len(payload)} байт не делится на блок канала {block_size} байт "
+            f"(заголовок {ADC_BLOCK_HEADER} + {points} отсчётов по 2 байта)",
+        )
+    count = len(payload) // block_size
+    if count != profile.channels:
+        return fail(
+            ParseErrorKind.LEN_MISMATCH,
+            f"тело содержит {count} блоков каналов, профиль описывает {profile.channels}",
+        )
+
+    blocks: list[AdcBlock] = []
+    for index in range(count):
+        parsed = _parse_adc_block(
+            payload, index * block_size, points, profile, f"30 03, блок {index}"
+        )
+        if parsed.error is not None:
+            return fail(parsed.error.kind, parsed.error.message)
+        assert parsed.value is not None
+        blocks.append(parsed.value)
+    return ok(DebugResponse(blocks=tuple(blocks), payload=payload))
 
 
 # --------------------------------------------------------------------------------------
@@ -564,9 +663,14 @@ def parse_debug_once(frame: bytes, profile: DeviceProfile) -> ParseResult[DebugR
 def detect_freq_divisor(freq_raw: np.ndarray, profile: DeviceProfile) -> int | None:
     """Определяет единицы поля частоты по одному кадру (KB_04, D1).
 
-    Диапазоны гипотез не пересекаются: 191150…196250 против 1911500…1962500.
-    Побеждает та, под которую подошло больше значений. None — не подошло
-    ни одно значение ни под одну гипотезу, единицы остаются неизвестными.
+    Диапазоны гипотез не пересекаются (для заводской развёртки 191149…196249
+    против 1911490…1962490), поэтому побеждает та, под которую подошло больше
+    значений. None — не подошло ни одно значение ни под одну гипотезу,
+    единицы остаются неизвестными.
+
+    ✅ Вопрос закрыт скринингом в пользу делителя 10, и профиль по умолчанию
+    его и содержит. Функция остаётся страховкой: она нужна, если прибор
+    окажется с другой прошивкой, а не для того, чтобы гадать при каждом кадре.
     """
     best: int | None = None
     best_count = 0
@@ -685,6 +789,8 @@ def parse_any(
     if ident == ID_READ:
         if fc == FC_VERSION:
             return parse_version(frame)
+        if fc == FC_UNDOCUMENTED:
+            return parse_undocumented(frame)
         if fc == FC_SERIAL:
             return parse_serial(frame)
         if fc == FC_MODULE_PARAMS:

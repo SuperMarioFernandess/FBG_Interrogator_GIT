@@ -159,9 +159,13 @@ class FragmentingDevice:
     независимым от кодека кодом, что и у полного симулятора (KB_05 №11).
     """
 
-    def __init__(self, profile: DeviceProfile, chunk_bytes: int = 1400) -> None:
+    def __init__(
+        self, profile: DeviceProfile, chunk_bytes: int = 1400, telemetry_at: int | None = None
+    ) -> None:
         self.profile = profile
         self.chunk_bytes = chunk_bytes
+        self.telemetry_at = telemetry_at
+        """Номер куска длинного ответа, перед которым вклинить кадр `30 02`."""
         self.reply_to: tuple[str, int] = ("127.0.0.1", 1)
         self.datagrams_sent = 0
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -227,14 +231,31 @@ class FragmentingDevice:
         if ident == sim_encode.SIM_ID_MODE:
             if fc == 0x01:
                 return [sim_encode.encode_stop_ack(True, width)]
+            if fc == 0x03:
+                adc = np.arange(self.profile.adc_points, dtype=np.uint16) % 4096
+                body = b"".join(
+                    sim_encode.encode_adc_block(channel, 0x00, 5, adc)
+                    for channel in range(self.profile.channels)
+                )
+                return [sim_encode.encode_debug(body, width)]
             if fc == 0x07:
                 adc = np.arange(self.profile.adc_points, dtype=np.uint16) % 4096
                 return [sim_encode.encode_raw_adc(request[5], 0x00, 5, adc, width)]
         return []
 
+    def _telemetry_frame(self) -> bytes:
+        """Кадр `30 02` для проверки того, что он не попадает в тело длинного ответа."""
+        freq = np.zeros((self.profile.channels, self.profile.fbg_per_channel), dtype=np.uint32)
+        freq[0, 0] = 0x1D9CC0
+        temp = np.full(self.profile.channels, 1685, dtype=np.int32)
+        return sim_encode.encode_measurement(self.profile, freq, temp)
+
     def _send(self, payload: bytes) -> None:
         # Длинный ответ уходит кусками, короткий — одной датаграммой.
-        for offset in range(0, len(payload), self.chunk_bytes):
+        for index, offset in enumerate(range(0, len(payload), self.chunk_bytes)):
+            if self.telemetry_at is not None and index == self.telemetry_at:
+                self._sock.sendto(self._telemetry_frame(), self.reply_to)
+                self.datagrams_sent += 1
             self._sock.sendto(payload[offset : offset + self.chunk_bytes], self.reply_to)
             self.datagrams_sent += 1
 
@@ -797,12 +818,52 @@ def test_lost_telemetry_is_not_a_session_error(rig: Rig) -> None:
 # --------------------------------------------------------------------------------------
 
 
-def test_debug_once_returns_raw_payload(rig: Rig) -> None:
-    """30 03: тело отдаётся сырым — раскладка неизвестна (N14)."""
+def test_debug_once_parses_channel_blocks(rig: Rig) -> None:
+    """30 03: ✅ тело разбирается на блоки каналов (N14 закрыт скринингом)."""
     response = rig.session.debug_once().unwrap()
-    assert isinstance(response.payload, bytes)
-    assert len(response.payload) > 0
+
+    assert response.channels == rig.profile.channels
+    for index, block in enumerate(response.blocks):
+        assert block.channel == index
+        assert block.points == rig.profile.adc_points
+    # Сырые байты сохраняются рядом с разбором — правило KB_05 №3.
+    assert len(response.payload) == 20430 - 6
     assert rig.session.state is SessionState.IDLE
+
+
+def test_debug_once_survives_unsolicited_telemetry(rig: Rig) -> None:
+    """⚠️ Команда 30 03 порождает ДВА ответа с разными парами (ID, FC).
+
+    Прибор шлёт кадр телеметрии `30 02` отдельной датаграммой непосредственно
+    перед ответом `30 03` (✅ скрининг, N14). Корреляция ведётся по паре
+    (ID, FC) с единственным ожидающим, и незапрошенный кадр обязан её пережить:
+    телеметрия отбирается в `_on_datagram` до всякой корреляции и уходит
+    в колбэк, а не в счётчик потерянных ответов.
+
+    Это главный риск правки: если бы кадр попал в ветку корреляции, он бы
+    либо увеличил `orphan_responses`, либо — при уже начатой сборке длинного
+    ответа — дописался в его тело и испортил бы разбор.
+    """
+    rig.telemetry.clear()
+    orphans_before = rig.session.stats().orphan_responses
+
+    response = rig.session.debug_once().unwrap()
+
+    assert response.channels == rig.profile.channels
+    assert len(rig.telemetry) == 1, "кадр 30 02 обязан дойти до потребителя телеметрии"
+    data, _t_mono = rig.telemetry[0]
+    assert codec.classify(data) == (codec.ID_MODE, codec.FC_STREAM)
+    assert len(data) == rig.profile.frame_size
+    assert rig.session.stats().orphan_responses == orphans_before
+    assert rig.session.stats().telemetry_frames >= 1
+
+
+def test_debug_once_repeats_cleanly(rig: Rig) -> None:
+    """Две отладки подряд: лишний кадр 30 02 не смещает корреляцию следующей команды."""
+    assert rig.session.debug_once().ok
+    assert rig.session.debug_once().ok
+    assert rig.session.read_version().unwrap() == 410
+    assert rig.session.stats().orphan_responses == 0
 
 
 def test_read_raw_adc_single_datagram(rig: Rig) -> None:
@@ -1052,3 +1113,66 @@ def test_context_manager_stops_device() -> None:
     finally:
         stand.sim.stop()
         stand.session.disconnect()
+
+
+def test_debug_response_reassembled_from_fragments() -> None:
+    """30 03 из 20430 байт собирается по объявленному LEN и разбирается на блоки.
+
+    ⚠️ Куски режет тестовый прибор. Реальная фрагментация со стенда — 20430
+    байт при полезной нагрузке 1472, то есть 13 × 1472 + 1294 = 14 датаграмм.
+    """
+    profile = DeviceProfile()
+    device = FragmentingDevice(profile, chunk_bytes=1472)
+    endpoint = Endpoint(
+        device_ip=device.address[0], device_port=device.address[1], **TEST_ENDPOINT_KWARGS
+    )
+    session = Session(endpoint, profile, QUIET)
+    try:
+        open_port_and_announce(session, lambda address: setattr(device, "reply_to", address))
+        assert session.connect().ok
+        response = session.debug_once().unwrap()
+        assert response.channels == profile.channels
+        assert response.blocks[2].channel == 2
+        assert response.blocks[2].points == profile.adc_points
+        assert len(response.payload) == 20430 - 6
+    finally:
+        session.disconnect()
+        device.stop()
+
+
+def test_telemetry_between_fragments_does_not_corrupt_long_response() -> None:
+    """Кадр 30 02, пришедший ПОСРЕДИ сборки длинного ответа, не попадает в тело.
+
+    Худший случай правки этого чата. Прибор шлёт телеметрию не спрашивая,
+    а сборка длинного ответа дописывает **любую** датаграмму как продолжение —
+    заголовка у продолжений нет (D5). Единственное, что разделяет эти два
+    случая, — отбор телеметрии по паре (ID, FC) до всякой корреляции.
+
+    Если бы отбор стоял позже, 494 байта кадра встали бы внутрь массива АЦП:
+    LEN добрался бы раньше, тело оказалось бы не кратно блоку канала, и
+    разбор упал бы с LEN_MISMATCH — либо, что хуже, сошёлся бы со сдвигом.
+    """
+    profile = DeviceProfile()
+    device = FragmentingDevice(profile, chunk_bytes=1472, telemetry_at=5)
+    endpoint = Endpoint(
+        device_ip=device.address[0], device_port=device.address[1], **TEST_ENDPOINT_KWARGS
+    )
+    telemetry: list[bytes] = []
+    session = Session(
+        endpoint, profile, QUIET, on_telemetry=lambda data, _t: telemetry.append(data)
+    )
+    try:
+        open_port_and_announce(session, lambda address: setattr(device, "reply_to", address))
+        assert session.connect().ok
+        response = session.debug_once().unwrap()
+
+        assert response.channels == profile.channels
+        assert len(response.payload) == 20430 - 6
+        for index, block in enumerate(response.blocks):
+            assert block.channel == index
+        # Кадр не потерялся: он ушёл потребителю телеметрии, а не в тело ответа.
+        assert any(len(frame) == profile.frame_size for frame in telemetry)
+        assert session.stats().orphan_responses == 0
+    finally:
+        session.disconnect()
+        device.stop()

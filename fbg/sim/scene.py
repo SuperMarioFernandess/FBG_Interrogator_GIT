@@ -10,10 +10,12 @@
 Сцена не знает ни про сеть, ни про протокол: она отдаёт сырые поля кадра
 и массив отсчётов АЦП. Байты из этого делает `fbg.sim.encode`.
 
-Параметризованные неизвестные:
-  * `divisor` — единицы поля частоты (D1), обе гипотезы равноправны;
-  * `missing_raw` — код «пик не найден» (N3), **не факт о приборе**;
-  * знаковость и масштаб температуры — из `DeviceProfile` (N2, N2b).
+После скрининга 27.08.2026 вопросы D1 (единицы частоты), N3 (код «пик не
+найден»), N2 (масштаб температуры) и D9 (ориентация массива АЦП) закрыты,
+и умолчания сцены совпадают с наблюдённым поведением прибора. Ручки остались:
+они позволяют воспроизвести прибор с другой прошивкой, а не гадать.
+
+Открытым остаётся N2b — знаковость поля температуры; она берётся из профиля.
 """
 
 from dataclasses import dataclass, field
@@ -21,7 +23,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from fbg.core.profile import C_NM_GHZ, DeviceProfile
-from fbg.sim.encode import MISSING_STIMULUS, encode_measurement, nm_to_raw
+from fbg.sim.encode import MISSING_STIMULUS, encode_adc_block, encode_measurement, nm_to_raw
 
 #: Пересчёт ширины по уровню половины в среднеквадратичную для гауссова пика.
 FWHM_TO_SIGMA = 1.0 / (2.0 * np.sqrt(2.0 * np.log(2.0)))
@@ -77,9 +79,10 @@ class Grating:
 class Scene:
     """Физическая обстановка на входе прибора.
 
-    `divisor` — гипотеза единиц поля частоты (D1). `missing_raw` — сырой код,
-    который ставится в свободные позиции: кодировка «пик не найден» неизвестна
-    (N3), поэтому это параметр сцены, а не константа и не факт о приборе.
+    `divisor` — единицы поля частоты (D1 ✅ закрыт: 10). `missing_raw` — код,
+    который ставится в свободные позиции (N3 ✅ закрыт: 0x000000). Оба остались
+    параметрами сцены: воспроизводить прибор с другими умолчаниями по-прежнему
+    нужно, но значения по умолчанию теперь наблюдённые, а не выбранные.
     """
 
     profile: DeviceProfile
@@ -196,11 +199,20 @@ class Scene:
         return self._temp_buf
 
     def freq_axis_ghz(self) -> np.ndarray:
-        """Частотная ось развёртки, ГГц: от `start_ghz` вниз шагом `adc_step_param`."""
-        return (
-            self.profile.start_ghz
-            - np.arange(self.profile.adc_points, dtype=np.float64) * self.profile.adc_step_param
-        )
+        """Частотная ось развёртки, ГГц, в порядке следования отсчётов АЦП.
+
+        ✅ Ориентация подтверждена скринингом (D9): индекс 0 соответствует
+        `stop_ghz` (191150 ГГц, 1568.36 нм), последний — `start_ghz`.
+        Частота **возрастает** с индексом, длина волны убывает.
+
+        До скрининга здесь стоял обратный порядок — от `start_ghz` вниз.
+        Ориентация была угадана неверно и в мануале, и в расчётах: интуиция
+        подсказывала «от Start к Stop», реальность оказалась обратной.
+        """
+        steps = np.arange(self.profile.adc_points, dtype=np.float64) * self.profile.adc_step_param
+        if self.profile.adc_index_ascending_freq:
+            return self.profile.stop_ghz + steps
+        return self.profile.start_ghz - steps
 
     def spectrum(self, channel: int, gain_level: int) -> np.ndarray:
         """Спектр АЦП одного канала: гауссовы пики над шумовой полкой, 14 бит.
@@ -226,27 +238,65 @@ class Scene:
 
         return np.clip(spectrum, 0.0, self.profile.adc_max).astype(np.uint16)
 
-    def debug_payload(self, gain_levels: list[int]) -> bytes:
-        """Тело ответа 30 03 — 🔴 **гипотеза**, вопрос N14 открыт.
+    def debug_payload(self, gain_modes: list[int], gain_levels: list[int]) -> bytes:
+        """Тело ответа 30 03 — ✅ раскладка подтверждена скринингом (N14 закрыт).
 
-        В KB_02 про тело известно только словесное описание «частоты + ADC всех
-        каналов» и оценка размера ≈ 21 КБ из KB_01. Числового примера нет ни
-        в PDF, ни в захватах: порядок блоков, наличие подзаголовков и то,
-        повторяется ли внутри кадр телеметрии, — неизвестны.
+            [ Канал(2) | Усиление(2) | ADC(2) × 2551 ] × N_каналов
 
-        Здесь собирается ровно то, что описано словами: кадр телеметрии 30 02
-        целиком, затем блоки АЦП всех каналов подряд без подзаголовков. Размер
-        совпадает с оценкой KB_01 (494 + 4·2551·2 = 20902 байта), но это
-        совпадение по размеру, а не подтверждение раскладки. Ни один тест
-        не проверяет эту раскладку как факт о приборе; `codec.parse_debug_once`
-        по-прежнему отдаёт тело сырым.
+        Для 4 каналов это 20424 байта тела, то есть 20430 байт полного ответа.
+
+        ⚠️ Кадра телеметрии здесь **нет**. Раньше он собирался внутрь тела —
+        так PDF описывает ответ словами «частоты + ADC». Захват показал, что
+        частоты приходят отдельной датаграммой `30 02` перед ответом `30 03`;
+        её шлёт `DeviceSimulator._run_debug`, а не этот метод.
         """
-        head = encode_measurement(self.profile, self.sample_freq_raw(), self.sample_temp_raw())
-        blocks = [
-            self.spectrum(channel, gain_levels[channel]).astype(">u2").tobytes()
+        return b"".join(
+            encode_adc_block(
+                channel,
+                gain_modes[channel],
+                gain_levels[channel],
+                self.spectrum(channel, gain_levels[channel]),
+            )
             for channel in range(self.profile.channels)
-        ]
-        return head + b"".join(blocks)
+        )
+
+    def measurement_frame(self) -> bytes:
+        """Кадр телеметрии `30 02` по текущему состоянию сцены.
+
+        Нужен отладочному режиму: прибор шлёт этот кадр отдельной датаграммой
+        непосредственно перед ответом `30 03`.
+        """
+        return encode_measurement(self.profile, self.sample_freq_raw(), self.sample_temp_raw())
+
+
+#: Сырые поля частоты канала 1, ✅ прочитанные из захвата 27.08.2026 (KB_06).
+#: Позиции 0 и 1 — две решётки стенда, распознанные прибором из четырёх.
+REAL_CAPTURE_FREQ_RAW: tuple[int, int] = (0x1D9CC0, 0x1D7BED)
+
+#: Сырое поле температуры корпуса из того же кадра: 1685 → 16.85 °C.
+REAL_CAPTURE_TEMP_RAW = 1685
+
+
+def scene_real_capture(profile: DeviceProfile) -> tuple[np.ndarray, np.ndarray]:
+    """Сырые поля кадра телеметрии со стенда — источник `measurement_real.hex`.
+
+    ✅ Канал 1, позиции 0 и 1, и температура прочитаны из захвата побайтово.
+
+    ⚠️ Каналы 2…4 — **реконструкция**: побайтово в KB_06 они не выписаны.
+    Заполнены нулями на основании двух записанных там фактов — оптическая
+    линия стенда подключена только к каналу 1, а температура одинакова
+    во всех четырёх каналах. Правдоподобно, но захватом не подтверждено.
+
+    Делитель здесь не параметр: значения взяты из захвата как есть,
+    а он снят при единственном существующем делителе — 10.
+    """
+    channels, fbg = profile.channels, profile.fbg_per_channel
+    freq_raw = np.full((channels, fbg), MISSING_STIMULUS, dtype=np.uint32)
+    for position, value in enumerate(REAL_CAPTURE_FREQ_RAW):
+        if position < fbg:
+            freq_raw[0, position] = value
+    temp_raw = np.full(channels, REAL_CAPTURE_TEMP_RAW, dtype=np.int32)
+    return freq_raw, temp_raw
 
 
 def scene_two_gratings(profile: DeviceProfile, divisor: int) -> tuple[np.ndarray, np.ndarray]:

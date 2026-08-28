@@ -1,8 +1,10 @@
 """Тесты кодека протокола.
 
-Позитивные тесты команд чтения — на пяти ответах, снятых с прибора (KB_02).
-Кадр телеметрии тестируется на синтетическом векторе: настоящего захвата
-не существует, см. предупреждение в `tests/synthetic.py`.
+Позитивные тесты команд чтения — на ответах, снятых с прибора (KB_02).
+Кадр телеметрии проверяется на **реальном** векторе со стенда
+(`measurement_real.hex`, скрининг 27.08.2026); синтетический вектор
+остался только там, где реального захвата не существует и не будет —
+проверка валидации на значениях, которых прибор не выдаёт.
 """
 
 import numpy as np
@@ -16,11 +18,18 @@ from tests.synthetic import (
     encode_measurement,
     load_vectors,
     nm_to_raw,
+    scene_real_capture,
     scene_two_gratings,
 )
 
 VEC = load_vectors()
 SYNTH = load_vectors("measurement_synthetic.hex")
+REAL = load_vectors("measurement_real.hex")
+
+#: Профиль без зафиксированного делителя — для тестов автодетекта (D1).
+#: После скрининга умолчание равно 10, и автодетект в рабочем тракте
+#: не срабатывает; чтобы его проверить, делитель приходится снимать явно.
+AUTODETECT = DeviceProfile(freq_divisor=None)
 
 
 @pytest.fixture
@@ -35,19 +44,63 @@ def profile() -> DeviceProfile:
 
 
 def test_профиль_считает_производные_величины(profile: DeviceProfile) -> None:
-    """Расчётные величины совпадают с KB_01."""
-    assert profile.start_ghz == 196250
-    assert profile.stop_ghz == 191150
+    """Расчётные величины совпадают с KB_01.
+
+    Заводские параметры прибора — 1 / 5101, и по формуле f = 196250 − параметр
+    они дают 196249 / 191149, а не круглые границы. Это не ошибка: прибор
+    хранит параметр, а не частоту. Круглые 196250 / 191150 получаются при
+    параметрах 0 / 5100 — см. отдельный тест ниже.
+    """
+    assert profile.sweep_base_ghz == 196250
+    assert profile.start_ghz == 196249
+    assert profile.stop_ghz == 191149
     assert profile.adc_points == 2551
     assert profile.frame_size == 494
     assert profile.channel_bytes == 122
 
 
+def test_база_развёртки_196250_а_не_196251() -> None:
+    """D8: при параметрах 0 / 0x13EC развёртка равна ровно 191150…196250 ГГц.
+
+    Это и есть доказательство базы. Файл вендора Spec_*.txt, снятый штатным
+    ПО именно при этих параметрах, содержит ровно 2551 строку с частотами
+    от 191150 до 196250. База 196251 из PDF дала бы 196251 — выше паспортного
+    максимума прибора.
+    """
+    demo = DeviceProfile(start_param=0, stop_param=5100)
+    assert demo.start_ghz == 196250
+    assert demo.stop_ghz == 191150
+    assert demo.adc_points == 2551
+
+
+def test_база_развёртки_является_полем_профиля() -> None:
+    """KB_05 №8: спорная величина правится профилем, а не кодом."""
+    old = DeviceProfile(sweep_base_ghz=196251)
+    assert old.start_ghz == 196250
+    assert old.param_to_ghz(0) == 196251
+
+
+def test_профиль_отвергает_базу_ниже_развёртки() -> None:
+    """База меньше stop_param дала бы неположительную нижнюю частоту."""
+    with pytest.raises(ValueError, match="sweep_base_ghz"):
+        DeviceProfile(sweep_base_ghz=1000)
+
+
+def test_умолчания_профиля_соответствуют_скринингу(profile: DeviceProfile) -> None:
+    """Три величины, закрытые скринингом, обязаны быть умолчаниями, а не гипотезами."""
+    assert profile.freq_divisor == 10
+    assert profile.peak_missing_codes == frozenset({0})
+    assert profile.case_temp_scale == 0.01
+    assert profile.adc_index_ascending_freq is True
+
+
 def test_профиль_переводит_параметры_в_частоту(profile: DeviceProfile) -> None:
     """Пересчёт параметр ↔ частота обратим и совпадает с проверенными значениями."""
-    assert profile.param_to_ghz(1) == 196250
-    assert profile.param_to_ghz(5101) == 191150
-    assert profile.ghz_to_param(191150) == 5101
+    assert profile.param_to_ghz(0) == 196250
+    assert profile.param_to_ghz(1) == 196249
+    assert profile.param_to_ghz(5100) == 191150
+    assert profile.ghz_to_param(191150) == 5100
+    assert profile.ghz_to_param(profile.param_to_ghz(1234)) == 1234
 
 
 def test_константа_скорости_света_согласована_с_границами_развёртки() -> None:
@@ -82,9 +135,10 @@ def test_профиль_отвергает_несогласованные_зна
 
 def test_профиль_фиксирует_делитель_копией(profile: DeviceProfile) -> None:
     """`with_freq_divisor` возвращает копию, исходный профиль не меняется."""
-    fixed = profile.with_freq_divisor(10)
+    base = DeviceProfile(freq_divisor=None)
+    fixed = base.with_freq_divisor(10)
     assert fixed.freq_divisor == 10
-    assert profile.freq_divisor is None
+    assert base.freq_divisor is None
 
 
 # ======================================================================================
@@ -303,10 +357,19 @@ def test_разбор_параметров_модуля() -> None:
 
 
 def test_разбор_параметров_развёртки(profile: DeviceProfile) -> None:
-    """10 05: параметры 1/2/5101/2 дают 196250…191150 ГГц и 2551 точку АЦП."""
+    """10 05: заводские параметры 1/2/5101/2 дают 196249…191149 ГГц, 2551 точку."""
     sweep = codec.parse_sweep_params(VEC["resp_sweep"], profile).unwrap()
     assert (sweep.start_param, sweep.step_param) == (1, 2)
     assert (sweep.stop_param, sweep.adc_step_param) == (5101, 2)
+    assert sweep.start_ghz == 196249
+    assert sweep.stop_ghz == 191149
+    assert sweep.adc_points == 2551
+
+
+def test_разбор_развёртки_после_штатного_по(profile: DeviceProfile) -> None:
+    """10 05 после демо: параметры 0/2/5100/2 — ровно 196250…191150 ГГц (D8)."""
+    sweep = codec.parse_sweep_params(VEC["resp_sweep_demo"], profile).unwrap()
+    assert (sweep.start_param, sweep.stop_param) == (0, 5100)
     assert sweep.start_ghz == 196250
     assert sweep.stop_ghz == 191150
     assert sweep.adc_points == 2551
@@ -366,8 +429,13 @@ def test_ответ_другой_команды() -> None:
 
 
 def test_неизвестная_пара_id_fc(profile: DeviceProfile) -> None:
-    """Пары (10, 02) в списке известных команд нет."""
-    result = codec.parse_any(bytes.fromhex("10020400"), profile)
+    """Пары (20, 05) в списке известных команд нет — это пропуск в нумерации.
+
+    Раньше здесь стояла пара (10, 02): до скрининга она считалась
+    несуществующей. Скрининг показал, что команда есть и отвечает (N17),
+    поэтому для проверки неизвестной пары взят другой пропуск нумерации.
+    """
+    result = codec.parse_any(bytes.fromhex("20050400"), profile)
     assert result.error is not None
     assert result.error.kind is ParseErrorKind.UNKNOWN_COMMAND
 
@@ -458,11 +526,15 @@ def test_синтетический_вектор_не_разошёлся_с_ге
 
 @pytest.mark.parametrize("divisor", [1, 10])
 def test_разбор_телеметрии_на_обеих_гипотезах(divisor: int, profile: DeviceProfile) -> None:
-    """Кадр разбирается одинаково по структуре при любой гипотезе единиц."""
+    """Кадр разбирается одинаково по структуре при любой гипотезе единиц.
+
+    Профиль здесь без зафиксированного делителя: с умолчанием 10 гипотеза A
+    не проверялась бы вовсе — кадр просто не прошёл бы валидацию по диапазону.
+    """
     freq_raw, temp_raw = scene_two_gratings(profile, divisor)
     frame = encode_measurement(profile, freq_raw, temp_raw)
 
-    result = codec.parse_measurement(frame, profile, t_mono=12.5).unwrap()
+    result = codec.parse_measurement(frame, AUTODETECT, t_mono=12.5).unwrap()
 
     assert result.freq_divisor == divisor
     assert result.t_mono == 12.5
@@ -484,7 +556,7 @@ def test_длины_волн_совпадают_со_сценой(
     """
     freq_raw, temp_raw = scene_two_gratings(profile, divisor)
     frame = encode_measurement(profile, freq_raw, temp_raw)
-    waves = codec.parse_measurement(frame, profile).unwrap().wavelength_nm()
+    waves = codec.parse_measurement(frame, AUTODETECT).unwrap().wavelength_nm()
 
     assert waves[0, 0] == pytest.approx(1545.0, abs=tolerance_nm)
     assert waves[0, 1] == pytest.approx(1550.0, abs=tolerance_nm)
@@ -584,12 +656,16 @@ def test_другой_масштаб_температуры_меняет_тол�
 
 
 def test_кадр_без_валидных_пиков_не_даёт_угадывать_единицы(profile: DeviceProfile) -> None:
-    """Единицы неизвестны и определить их нечем — это ошибка, а не догадка."""
+    """Единицы неизвестны и определить их нечем — это ошибка, а не догадка.
+
+    Ситуация возможна только при снятом делителе: в рабочем профиле он
+    зафиксирован скринингом, и пустой кадр даёт просто 120 значений NaN.
+    """
     channels, fbg = profile.channels, profile.fbg_per_channel
     freq_raw = np.zeros((channels, fbg), dtype=np.uint32)
     frame = encode_measurement(profile, freq_raw, np.zeros(channels, dtype=np.int32))
 
-    result = codec.parse_measurement(frame, profile)
+    result = codec.parse_measurement(frame, AUTODETECT)
     assert result.error is not None
     assert result.error.kind is ParseErrorKind.AMBIGUOUS_UNITS
 
@@ -714,14 +790,75 @@ def test_разбор_сырых_ацп_отвергает_нечётное_те
     assert result.error.kind is ParseErrorKind.LEN_MISMATCH
 
 
-def test_отладочный_ответ_отдаёт_тело_сырым(profile: DeviceProfile) -> None:
-    """Раскладка тела 30 03 неизвестна (вопрос N14) — проверяется только заголовок."""
-    payload = bytes(range(20))
-    total = 2 + profile.mode_len_width + len(payload)
-    frame = bytes([0x30, 0x03]) + total.to_bytes(profile.mode_len_width, "big") + payload
+def _debug_frame(profile: DeviceProfile, channels: int | None = None) -> bytes:
+    """Собирает ответ 30 03: [Канал(2) Усиление(2) ADC(2)×N] × каналы.
 
-    result = codec.parse_debug_once(frame, profile).unwrap()
-    assert result.payload == payload
+    ⚠️ Тело синтетическое: полных 20430 байт сырых отсчётов в KB_06 нет.
+    Реальны здесь только раскладка и заголовок — они проверяются отдельно
+    вектором `resp_debug_header`.
+    """
+    count = profile.channels if channels is None else channels
+    body = b""
+    for channel in range(count):
+        body += channel.to_bytes(2, "big") + b"\x00\x05"
+        body += b"".join(
+            ((channel * 1000 + value) % 16384).to_bytes(2, "big")
+            for value in range(profile.adc_points)
+        )
+    total = 2 + profile.mode_len_width + len(body)
+    return bytes([0x30, 0x03]) + total.to_bytes(profile.mode_len_width, "big") + body
+
+
+def test_размер_отладочного_ответа_совпадает_с_захватом(profile: DeviceProfile) -> None:
+    """N14: 6 + 4 × (2 + 2 + 2551 × 2) = 20430 байт, LEN = 0x00004FCE.
+
+    Заголовок сверяется с байтами, реально снятыми со стенда.
+    """
+    frame = _debug_frame(profile)
+    assert len(frame) == 20430
+    assert frame[:6] == VEC["resp_debug_header"]
+    assert int.from_bytes(frame[2:6], "big") == 0x00004FCE
+
+
+def test_разбор_отладочного_ответа(profile: DeviceProfile) -> None:
+    """30 03 раскладывается на блоки каналов; частот в теле нет (N14)."""
+    result = codec.parse_debug_once(_debug_frame(profile), profile).unwrap()
+
+    assert result.channels == 4
+    for index, block in enumerate(result.blocks):
+        assert block.channel == index
+        assert block.gain == GainSetting(manual=False, level=5)
+        assert block.points == profile.adc_points
+        assert block.adc[0] == index * 1000
+    # Сырое тело сохраняется рядом с разбором — правило KB_05 №3.
+    assert len(result.payload) == 20430 - 6
+
+
+def test_отладочный_ответ_с_неполным_числом_каналов(profile: DeviceProfile) -> None:
+    """Блоков меньше, чем каналов в профиле, — тело неполное, а не «ещё сойдёт»."""
+    result = codec.parse_debug_once(_debug_frame(profile, channels=3), profile)
+    assert result.error is not None
+    assert result.error.kind is ParseErrorKind.LEN_MISMATCH
+
+
+def test_отладочный_ответ_не_кратный_блоку(profile: DeviceProfile) -> None:
+    """Тело, не делящееся на блок канала, означает потерю данных."""
+    frame = _debug_frame(profile)
+    truncated = frame[:-2]
+    broken = truncated[:2] + len(truncated).to_bytes(profile.mode_len_width, "big") + truncated[6:]
+    result = codec.parse_debug_once(broken, profile)
+    assert result.error is not None
+    assert result.error.kind is ParseErrorKind.LEN_MISMATCH
+
+
+def test_отладочный_ответ_с_недопустимым_усилением(profile: DeviceProfile) -> None:
+    """Старший байт усиления бывает только 00 или 80 — и в блоках 30 03 тоже."""
+    frame = bytearray(_debug_frame(profile))
+    frame[8] = 0x40
+    result = codec.parse_debug_once(bytes(frame), profile)
+    assert result.error is not None
+    assert result.error.kind is ParseErrorKind.BAD_VALUE
+    assert "блок 0" in result.error.message
 
 
 # ======================================================================================
@@ -762,6 +899,251 @@ def test_диспетчер_разбирает_телеметрию(profile: Dev
 
 
 def test_все_известные_команды_перечислены() -> None:
-    """В KB_02 их четырнадцать: 5 чтения, 5 записи, 4 режима."""
-    assert len(codec.KNOWN_COMMANDS) == 14
+    """Пятнадцать пар: 6 чтения (включая недокументированную 10 02), 5 записи, 4 режима."""
+    assert len(codec.KNOWN_COMMANDS) == 15
+    assert (codec.ID_READ, codec.FC_UNDOCUMENTED) in codec.KNOWN_COMMANDS
     assert (0x20, 0x06) in codec.NO_RESPONSE_COMMANDS
+
+
+# ======================================================================================
+# Реальные векторы со стенда — скрининг 27.08.2026
+# ======================================================================================
+
+
+def test_реальный_вектор_не_разошёлся_с_генератором(profile: DeviceProfile) -> None:
+    """Сохранённый кадр совпадает с тем, что порождает `scene_real_capture`."""
+    assert encode_measurement(profile, *scene_real_capture(profile)) == REAL["measurement_real"]
+
+
+def test_разбор_реального_кадра_телеметрии(profile: DeviceProfile) -> None:
+    """✅ Эталон D1: две решётки стенда, 1544.79 и 1551.50 нм.
+
+    Длины волн сверены с KB_06 с допуском 0.01 нм: там они выписаны
+    с округлением расчёта. Частоты сверяются с самими байтами — см.
+    следующий тест о расхождении в файлах знаний.
+    """
+    result = codec.parse_measurement(REAL["measurement_real"], profile, t_mono=7.5).unwrap()
+
+    assert result.freq_divisor == 10
+    assert result.index_mismatches == 0
+    assert result.freq_ghz[0, 0] == pytest.approx(194_067.2)
+    assert result.freq_ghz[0, 1] == pytest.approx(193_226.9)
+
+    waves = result.wavelength_nm()
+    assert waves[0, 0] == pytest.approx(1544.785, abs=0.01)
+    assert waves[0, 1] == pytest.approx(1551.507, abs=0.01)
+
+
+def test_байты_кадра_расходятся_с_десятичными_в_файлах_знаний() -> None:
+    """⚠️ В KB_02, KB_06 и постановке чата №5 десятичные значения ошибочны.
+
+    Записано «1D 9C C0 = 1 940 674» и «1D 7B ED = 1 932 266», тогда как
+    на самом деле это 1 940 672 и 1 932 269: расхождение −2 и +3 единицы.
+    Значения 1 940 674 и 1 932 266 дали бы байты 1D 9C C2 и 1D 7B EA.
+
+    Правы **байты**, и это не выбор из двух равных вариантов. Во-первых,
+    захват выше любого пересказа. Во-вторых, KB_06 в другом месте приводит
+    независимое число — среднее по 287 кадрам, 1 940 672.3, — и оно сходится
+    именно с байтами. На длину волны расхождение влияет на 2 пм, то есть
+    ниже паспортной повторяемости прибора; на выводы о делителе — никак.
+
+    Тест существует, чтобы правка файлов знаний не превратилась в правку
+    кода под ошибочное число.
+    """
+    assert int.from_bytes(bytes.fromhex("1D9CC0"), "big") == 1_940_672
+    assert int.from_bytes(bytes.fromhex("1D7BED"), "big") == 1_932_269
+    assert int.from_bytes(bytes.fromhex("1D9CC2"), "big") == 1_940_674
+    assert int.from_bytes(bytes.fromhex("1D7BEA"), "big") == 1_932_266
+
+
+def test_реальный_кадр_даёт_nan_на_ненайденных_пиках(profile: DeviceProfile) -> None:
+    """N3: 28 позиций канала 1 из 30 — нули, и все они NaN, а не 0 ГГц."""
+    result = codec.parse_measurement(REAL["measurement_real"], profile).unwrap()
+
+    assert np.isnan(result.freq_ghz[0, 2:]).all()
+    assert np.isfinite(result.freq_ghz[0, :2]).all()
+    # Каналы 2…4 линии не имеют — 4×30 − 2 позиций пустые.
+    assert result.missing == profile.channels * profile.fbg_per_channel - 2
+
+
+def test_реальная_температура_корпуса(profile: DeviceProfile) -> None:
+    """N2: сырое 1685 → 16.85 °C, одинаково во всех четырёх каналах."""
+    result = codec.parse_measurement(REAL["measurement_real"], profile).unwrap()
+    assert result.case_temp_c == pytest.approx(np.full(4, 16.85))
+
+
+def test_реальный_кадр_проходит_автодетект_единиц() -> None:
+    """Даже со снятым делителем настоящий кадр однозначно опознаётся как 0.1 ГГц."""
+    result = codec.parse_measurement(REAL["measurement_real"], AUTODETECT).unwrap()
+    assert result.freq_divisor == 10
+
+
+def test_реальные_частоты_попадают_в_заводскую_развёртку(profile: DeviceProfile) -> None:
+    """Оба пика лежат внутри 191149…196249 ГГц — валидация по диапазону их пропускает.
+
+    Проверка не косметическая: смена базы на 196250 сдвинула обе границы
+    на 1 ГГц вниз, и убедиться, что реальные значения по-прежнему внутри,
+    нужно именно на них.
+    """
+    low, high = profile.freq_raw_bounds(10)
+    assert low == 1_911_490
+    assert high == 1_962_490
+    assert low <= 0x1D9CC0 <= high
+    assert low <= 0x1D7BED <= high
+
+
+def test_маркер_ненайденного_пика_отбраковывает_и_валидное_значение() -> None:
+    """N3 задан полем профиля: объявленный маркер отбраковывается даже внутри диапазона."""
+    profile = DeviceProfile()
+    freq_raw, temp_raw = scene_real_capture(profile)
+    tuned = DeviceProfile(peak_missing_codes=frozenset({0, int(freq_raw[0, 1])}))
+    frame = encode_measurement(profile, freq_raw, temp_raw)
+
+    result = codec.parse_measurement(frame, tuned).unwrap()
+    assert np.isnan(result.freq_ghz[0, 1])
+    assert np.isfinite(result.freq_ghz[0, 0])
+
+
+# ======================================================================================
+# Ориентация массива АЦП (D9)
+# ======================================================================================
+
+
+def test_индекс_ноль_соответствует_stop() -> None:
+    """D9: индекс 0 — нижняя частота 191150 ГГц, последний — верхняя 196250."""
+    demo = DeviceProfile(start_param=0, stop_param=5100)
+    assert demo.adc_index_to_ghz(0) == 191150
+    assert demo.adc_index_to_ghz(demo.adc_points - 1) == 196250
+
+
+def test_длина_волны_убывает_с_индексом() -> None:
+    """Прежняя интуиция «от Start к Stop» была обратной — фиксируем правильную."""
+    demo = DeviceProfile(start_param=0, stop_param=5100)
+    assert demo.adc_index_to_nm(0) == pytest.approx(1568.36, abs=0.01)
+    assert demo.adc_index_to_nm(demo.adc_points - 1) == pytest.approx(1527.60, abs=0.01)
+    assert demo.adc_index_to_nm(0) > demo.adc_index_to_nm(1)
+
+
+def test_пересчёт_индекса_обратим() -> None:
+    """`ghz_to_adc_index` обратна `adc_index_to_ghz`, включая дробные индексы."""
+    demo = DeviceProfile(start_param=0, stop_param=5100)
+    assert demo.ghz_to_adc_index(demo.adc_index_to_ghz(1455.7)) == pytest.approx(1455.7)
+
+
+def test_положение_пика_совпадает_с_наблюдённым() -> None:
+    """Сверка с KB_06: решётка 1544.80 нм ожидается около индекса 1458.
+
+    В захвате пик наблюдался на 1455.7, а курсор GUI на нём показал
+    1544.850 нм; наш пересчёт того же индекса даёт 1544.83.
+    """
+    demo = DeviceProfile(start_param=0, stop_param=5100)
+    assert demo.ghz_to_adc_index(C_NM_GHZ / 1544.80) == pytest.approx(1458, abs=1.0)
+    assert demo.adc_index_to_nm(1455.7) == pytest.approx(1544.84, abs=0.01)
+
+
+def test_обратная_ориентация_остаётся_параметром() -> None:
+    """KB_05 №8: если прибор окажется с другой ориентацией, правится профиль."""
+    flipped = DeviceProfile(start_param=0, stop_param=5100, adc_index_ascending_freq=False)
+    assert flipped.adc_index_to_ghz(0) == 196250
+    assert flipped.adc_index_to_ghz(flipped.adc_points - 1) == 191150
+
+
+# ======================================================================================
+# Недокументированная команда 10 02 (N17)
+# ======================================================================================
+
+
+def test_сборка_недокументированной_команды() -> None:
+    """10 02 04 00 — байт в байт как в захвате."""
+    assert codec.build_read_undocumented() == VEC["req_undocumented_02"]
+
+
+def test_разбор_недокументированного_ответа() -> None:
+    """Поля не интерпретируются: смысл неизвестен (N17), выдумывать нечего."""
+    response = codec.parse_undocumented(VEC["resp_undocumented_02"]).unwrap()
+
+    assert len(response.payload) == 16
+    assert response.words == (1500, 2688, 0, 0, 0, 0, 0, 0)
+
+
+def test_диспетчер_узнаёт_недокументированный_ответ(profile: DeviceProfile) -> None:
+    """Ответ 10 02 больше не UNKNOWN_COMMAND: команда существует и отвечает."""
+    result = codec.parse_any(VEC["resp_undocumented_02"], profile).unwrap()
+    assert result.words[0] == 1500
+
+
+def test_недокументированный_ответ_с_нечётным_телом() -> None:
+    """Тело обязано делиться на 16-битные слова — остальное не проверяется."""
+    broken = bytes.fromhex("100200070506 07".replace(" ", ""))
+    result = codec.parse_undocumented(broken)
+    assert result.error is not None
+    assert result.error.kind is ParseErrorKind.LEN_MISMATCH
+
+
+# ======================================================================================
+# Валидация номера канала — целиком на нашей стороне (N18)
+# ======================================================================================
+
+
+@pytest.mark.parametrize("channel", [4, 5, 31, 32])
+def test_команды_отвергают_несуществующий_канал(channel: int, profile: DeviceProfile) -> None:
+    """N18: прибор подтверждает настройку каналов 5…32, границы держим мы.
+
+    Скрининг: штатное ПО настраивает пороги всех 32 каналов на четырёхканальном
+    приборе, и тот отвечает `00 01` на каждую команду. Собственной проверки
+    границ у прибора нет, поэтому единственная защита — эта.
+    """
+    with pytest.raises(ValueError, match="номер канала"):
+        codec.build_set_threshold(channel, 1000, profile)
+    with pytest.raises(ValueError, match="номер канала"):
+        codec.build_set_gain(channel, GainSetting(manual=False, level=1), profile)
+    with pytest.raises(ValueError, match="номер канала"):
+        codec.build_read_raw_adc(channel, profile)
+
+
+def test_команды_принимают_все_существующие_каналы(profile: DeviceProfile) -> None:
+    """Границы валидации — из профиля, а не из константы: 0…3 допустимы."""
+    for channel in range(profile.channels):
+        assert codec.build_set_threshold(channel, None, profile)[3] == channel
+
+
+# ======================================================================================
+# Реальные заголовки длинных ответов
+# ======================================================================================
+
+
+def test_заголовок_ответа_30_07_со_стенда(profile: DeviceProfile) -> None:
+    """✅ 5112 байт, канал 0, усиление авто уровня 0, первый отсчёт 100."""
+    prefix = VEC["resp_raw_adc_ch1_prefix"]
+    assert int.from_bytes(prefix[2:6], "big") == 5112
+    assert 2 + profile.mode_len_width + 4 + profile.adc_points * 2 == 5112
+
+    # Тело дополняется синтетическими отсчётами: полных 2551 значения в KB_06 нет.
+    tail = b"\x00\x00" * (profile.adc_points - 1)
+    block = codec.parse_raw_adc(prefix + tail, profile).unwrap()
+    assert block.channel == 0
+    assert block.gain == GainSetting(manual=False, level=0)
+    assert block.points == profile.adc_points
+    assert block.adc[0] == 100
+
+
+def test_фрагментация_длинных_ответов_согласована_с_захватом(profile: DeviceProfile) -> None:
+    """Число датаграмм при полезной нагрузке 1472 байта.
+
+    ✅ Для `30 07` захват даёт 4 датаграммы: 1472 · 3 + 696 = 5112 — сходится.
+
+    ⚠️ Для `30 03` KB_02 называет «15 датаграмм (14 × 1472 + 1294)», но эта
+    арифметика противоречива: 14 × 1472 + 1294 = 21902, а не 20430. При том же
+    размере полезной нагрузки 20430 байт дают 13 × 1472 + 1294 = 20430, то есть
+    **14** датаграмм. Тест закрепляет арифметику, а не число из текста;
+    расхождение вынесено в сводку чата.
+    """
+    mtu_payload = 1472
+    raw_adc_total = 5112
+    debug_total = 20430
+
+    assert -(-raw_adc_total // mtu_payload) == 4
+    assert raw_adc_total - 3 * mtu_payload == 696
+
+    assert -(-debug_total // mtu_payload) == 14
+    assert debug_total - 13 * mtu_payload == 1294
