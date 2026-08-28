@@ -96,8 +96,14 @@ def frame_numbers(paths: list[Path]) -> list[int]:
 
 
 def files_of(directory: Path, prefix: str = "data") -> list[Path]:
-    """Файлы записи в порядке появления."""
-    return sorted(directory.glob(f"{prefix}_*.csv"), key=lambda path: path.stat().st_ctime_ns)
+    """Файлы записи в порядке появления — по именам, а не по времени создания.
+
+    Сортировка по `st_ctime_ns` выглядела очевиднее и была неверна: на Windows
+    разрешение времени создания грубее интервала между ротациями, и девять
+    файлов одной секунды выстраивались произвольно. Порядок обязан читаться
+    из имён — ровно так его будет восстанавливать постобработка.
+    """
+    return sorted(directory.glob(f"{prefix}_*.csv"))
 
 
 @pytest.fixture
@@ -583,6 +589,40 @@ def test_имена_файлов_не_сталкиваются(pipeline: Pipelin
     assert len(paths) >= 2
     assert len({path.name for path in paths}) == len(paths)
     assert all(path.stat().st_size > 0 for path in paths)
+    # Номер дополнен нулями, иначе `_10` встало бы перед `_2`.
+    assert paths[1].name.endswith("_002.csv")
+
+
+def test_порядок_имён_совпадает_с_порядком_создания(pipeline: Pipeline, tmp_path: Path) -> None:
+    """Алфавитная сортировка имён обязана давать порядок частей записи.
+
+    Свойство не косметическое: постобработка склеивает файлы по
+    `sorted(glob(...))`, и перепутанный порядок разорвал бы непрерывный ряд
+    кадров. Опираться на время создания файла нельзя — на Windows его
+    разрешение грубее интервала между ротациями, что и уронило CI чата №7.
+
+    Стимул точный: лимит в 2 КБ при строке около 550 байт даёт десяток
+    файлов за одну секунду, то есть двузначные номера частей, — именно там
+    ломается сортировка без дополнения нулями.
+    """
+    recorder = recorder_for(pipeline, tmp_path, rotate_bytes=2000, chunk_frames=1)
+    recorder.open()
+    feed(pipeline, 60, start_s=0.0)
+    recorder.pump()
+    recorder.close()
+
+    paths = sorted(tmp_path.glob("data_*.csv"))
+    assert len(paths) >= 10, "стимул не сработал: двузначных номеров частей нет"
+    parts = [
+        int(
+            next(line for line in comment_lines(path) if "file_part=" in line).split("file_part=")[
+                1
+            ]
+        )
+        for path in paths
+    ]
+    assert parts == list(range(1, len(paths) + 1))
+    assert frame_numbers(paths) == list(range(60))
 
 
 # --------------------------------------------------------------------------------------
