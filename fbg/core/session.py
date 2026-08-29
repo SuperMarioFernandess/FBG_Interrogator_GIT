@@ -36,6 +36,20 @@
 `on_telemetry` — из потока-диспетчера транспорта, `on_state` и
 `on_config_mismatch` — из потока watchdog либо из потока вызывающего.
 Блокироваться в них надолго нельзя (см. контракт `tap` в `transport.py`).
+
+Журнал пакетов — необязательный отвод, а не зависимость
+-------------------------------------------------------
+Проводка журнала (Р54) сделана двумя колбэками `log_rx` и `log_tx`, а не
+объектом журнала: `fbg/core` не импортирует `fbg/io` и не должен (направление
+зависимостей в KB_03). Сигнатуры совпадают с методами `fbg.io.packet_log`,
+поэтому подключение выглядит как ``Session(..., log_rx=log.log_rx,
+log_tx=log.log_tx)``, но сессия про журнал ничего не знает и без него
+работает ровно как раньше.
+
+`log_rx` зовётся **первой строкой** `_on_datagram`, до классификации: сырые
+байты попадают в журнал до разбора всегда (KB_05 №3). `log_tx` зовётся из
+`_send` после успешной отправки. Отказ любого из них считается в
+`SessionStats.tap_errors` и обмен не прерывает (Р50).
 """
 
 import threading
@@ -299,6 +313,9 @@ class SessionStats:
     verification_mismatches: int = 0
     keepalive_failures: int = 0
     incomplete_responses: int = 0
+    tap_errors: int = 0
+    """Отказы журнала пакетов. Сессию они не роняют (Р50), но и не молчат."""
+
     errors: dict[str, int] = field(default_factory=dict)
     """Исключения в потоке watchdog по имени класса — признак бага, а не связи."""
 
@@ -325,6 +342,7 @@ class _Counters:
     verification_mismatches: int = 0
     keepalive_failures: int = 0
     incomplete_responses: int = 0
+    tap_errors: int = 0
 
 
 @dataclass
@@ -371,6 +389,8 @@ class Session:
         on_telemetry: Callable[[bytes, float], None] | None = None,
         on_state: Callable[[SessionState, SessionState], None] | None = None,
         on_config_mismatch: Callable[[tuple[str, ...]], None] | None = None,
+        log_rx: Callable[[bytes, float], None] | None = None,
+        log_tx: Callable[[bytes, float], None] | None = None,
     ) -> None:
         self._endpoint = endpoint
         self._profile = profile or DeviceProfile()
@@ -378,6 +398,8 @@ class Session:
         self._on_telemetry = on_telemetry
         self._on_state = on_state
         self._on_config_mismatch = on_config_mismatch
+        self._log_rx = log_rx
+        self._log_tx = log_tx
 
         self._transport = UdpTransport(endpoint, self._on_datagram)
         self._counters = _Counters()
@@ -472,6 +494,7 @@ class Session:
             verification_mismatches=counters.verification_mismatches,
             keepalive_failures=counters.keepalive_failures,
             incomplete_responses=counters.incomplete_responses,
+            tap_errors=counters.tap_errors,
             errors=dict(self._errors),
         )
 
@@ -533,7 +556,7 @@ class Session:
         """
         try:
             if self._transport.is_open:
-                self._transport.send(codec.build_stop())
+                self._send(codec.build_stop())
         except (OSError, RuntimeError):
             pass
         finally:
@@ -569,12 +592,19 @@ class Session:
     # --- Приём датаграмм ---------------------------------------------------------------
 
     def _on_datagram(self, data: bytes, t_mono: float) -> None:
-        """Колбэк транспорта: телеметрия — потребителю, остальное — корреляции.
+        """Колбэк транспорта: журнал, затем телеметрия потребителю или корреляция.
 
         Вызывается из потока-диспетчера транспорта. Разбора здесь нет:
         телеметрия уходит сырыми байтами (KB_05 №3 — журналу нужны байты
         до разбора), корреляция работает по двум первым байтам.
+
+        Журнал стоит **первой строкой**, до `classify` и до любого ветвления
+        (правило KB_05 №3): байты обязаны попасть в него раньше, чем кто-либо
+        решит, что они означают, — иначе датаграмма, которую мы не сумели
+        опознать, в журнал не попала бы вовсе, а именно она при отладке
+        протокола интереснее всего (Р48).
         """
+        self._tap(self._log_rx, data, t_mono)
         key = codec.classify(data)
         if key == (codec.ID_MODE, codec.FC_STREAM):
             self._last_frame_mono = t_mono
@@ -599,6 +629,38 @@ class Session:
                 return
             pending.frame = data
             pending.done.set()
+
+    def _tap(self, sink: Callable[[bytes, float], None] | None, data: bytes, t_mono: float) -> None:
+        """Отдаёт байты журналу, если он подключён. Его отказ сессию не роняет.
+
+        Журнал по отношению к обмену вторичен (Р50): диагностический модуль
+        не имеет права остановить протокол. Поэтому здесь ловится `Exception`
+        целиком — включая баг в самом журнале, — но не молча: отказ считается
+        в `SessionStats.tap_errors`, потому что тихой потери в тракте быть
+        не должно нигде (KB_05 №13).
+
+        Дорогого здесь не делается ничего: контракт `log_rx` — положить байты
+        в свою очередь и вернуться (KB_05 №23, №28).
+        """
+        if sink is None:
+            return
+        try:
+            sink(data, t_mono)
+        except Exception:
+            self._counters.tap_errors += 1
+
+    def _send(self, request: bytes) -> bool:
+        """Отправляет датаграмму и отдаёт её журналу. False — сокет отверг.
+
+        Журнал зовётся **после** успешной отправки: он ведёт запись провода,
+        а команда, которую сокет не принял, на проводе не появилась. Отказ
+        отправки при этом не теряется — его считает транспорт, а сессия
+        возвращает отдельный `SEND_FAILED`.
+        """
+        if not self._transport.send(request):
+            return False
+        self._tap(self._log_tx, request, time.perf_counter())
+        return True
 
     def _starts_long_response(self, pending: _Pending, data: bytes) -> bool:
         """True, если первая датаграмма объявила LEN больше собственной длины (D5).
@@ -691,7 +753,7 @@ class Session:
         with self._pending_lock:
             self._pending = pending
         try:
-            if not self._transport.send(request):
+            if not self._send(request):
                 return _fail(
                     SessionErrorKind.SEND_FAILED,
                     f"сокет отверг команду {ident:02X} {fc:02X}; см. transport.stats().errors",
@@ -824,7 +886,7 @@ class Session:
             )
         try:
             self._counters.commands += 1
-            if not self._transport.send(request):
+            if not self._send(request):
                 return _fail(
                     SessionErrorKind.SEND_FAILED, f"сокет отверг команду {ident:02X} {fc:02X}"
                 )
