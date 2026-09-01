@@ -16,9 +16,12 @@
 """
 
 import socket
+import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -1059,10 +1062,27 @@ def test_заводское_состояние_совпадает_с_прибо�
 
 
 def test_симулятор_не_тянет_qt() -> None:
-    """Симулятор — часть проекта, а не UI: PySide6 он не импортирует."""
-    import sys
+    """Симулятор — часть проекта, а не UI: PySide6 он не импортирует.
 
-    assert "PySide6" not in sys.modules
+    Проверка ушла в подпроцесс в чате №10 по той же причине, что и у дымового
+    теста: с появлением `fbg/ui` в прогоне живут тесты, импортирующие Qt
+    намеренно, и `sys.modules` текущего процесса перестал что-либо говорить
+    о зависимостях симулятора — сборка тестовых модулей затягивает PySide6
+    ещё до запуска первого теста.
+    """
+    program = (
+        "import sys\n"
+        "import fbg.sim.device_sim, fbg.sim.encode, fbg.sim.scene\n"
+        "sys.exit('симулятор импортировал PySide6' if 'PySide6' in sys.modules else 0)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 # ======================================================================================

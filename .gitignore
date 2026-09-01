@@ -26,3 +26,6 @@ settings.json
 # IDE
 .idea/
 .vscode/
+fbg_config.json
+fbg_config.json.bad
+sensors.json
