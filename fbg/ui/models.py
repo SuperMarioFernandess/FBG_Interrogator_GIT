@@ -85,6 +85,10 @@ class AppSnapshot:
     log: PacketLogStats | None = None
     recorder: RecorderStats | None = None
 
+    last_spectrum_max_adc: int | None = None
+    last_spectrum_saturated_points: int | None = None
+    """Сводка последнего спектра; `None` означает, что спектра в приложении ещё не было."""
+
     connected: bool = False
     recording: bool = False
     connecting: bool = False
@@ -126,6 +130,190 @@ def format_threshold(setup: ChannelSetup) -> str:
     if setup.threshold is None:
         return "авто (FFFF)"
     return str(setup.threshold)
+
+
+# --------------------------------------------------------------------------------------
+# Панель настройки прибора
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ChannelConfigModel:
+    """Редактируемые настройки одного физического канала."""
+
+    channel: int
+    threshold: int | None
+    gain: GainSetting
+    threshold_unconfirmed: bool = False
+    gain_unconfirmed: bool = False
+
+
+@dataclass(frozen=True)
+class SweepEditModel:
+    """Поля команды 20 01 и производные величины для предварительного просмотра."""
+
+    start_param: int
+    step_param: int
+    stop_param: int
+    adc_step_param: int
+    start_ghz: int
+    stop_ghz: int
+    start_nm: float
+    stop_nm: float
+    adc_points: int
+    unconfirmed: bool = False
+
+
+@dataclass(frozen=True)
+class DeviceConfigModel:
+    """Вся модель панели настройки, построенная из одного `AppSnapshot`."""
+
+    enabled: bool
+    channel_count: int
+    channels: tuple[ChannelConfigModel, ...]
+    peak_gap_ghz: int | None
+    peak_gap_unconfirmed: bool
+    sweep: SweepEditModel | None
+    saved_thresholds_unconfirmed: bool
+    adc_max: int
+    gain_max_level: int
+    last_spectrum_max_adc: int | None
+    last_spectrum_saturated_points: int | None
+
+
+def validate_channel(channel: int, channel_count: int) -> int:
+    """Проверяет 0-based номер **реального** канала (R14)."""
+    if not 0 <= channel < channel_count:
+        raise ValueError(
+            f"номер канала {channel} вне диапазона 0…{channel_count - 1}; "
+            "прибор не проверяет канал и может испортить настройки других каналов (R14)"
+        )
+    return channel
+
+
+def threshold_value(auto: bool, value: int, adc_max: int) -> int | None:
+    """Значение для 20 02: `None` кодирует FFFF, число строго 0…adc_max."""
+    if auto:
+        return None
+    if not 0 <= value <= adc_max:
+        raise ValueError(
+            f"порог {value} вне диапазона 0…{adc_max}; FFFF доступен только как режим «авто»"
+        )
+    return value
+
+
+def gain_value(manual: bool, level: int, gain_max_level: int) -> GainSetting:
+    """Значение для 20 03 с жёсткой проверкой уровня."""
+    if not 0 <= level <= gain_max_level:
+        raise ValueError(f"уровень усиления {level} вне диапазона 0…{gain_max_level}")
+    return GainSetting(manual=manual, level=level)
+
+
+def sweep_edit_model(
+    profile: DeviceProfile,
+    start_param: int,
+    step_param: int,
+    stop_param: int,
+    adc_step_param: int,
+    *,
+    unconfirmed: bool = False,
+) -> SweepEditModel:
+    """Проверяет поля 20 01 и считает точки АЦП и границы в нм до отправки."""
+    for name, value in (
+        ("start_param", start_param),
+        ("step_param", step_param),
+        ("stop_param", stop_param),
+        ("adc_step_param", adc_step_param),
+    ):
+        if not 0 <= value <= 0xFFFF:
+            raise ValueError(f"{name}={value} не помещается в 16 бит")
+    if start_param >= stop_param:
+        raise ValueError(
+            "нарушен инвариант развёртки: Start-частота должна быть больше Stop-частоты "
+            "(то есть start_param < stop_param)"
+        )
+    if step_param < 1 or adc_step_param < 1:
+        raise ValueError("шаг развёртки и шаг АЦП должны быть не меньше 1 ГГц")
+
+    start_ghz = profile.param_to_ghz(start_param)
+    stop_ghz = profile.param_to_ghz(stop_param)
+    adc_points = (start_ghz - stop_ghz) // adc_step_param + 1
+    return SweepEditModel(
+        start_param=start_param,
+        step_param=step_param,
+        stop_param=stop_param,
+        adc_step_param=adc_step_param,
+        start_ghz=start_ghz,
+        stop_ghz=stop_ghz,
+        start_nm=C_NM_GHZ / start_ghz,
+        stop_nm=C_NM_GHZ / stop_ghz,
+        adc_points=adc_points,
+        unconfirmed=unconfirmed,
+    )
+
+
+def device_config_model(snapshot: AppSnapshot) -> DeviceConfigModel:
+    """Строит модель редактирования только из подтверждённого снимка прибора.
+
+    Каналы берутся из `DeviceConfig.module.channels`, а не из профиля: R14
+    показал, что ошибочный номер не отвергается железом и портит реальные
+    настройки. До успешного опроса панель поэтому заблокирована целиком.
+    """
+    device = snapshot.device
+    enabled = (
+        device is not None
+        and snapshot.state in (SessionState.IDLE, SessionState.STREAMING)
+        and not snapshot.connecting
+        and not snapshot.profile_mismatch
+    )
+    if device is None:
+        return DeviceConfigModel(
+            enabled=False,
+            channel_count=0,
+            channels=(),
+            peak_gap_ghz=None,
+            peak_gap_unconfirmed="peak_gap" in snapshot.unconfirmed,
+            sweep=None,
+            saved_thresholds_unconfirmed="saved_thresholds" in snapshot.unconfirmed,
+            adc_max=snapshot.profile.adc_max,
+            gain_max_level=snapshot.profile.gain_max_level,
+            last_spectrum_max_adc=snapshot.last_spectrum_max_adc,
+            last_spectrum_saturated_points=snapshot.last_spectrum_saturated_points,
+        )
+
+    channel_count = device.module.channels
+    channels = tuple(
+        ChannelConfigModel(
+            channel=setup.channel,
+            threshold=setup.threshold,
+            gain=setup.gain,
+            threshold_unconfirmed=f"threshold:{setup.channel}" in snapshot.unconfirmed,
+            gain_unconfirmed=f"gain:{setup.channel}" in snapshot.unconfirmed,
+        )
+        for setup in device.channels
+        if 0 <= setup.channel < channel_count
+    )
+    sweep = sweep_edit_model(
+        snapshot.profile,
+        device.sweep.start_param,
+        device.sweep.step_param,
+        device.sweep.stop_param,
+        device.sweep.adc_step_param,
+        unconfirmed="sweep" in snapshot.unconfirmed,
+    )
+    return DeviceConfigModel(
+        enabled=enabled,
+        channel_count=channel_count,
+        channels=channels,
+        peak_gap_ghz=device.module.peak_gap_ghz,
+        peak_gap_unconfirmed="peak_gap" in snapshot.unconfirmed,
+        sweep=sweep,
+        saved_thresholds_unconfirmed="saved_thresholds" in snapshot.unconfirmed,
+        adc_max=snapshot.profile.adc_max,
+        gain_max_level=snapshot.profile.gain_max_level,
+        last_spectrum_max_adc=snapshot.last_spectrum_max_adc,
+        last_spectrum_saturated_points=snapshot.last_spectrum_saturated_points,
+    )
 
 
 # --------------------------------------------------------------------------------------

@@ -47,6 +47,7 @@ from pathlib import Path
 from types import TracebackType
 
 from fbg.core.endpoint import Endpoint
+from fbg.core.frames import ChannelSetup, GainSetting, SweepConfig
 from fbg.core.pipeline import Pipeline
 from fbg.core.session import (
     DeviceConfig,
@@ -323,6 +324,150 @@ class AppController:
     def stop_stream(self) -> Result[bool]:
         """Останавливает поток телеметрии."""
         return self._session.stop_stream()
+
+    # --- Настройка прибора -------------------------------------------------------------
+
+    def _require_configurable_profile(self) -> None:
+        """Не пишет геометрию, пока профиль приложения расходится с прибором."""
+        if self._profile_mismatch:
+            raise RuntimeError(
+                "настройка прибора заблокирована: сначала примите его геометрию и переподключитесь"
+            )
+
+    def _live_channel_count(self) -> int:
+        """Число каналов по живому ответу 10 04, а не по профилю (R14)."""
+        device = self._session.device_config
+        if device is None:
+            raise RuntimeError("настройка канала доступна только после опроса прибора")
+        return device.module.channels
+
+    def _validate_live_channel(self, channel: int) -> None:
+        count = self._live_channel_count()
+        if not 0 <= channel < count:
+            raise ValueError(
+                f"номер канала {channel} вне диапазона 0…{count - 1}; "
+                "прибор не проверяет канал и может испортить настройки других каналов (R14)"
+            )
+
+    def _remember_command_result[T](self, label: str, result: Result[T]) -> Result[T]:
+        """Сохраняет отказ для строки состояния и сообщает его оператору."""
+        self._last_error = result.error
+        if result.error is not None:
+            self.note(f"{label}: {result.error}")
+        return result
+
+    def set_threshold(self, channel: int, threshold: int | None) -> Result[ChannelSetup]:
+        """20 02 + обязательный read-back 10 06. Разрешено и в Streaming (Р62)."""
+        self._require_configurable_profile()
+        self._validate_live_channel(channel)
+        if threshold is not None and not 0 <= threshold <= self._config.profile.adc_max:
+            raise ValueError(
+                f"порог {threshold} вне диапазона 0…{self._config.profile.adc_max}; "
+                "авторежим задаётся только значением None"
+            )
+        return self._remember_command_result(
+            f"порог канала {channel + 1}", self._session.set_threshold(channel, threshold)
+        )
+
+    def set_gain(self, channel: int, manual: bool, level: int) -> Result[ChannelSetup]:
+        """20 03 + обязательный read-back 10 06. Разрешено и в Streaming (Р62)."""
+        self._require_configurable_profile()
+        self._validate_live_channel(channel)
+        if not 0 <= level <= self._config.profile.gain_max_level:
+            raise ValueError(
+                f"уровень усиления {level} вне диапазона 0…{self._config.profile.gain_max_level}"
+            )
+        gain = GainSetting(manual=manual, level=level)
+        return self._remember_command_result(
+            f"усиление канала {channel + 1}", self._session.set_gain(channel, gain)
+        )
+
+    def _cache_live_geometry(self) -> None:
+        """Кэширует подтверждённые 10 04/10 05 в `AppConfig` после записи."""
+        device = self._session.device_config
+        if device is None:
+            return
+        profile = config_module.profile_from_device(
+            self._config.profile, device.module, device.sweep
+        )
+        self._last_device = device
+        if profile == self._config.profile:
+            return
+        self._config = self._config.with_profile(profile)
+        self._save()
+
+    def set_peak_gap(self, gap_ghz: int) -> Result[int]:
+        """20 04 + обязательный read-back 10 04."""
+        self._require_configurable_profile()
+        if not 1 <= gap_ghz <= 0xFF:
+            raise ValueError(f"интервал пиков {gap_ghz} ГГц вне диапазона 1…255")
+        result = self._remember_command_result(
+            "интервал пиков", self._session.set_peak_gap(gap_ghz)
+        )
+        if result.ok:
+            self._cache_live_geometry()
+        return result
+
+    def set_sweep(
+        self, start_param: int, step_param: int, stop_param: int, adc_step_param: int
+    ) -> Result[SweepConfig]:
+        """20 01 + read-back; при новой геометрии пересобирает тракт.
+
+        Сама команда 0x20 разрешена в Streaming по Р62. Но границы развёртки
+        входят в `DeviceProfile`, которым pipeline валидирует телеметрию. После
+        подтверждённого изменения старый профиль использовать нельзя, поэтому
+        сессия останавливается, профиль сохраняется и тракт пересобирается.
+        Следующее подключение уже работает с новыми границами.
+        """
+        self._require_configurable_profile()
+        if self._recorder is not None:
+            raise RuntimeError("развёртку нельзя менять во время записи измерений")
+        for name, value in (
+            ("start_param", start_param),
+            ("step_param", step_param),
+            ("stop_param", stop_param),
+            ("adc_step_param", adc_step_param),
+        ):
+            if not 0 <= value <= 0xFFFF:
+                raise ValueError(f"{name}={value} не помещается в 16 бит")
+        if start_param >= stop_param:
+            raise ValueError(
+                "нарушен инвариант развёртки: start_param должен быть меньше stop_param"
+            )
+        if step_param < 1 or adc_step_param < 1:
+            raise ValueError("шаг развёртки и шаг АЦП должны быть не меньше 1 ГГц")
+        sweep = SweepConfig.from_params(
+            start_param, step_param, stop_param, adc_step_param, self._config.profile
+        )
+        result = self._remember_command_result("развёртка", self._session.set_sweep(sweep))
+        if result.ok:
+            self._rebuild_after_sweep_change()
+        return result
+
+    def _rebuild_after_sweep_change(self) -> None:
+        """Пересобирает parser/log/session, если 10 05 подтвердил новые границы."""
+        device = self._session.device_config
+        if device is None:
+            return
+        updated = config_module.profile_from_device(
+            self._config.profile, device.module, device.sweep
+        )
+        self._last_device = device
+        if updated == self._config.profile:
+            return
+        self._session.disconnect()
+        self._config = self._config.with_profile(updated)
+        self._save()
+        self._rebuild()
+        self.note(
+            "развёртка применена и подтверждена; тракт пересобран под новые границы, "
+            "подключитесь снова"
+        )
+
+    def save_thresholds(self) -> Result[tuple[ChannelSetup, ...]]:
+        """20 06 без ответа, задержка, затем read-back 10 06 (D4 подтверждён)."""
+        self._require_configurable_profile()
+        return self._remember_command_result("сохранение порогов", self._session.save_thresholds())
 
     def start_recording(self) -> Recorder:
         """Начинает запись измерений. Повторный вызов возвращает того же писателя.

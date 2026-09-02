@@ -2,11 +2,10 @@
 
 Всё гоняется против симулятора `fbg.sim.device_sim`: живого прибора нет.
 
-⚠️ Тесты фиксируют поведение **сессии и симулятора**, а не факты о приборе.
-Керектность гипотез D4 (`20 06` без ответа), D5 (сколькими датаграммами
-приходят длинные ответы), N7 (порядок команд при старте), N8 (период
-keepalive) и N9 (принимает ли прибор настройки в потоке) этими тестами
-не проверяется и проверена быть не может — захватов нет (KB_04, KB_05 №12).
+⚠️ Тесты фиксируют поведение **сессии и симулятора**, а факты о приборе
+берутся из захватов. D4 и N9 закрыты скринингом 01.09.2026: `20 06` молчит,
+а во время потока группы 0x10/0x20 проходят, тогда как 0x30 вытесняет поток.
+Тесты ниже лишь закрепляют перенос этих измеренных фактов в код.
 
 Отдельно про D5: датаграммы «в несколько кусков» здесь производит
 тестовый `FragmentingDevice`, а не наблюдение за прибором. Тест проверяет,
@@ -764,26 +763,39 @@ def test_telemetry_goes_to_callback_raw(rig: Rig) -> None:
     assert t_mono > 0.0
 
 
-def test_settings_blocked_during_streaming(rig: Rig) -> None:
-    """Настройка во время потока не выпускается наружу — WrongState."""
+def test_reads_and_writes_allowed_during_streaming(rig: Rig) -> None:
+    """Р62: 0x10 и 0x20 проходят в Streaming и поток продолжает идти."""
     assert rig.session.start_stream().ok
     try:
-        for result in (
-            rig.session.set_threshold(0, 1000),
-            rig.session.set_gain(0, GainSetting(manual=True, level=1)),
-            rig.session.set_peak_gap(35),
-            rig.session.read_version(),
-            rig.session.debug_once(),
-        ):
+        assert wait_until(lambda: rig.session.stats().telemetry_frames > 5)
+        before = rig.session.stats().telemetry_frames
+        assert rig.session.read_module_params().ok
+        setup = rig.session.set_threshold(0, 1000).unwrap()
+        assert setup.threshold == 1000
+        assert rig.sim.state.thresholds[0] == 1000
+        assert rig.session.state is SessionState.STREAMING
+        assert rig.sim.streaming
+        assert wait_until(lambda: rig.session.stats().telemetry_frames > before + 5)
+    finally:
+        assert rig.session.stop_stream().ok
+
+
+def test_mode_group_rejected_during_streaming(rig: Rig) -> None:
+    """Р62/R13: 30 03 и 30 07 не выпускаются, потому что вытесняют поток."""
+    assert rig.session.start_stream().ok
+    assert wait_until(lambda: rig.sim.streaming)
+    try:
+        for result in (rig.session.read_raw_adc(0), rig.session.debug_once()):
             assert result.error is not None
             assert result.error.kind is SessionErrorKind.WRONG_STATE
-        assert rig.sim.state.thresholds[0] != 1000
+        assert rig.session.state is SessionState.STREAMING
+        assert rig.sim.streaming
     finally:
         assert rig.session.stop_stream().ok
 
 
 def test_stop_allowed_during_streaming(rig: Rig) -> None:
-    """Единственная разрешённая в потоке команда — Stop."""
+    """Из режимной группы 0x30 в потоке разрешён Stop."""
     assert rig.session.start_stream().ok
     assert rig.session.stop_stream().ok
     assert rig.session.state is SessionState.IDLE

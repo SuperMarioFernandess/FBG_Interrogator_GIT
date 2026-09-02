@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QLabel, QMainWindow, QStatusBar, QTabWidget, QWidg
 from fbg.ui import models, texts
 from fbg.ui.app import AppController
 from fbg.ui.panels.connection import ConnectionPanel
+from fbg.ui.panels.device_config import DeviceConfigPanel
 from fbg.ui.panels.device_info import DeviceInfoPanel
 from fbg.ui.panels.packet_log import PacketLogPanel
 
@@ -25,7 +26,7 @@ UI_PERIOD_MS = 100
 
 
 class MainWindow(QMainWindow):
-    """Главное окно: три вкладки и строка состояния."""
+    """Главное окно: четыре вкладки и строка состояния."""
 
     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -35,11 +36,13 @@ class MainWindow(QMainWindow):
 
         self.connection_panel = ConnectionPanel(controller)
         self.device_panel = DeviceInfoPanel(controller)
+        self.device_config_panel = DeviceConfigPanel(controller)
         self.packet_log_panel = PacketLogPanel(controller)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self.connection_panel, texts.TAB_CONNECTION)
         self.tabs.addTab(self.device_panel, texts.TAB_DEVICE)
+        self.tabs.addTab(self.device_config_panel, texts.TAB_DEVICE_CONFIG)
         self.tabs.addTab(self.packet_log_panel, texts.TAB_PACKET_LOG)
         self.setCentralWidget(self.tabs)
 
@@ -55,7 +58,12 @@ class MainWindow(QMainWindow):
     @property
     def panels(self) -> tuple[QWidget, ...]:
         """Все панели окна в порядке вкладок."""
-        return (self.connection_panel, self.device_panel, self.packet_log_panel)
+        return (
+            self.connection_panel,
+            self.device_panel,
+            self.device_config_panel,
+            self.packet_log_panel,
+        )
 
     @property
     def timer(self) -> QTimer:
@@ -76,6 +84,7 @@ class MainWindow(QMainWindow):
         snapshot = self._controller.snapshot()
         self.connection_panel.refresh(snapshot)
         self.device_panel.refresh(snapshot)
+        self.device_config_panel.refresh(snapshot)
         self.packet_log_panel.refresh(snapshot)
         self.status_label.setText(models.status_line(snapshot))
 

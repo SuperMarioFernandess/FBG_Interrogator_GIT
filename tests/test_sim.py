@@ -10,9 +10,9 @@
 скрининга 27.08.2026 часть воспроизводимого поведения стала наблюдённой —
 раскладка кадра (N4), единицы частоты (D1), код «пик не найден» (N3),
 раскладка `30 03` и два ответа на одну команду (N14), ориентация массива
-АЦП (D9). Открытыми остаются реакция на мусор и на недопустимый аргумент
-(N10) и знаковость температуры (N2b): здесь симулятор по-прежнему
-воспроизводит выбранное нами поведение, а не наблюдённое.
+АЦП (D9). Скрининг 01.09.2026 добавил D4 и Р62/Р63: `20 06` молчит,
+0x10/0x20 проходят во время потока, а режимная 0x30 вытесняет его.
+Открытой остаётся знаковость температуры (N2b).
 """
 
 import socket
@@ -296,17 +296,14 @@ def test_20_01_развёртка_записывается_и_читается_�
     assert (read_back.stop_param, read_back.adc_step_param) == (5000, 4)
 
 
-@pytest.mark.parametrize("frame_len", [11, 12])
-def test_20_01_принимаются_обе_длины_кадра_из_вопроса_d3(
-    harness: Harness, profile: DeviceProfile, frame_len: int
+@pytest.mark.parametrize("padding", [0, 4])
+def test_20_01_принимает_точный_кадр_и_padding_штатного_по(
+    harness: Harness, profile: DeviceProfile, padding: int
 ) -> None:
-    """Вопрос D3 не закрыт, поэтому симулятор не предрешает, какую длину шлёт ПК.
-
-    Какую из двух принимает настоящий прибор — выясняется фазой 2 скрининга.
-    """
-    variant = DeviceProfile(set_sweep_frame_len=frame_len, set_sweep_len_field=12)
-    command = codec.build_set_sweep(SweepConfig.from_params(1, 2, 5101, 2, profile), variant)
-    assert len(command) == frame_len
+    """D3: LEN=12, на проводе наблюдались 12 байт и 16 с четырьмя нулями."""
+    command = codec.build_set_sweep(SweepConfig.from_params(1, 2, 5101, 2, profile), profile)
+    command += b"\x00" * padding
+    assert len(command) == 12 + padding
     reply = harness.ask(command)
     assert reply is not None
     assert codec.parse_write_ack(reply).unwrap() is True
@@ -526,7 +523,7 @@ def test_30_03_отдаёт_тот_же_спектр_что_и_30_07(harness: Ha
 
 
 def test_неизвестная_команда_остаётся_без_ответа(harness: Harness) -> None:
-    """Мусор `AA BB CC DD` из сценария G5: реакция прибора неизвестна (N10)."""
+    """N10: мусор `AA BB CC DD` игнорируется, прибор остаётся жив."""
     assert harness.ask(bytes.fromhex("AABBCCDD"), timeout=0.5) is None
     assert harness.sim.stats.unknown_requests >= 1
 
@@ -534,6 +531,41 @@ def test_неизвестная_команда_остаётся_без_отве�
 # ======================================================================================
 # Поток телеметрии
 # ======================================================================================
+
+
+def test_чтения_и_записи_не_останавливают_поток(profile: DeviceProfile, scene: Scene) -> None:
+    """Р62: симулятор не должен врать, что 0x10/0x20 вытесняют Streaming."""
+    sim = DeviceSimulator(profile=profile, scene=scene, reply_to=("127.0.0.1", 1))
+    sim._handle(codec.build_start_stream())
+    assert sim.streaming
+
+    assert sim._handle(codec.build_read_module_params())
+    assert sim._handle(codec.build_set_threshold(0, 1000, profile))
+    assert sim.state.thresholds[0] == 1000
+    assert sim.streaming
+
+
+@pytest.mark.parametrize(
+    "command",
+    [codec.build_debug_once(), codec.build_read_raw_adc(0, DeviceProfile())],
+)
+def test_режимная_команда_вытесняет_поток_до_stop(
+    profile: DeviceProfile, scene: Scene, command: bytes
+) -> None:
+    """Р62/Р63: после 30 03/30 07 простой повтор 30 02 поток не возвращает."""
+    sim = DeviceSimulator(profile=profile, scene=scene, reply_to=("127.0.0.1", 1))
+    sim._handle(codec.build_start_stream())
+    assert sim.streaming
+
+    assert sim._handle(command)
+    assert not sim.streaming
+
+    sim._handle(codec.build_start_stream())
+    assert not sim.streaming
+
+    assert sim._handle(codec.build_stop())
+    sim._handle(codec.build_start_stream())
+    assert sim.streaming
 
 
 def test_поток_стартует_и_останавливается(harness: Harness) -> None:
@@ -734,6 +766,13 @@ def test_сбой_неверный_len_в_ответе_режима(harness: Har
     assert not result.ok
     assert result.error is not None
     assert result.error.kind is ParseErrorKind.LEN_MISMATCH
+
+
+def test_неверный_len_запроса_молча_игнорируется(harness: Harness) -> None:
+    """N10: `10 01 FF 00` ответа не даёт, но симулятор остаётся жив."""
+    assert harness.ask(bytes.fromhex("10 01 FF 00"), timeout=0.05) is None
+    reply = harness.ask(codec.build_read_version())
+    assert reply is not None
 
 
 def test_сбой_ответ_мусором(harness: Harness, profile: DeviceProfile) -> None:

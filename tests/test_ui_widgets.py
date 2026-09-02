@@ -77,12 +77,17 @@ def push(controller: AppController, count: int, prefix: bytes = b"\x10\x04\x04\x
 # --------------------------------------------------------------------------------------
 
 
-def test_окно_создаётся_с_тремя_вкладками(window: MainWindow) -> None:
+def test_окно_создаётся_с_четырьмя_вкладками(window: MainWindow) -> None:
     """Вкладки на месте и подписаны по-русски."""
     titles = [window.tabs.tabText(index) for index in range(window.tabs.count())]
-    assert titles == [texts.TAB_CONNECTION, texts.TAB_DEVICE, texts.TAB_PACKET_LOG]
+    assert titles == [
+        texts.TAB_CONNECTION,
+        texts.TAB_DEVICE,
+        texts.TAB_DEVICE_CONFIG,
+        texts.TAB_PACKET_LOG,
+    ]
     assert window.windowTitle() == texts.APP_TITLE
-    assert len(window.panels) == 3
+    assert len(window.panels) == 4
 
 
 def test_таймер_запускается_и_гаснет(window: MainWindow) -> None:

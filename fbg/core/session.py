@@ -77,18 +77,16 @@ from fbg.core.transport import TransportStats, UdpTransport
 #: превысить заданный; на бюджет команд (сотни миллисекунд) влияния не имеет.
 POLL_SLICE_S = 0.005
 
-#: Единственная команда, разрешённая во время потока телеметрии.
+#: Из режимной группы 0x30 во время Streaming разрешён только Stop.
 #:
-#: Блокируются не только команды настройки, но и чтения: реакция прибора
-#: на любую команду во время потока — открытый вопрос N9, а watchdog
-#: в `Streaming` намеренно не шлёт keepalive `10 01` по той же причине.
-#: Разрешать чтения и одновременно запрещать их watchdog'у было бы
-#: непоследовательно. Выход из потока — только через `Stop` (KB_05 №6).
-STREAMING_ALLOWED: frozenset[tuple[int, int]] = frozenset({(codec.ID_MODE, codec.FC_STOP)})
+#: Р62 подтверждён скринингом 01.09.2026: чтения 0x10 и записи 0x20 проходят
+#: без остановки телеметрии, а 0x30 вытесняет поток. Keepalive в Streaming
+#: по-прежнему не нужен: живость там проверяется самими кадрами телеметрии.
+STREAMING_ALLOWED_MODE: frozenset[tuple[int, int]] = frozenset({(codec.ID_MODE, codec.FC_STOP)})
 
 #: Команды, ответ на которые протоколом не предусмотрен.
 #:
-#: `20 06` — гипотеза D4 (список ведёт кодек). `30 02` — старт потока:
+#: `20 06` — D4 подтверждён скринингом. `30 02` — старт потока:
 #: подтверждения нет, сразу идёт телеметрия (KB_02).
 NO_RESPONSE: frozenset[tuple[int, int]] = codec.NO_RESPONSE_COMMANDS | frozenset(
     {(codec.ID_MODE, codec.FC_STREAM)}
@@ -724,17 +722,24 @@ class Session:
         self._command_lock.release()
 
     def _check_state(self, ident: int, fc: int, internal: bool) -> SessionError | None:
-        """Проверяет, допустима ли команда в текущем состоянии."""
+        """Проверяет, допустима ли команда в текущем состоянии.
+
+        Р62 подтверждено скринингом 01.09.2026, а не принято из осторожности:
+        во время потока группы 0x10 и 0x20 проходят без пропусков телеметрии,
+        тогда как режимная группа 0x30 вытесняет поток. Поэтому в Streaming
+        запрещены только команды 0x30, кроме Stop ``30 01``.
+        """
         state = self.state
         if state is SessionState.DISCONNECTED:
             return SessionError(SessionErrorKind.NOT_CONNECTED, "сессия не подключена")
         if internal:
             return None
-        if state is SessionState.STREAMING and (ident, fc) not in STREAMING_ALLOWED:
+        mode_forbidden = ident == codec.ID_MODE and (ident, fc) not in STREAMING_ALLOWED_MODE
+        if state is SessionState.STREAMING and mode_forbidden:
             return SessionError(
                 SessionErrorKind.WRONG_STATE,
                 f"команда {ident:02X} {fc:02X} запрещена во время потока: "
-                "выйти из Streaming можно только командой Stop (вопрос N9 открыт)",
+                "режимная группа 0x30 вытесняет Streaming (Р62); разрешён только Stop 30 01",
             )
         if state in (SessionState.PROBING, SessionState.DEGRADED, SessionState.RECONNECTING):
             return SessionError(
@@ -1103,11 +1108,11 @@ class Session:
     def save_thresholds(self) -> Result[tuple[ChannelSetup, ...]]:
         """20 06 — сохранить пороги. Ответа нет (D4), поэтому проверяем чтением.
 
-        ⚠️ Read-back здесь подтверждает только то, что прибор жив и пороги
+        Read-back здесь подтверждает только то, что прибор жив и пороги
         в нём те же, что мы записывали. Что они действительно легли
         в энергонезависимую память, чтением не проверить: это видно лишь
-        после отключения питания. Гипотеза D4 (ответа нет) тоже не проверена
-        на железе — команда просто не ждёт ответа, а не «знает», что его нет.
+        после отключения питания. D4 подтверждён скринингом 01.09.2026:
+        ответа на 20 06 нет, а сохранённый порог переживает отключение питания.
         """
         sent = self._send_only(
             codec.build_save_thresholds(), codec.ID_WRITE, codec.FC_SAVE_THRESHOLDS
