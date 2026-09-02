@@ -23,6 +23,8 @@ jobs:
           cat .ci/chat11.patch.* > chat11.patch
           git apply --check chat11.patch
           git apply chat11.patch
+          git apply --check .ci/chat11.fix.001.patch
+          git apply .ci/chat11.fix.001.patch
       - name: Install core dependencies
         run: python -m pip install numpy pytest pytest-cov ruff
       - name: Ruff check
@@ -45,6 +47,8 @@ jobs:
           cat .ci/chat11.patch.* > chat11.patch
           git apply --check chat11.patch
           git apply chat11.patch
+          git apply --check .ci/chat11.fix.001.patch
+          git apply .ci/chat11.fix.001.patch
       - name: Qt system libraries
         run: |
           sudo apt-get update
@@ -69,6 +73,8 @@ jobs:
           cat .ci/chat11.patch.* > chat11.patch
           git apply --check chat11.patch
           git apply chat11.patch
+          git apply --check .ci/chat11.fix.001.patch
+          git apply .ci/chat11.fix.001.patch
       - name: Install dependencies
         run: python -m pip install numpy pytest
       - name: Slow tests
@@ -87,6 +93,8 @@ jobs:
           cat .ci/chat11.patch.* > chat11.patch
           git apply --check chat11.patch
           git apply chat11.patch
+          git apply --check .ci/chat11.fix.001.patch
+          git apply .ci/chat11.fix.001.patch
       - name: Qt system libraries
         run: |
           sudo apt-get update
