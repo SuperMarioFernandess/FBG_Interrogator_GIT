@@ -23,6 +23,7 @@ jobs:
           encoded = p0 + Path('.chat12/patch.01').read_text() + Path('.chat12/patch.02').read_text() + Path('.chat12/patch.03').read_text()
           Path('chat12.patch').write_bytes(gzip.decompress(base64.b64decode(encoded)))
           subprocess.run(['git', 'apply', 'chat12.patch'], check=True)
+          subprocess.run(['git', 'apply', '.chat12/ruff-fix.patch'], check=True)
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -32,13 +33,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set +e
-          ruff check fbg tests main.py --output-format concise > ruff.txt 2>&1
-          rc=$?
+          ruff check fbg tests main.py --output-format concise > ruff-check.txt 2>&1
+          rc_check=$?
+          ruff format --check fbg tests main.py > ruff-format.txt 2>&1
+          rc_format=$?
           {
             echo 'Chat 12 ruff diagnostic:'
+            echo 'ruff check:'
             echo '```text'
-            cat ruff.txt
+            cat ruff-check.txt
+            echo '```'
+            echo 'ruff format --check:'
+            echo '```text'
+            cat ruff-format.txt
             echo '```'
           } > body.txt
           gh pr comment ${{ github.event.pull_request.number }} --body-file body.txt
-          exit $rc
+          if [ "$rc_check" -ne 0 ] || [ "$rc_format" -ne 0 ]; then exit 1; fi
