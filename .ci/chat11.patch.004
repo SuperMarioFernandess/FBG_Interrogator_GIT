@@ -1,0 +1,380 @@
+ Всё гоняется против симулятора `fbg.sim.device_sim`: живого прибора нет.
+ 
+-⚠️ Тесты фиксируют поведение **сессии и симулятора**, а не факты о приборе.
+-Керектность гипотез D4 (`20 06` без ответа), D5 (сколькими датаграммами
+-приходят длинные ответы), N7 (порядок команд при старте), N8 (период
+-keepalive) и N9 (принимает ли прибор настройки в потоке) этими тестами
+-не проверяется и проверена быть не может — захватов нет (KB_04, KB_05 №12).
++⚠️ Тесты фиксируют поведение **сессии и симулятора**, а факты о приборе
++берутся из захватов. D4 и N9 закрыты скринингом 01.09.2026: `20 06` молчит,
++а во время потока группы 0x10/0x20 проходят, тогда как 0x30 вытесняет поток.
++Тесты ниже лишь закрепляют перенос этих измеренных фактов в код.
+ 
+ Отдельно про D5: датаграммы «в несколько кусков» здесь производит
+ тестовый `FragmentingDevice`, а не наблюдение за прибором. Тест проверяет,
+@@ -764,26 +763,39 @@ def test_telemetry_goes_to_callback_raw(rig: Rig) -> None:
+     assert t_mono > 0.0
+ 
+ 
+-def test_settings_blocked_during_streaming(rig: Rig) -> None:
+-    """Настройка во время потока не выпускается наружу — WrongState."""
++def test_reads_and_writes_allowed_during_streaming(rig: Rig) -> None:
++    """Р62: 0x10 и 0x20 проходят в Streaming и поток продолжает идти."""
+     assert rig.session.start_stream().ok
+     try:
+-        for result in (
+-            rig.session.set_threshold(0, 1000),
+-            rig.session.set_gain(0, GainSetting(manual=True, level=1)),
+-            rig.session.set_peak_gap(35),
+-            rig.session.read_version(),
+-            rig.session.debug_once(),
+-        ):
++        assert wait_until(lambda: rig.session.stats().telemetry_frames > 5)
++        before = rig.session.stats().telemetry_frames
++        assert rig.session.read_module_params().ok
++        setup = rig.session.set_threshold(0, 1000).unwrap()
++        assert setup.threshold == 1000
++        assert rig.sim.state.thresholds[0] == 1000
++        assert rig.session.state is SessionState.STREAMING
++        assert rig.sim.streaming
++        assert wait_until(lambda: rig.session.stats().telemetry_frames > before + 5)
++    finally:
++        assert rig.session.stop_stream().ok
++
++
++def test_mode_group_rejected_during_streaming(rig: Rig) -> None:
++    """Р62/R13: 30 03 и 30 07 не выпускаются, потому что вытесняют поток."""
++    assert rig.session.start_stream().ok
++    assert wait_until(lambda: rig.sim.streaming)
++    try:
++        for result in (rig.session.read_raw_adc(0), rig.session.debug_once()):
+             assert result.error is not None
+             assert result.error.kind is SessionErrorKind.WRONG_STATE
+-        assert rig.sim.state.thresholds[0] != 1000
++        assert rig.session.state is SessionState.STREAMING
++        assert rig.sim.streaming
+     finally:
+         assert rig.session.stop_stream().ok
+ 
+ 
+ def test_stop_allowed_during_streaming(rig: Rig) -> None:
+-    """Единственная разрешённая в потоке команда — Stop."""
++    """Из режимной группы 0x30 в потоке разрешён Stop."""
+     assert rig.session.start_stream().ok
+     assert rig.session.stop_stream().ok
+     assert rig.session.state is SessionState.IDLE
+diff --git a/tests/test_sim.py b/tests/test_sim.py
+index a48af1d..eba87d3 100644
+--- a/tests/test_sim.py
++++ b/tests/test_sim.py
+@@ -10,9 +10,9 @@
+ скрининга 27.08.2026 часть воспроизводимого поведения стала наблюдённой —
+ раскладка кадра (N4), единицы частоты (D1), код «пик не найден» (N3),
+ раскладка `30 03` и два ответа на одну команду (N14), ориентация массива
+-АЦП (D9). Открытыми остаются реакция на мусор и на недопустимый аргумент
+-(N10) и знаковость температуры (N2b): здесь симулятор по-прежнему
+-воспроизводит выбранное нами поведение, а не наблюдённое.
++АЦП (D9). Скрининг 01.09.2026 добавил D4 и Р62/Р63: `20 06` молчит,
++0x10/0x20 проходят во время потока, а режимная 0x30 вытесняет его.
++Открытой остаётся знаковость температуры (N2b).
+ """
+ 
+ import socket
+@@ -296,17 +296,14 @@ def test_20_01_развёртка_записывается_и_читается_
+     assert (read_back.stop_param, read_back.adc_step_param) == (5000, 4)
+ 
+ 
+-@pytest.mark.parametrize("frame_len", [11, 12])
+-def test_20_01_принимаются_обе_длины_кадра_из_вопроса_d3(
+-    harness: Harness, profile: DeviceProfile, frame_len: int
++@pytest.mark.parametrize("padding", [0, 4])
++def test_20_01_принимает_точный_кадр_и_padding_штатного_по(
++    harness: Harness, profile: DeviceProfile, padding: int
+ ) -> None:
+-    """Вопрос D3 не закрыт, поэтому симулятор не предрешает, какую длину шлёт ПК.
+-
+-    Какую из двух принимает настоящий прибор — выясняется фазой 2 скрининга.
+-    """
+-    variant = DeviceProfile(set_sweep_frame_len=frame_len, set_sweep_len_field=12)
+-    command = codec.build_set_sweep(SweepConfig.from_params(1, 2, 5101, 2, profile), variant)
+-    assert len(command) == frame_len
++    """D3: LEN=12, на проводе наблюдались 12 байт и 16 с четырьмя нулями."""
++    command = codec.build_set_sweep(SweepConfig.from_params(1, 2, 5101, 2, profile), profile)
++    command += b"\x00" * padding
++    assert len(command) == 12 + padding
+     reply = harness.ask(command)
+     assert reply is not None
+     assert codec.parse_write_ack(reply).unwrap() is True
+@@ -526,7 +523,7 @@ def test_30_03_отдаёт_тот_же_спектр_что_и_30_07(harness: Ha
+ 
+ 
+ def test_неизвестная_команда_остаётся_без_ответа(harness: Harness) -> None:
+-    """Мусор `AA BB CC DD` из сценария G5: реакция прибора неизвестна (N10)."""
++    """N10: мусор `AA BB CC DD` игнорируется, прибор остаётся жив."""
+     assert harness.ask(bytes.fromhex("AABBCCDD"), timeout=0.5) is None
+     assert harness.sim.stats.unknown_requests >= 1
+ 
+@@ -536,6 +533,43 @@ def test_неизвестная_команда_остаётся_без_отве
+ # ======================================================================================
+ 
+ 
++def test_чтения_и_записи_не_останавливают_поток(
++    profile: DeviceProfile, scene: Scene
++) -> None:
++    """Р62: симулятор не должен врать, что 0x10/0x20 вытесняют Streaming."""
++    sim = DeviceSimulator(profile=profile, scene=scene, reply_to=("127.0.0.1", 1))
++    sim._handle(codec.build_start_stream())
++    assert sim.streaming
++
++    assert sim._handle(codec.build_read_module_params())
++    assert sim._handle(codec.build_set_threshold(0, 1000, profile))
++    assert sim.state.thresholds[0] == 1000
++    assert sim.streaming
++
++
++@pytest.mark.parametrize(
++    "command",
++    [codec.build_debug_once(), codec.build_read_raw_adc(0, DeviceProfile())],
++)
++def test_режимная_команда_вытесняет_поток_до_stop(
++    profile: DeviceProfile, scene: Scene, command: bytes
++) -> None:
++    """Р62/Р63: после 30 03/30 07 простой повтор 30 02 поток не возвращает."""
++    sim = DeviceSimulator(profile=profile, scene=scene, reply_to=("127.0.0.1", 1))
++    sim._handle(codec.build_start_stream())
++    assert sim.streaming
++
++    assert sim._handle(command)
++    assert not sim.streaming
++
++    sim._handle(codec.build_start_stream())
++    assert not sim.streaming
++
++    assert sim._handle(codec.build_stop())
++    sim._handle(codec.build_start_stream())
++    assert sim.streaming
++
++
+ def test_поток_стартует_и_останавливается(harness: Harness) -> None:
+     """30 02 запускает поток без подтверждения, 30 01 его глушит."""
+     assert harness.ask(codec.build_start_stream(), timeout=0.15) is not None, "пошли кадры"
+@@ -736,6 +770,13 @@ def test_сбой_неверный_len_в_ответе_режима(harness: Har
+     assert result.error.kind is ParseErrorKind.LEN_MISMATCH
+ 
+ 
++def test_неверный_len_запроса_молча_игнорируется(harness: Harness) -> None:
++    """N10: `10 01 FF 00` ответа не даёт, но симулятор остаётся жив."""
++    assert harness.ask(bytes.fromhex("10 01 FF 00"), timeout=0.05) is None
++    reply = harness.ask(codec.build_read_version())
++    assert reply is not None
++
++
+ def test_сбой_ответ_мусором(harness: Harness, profile: DeviceProfile) -> None:
+     """Вместо кадра приходит мусор — диспетчер обязан его отвергнуть, а не упасть."""
+     harness.sim.faults.garbage = True
+diff --git a/tests/test_ui_config_model.py b/tests/test_ui_config_model.py
+new file mode 100644
+index 0000000..cd347f5
+--- /dev/null
++++ b/tests/test_ui_config_model.py
+@@ -0,0 +1,352 @@
++"""Модель и контроллер панели настройки прибора — без Qt.
++
++Здесь лежит опасная часть UI: диапазоны и номера каналов проверяются до
++отправки, а состояние `unconfirmed` берётся из уже существующего механизма
++сессии. Виджет только раскладывает эти значения по полям.
++"""
++
++from pathlib import Path
++
++import pytest
++
++from fbg.core.endpoint import Endpoint
++from fbg.core.frames import ChannelSetup, GainSetting, ModuleParams, SweepConfig
++from fbg.core.pipeline import PipelineConfig
++from fbg.core.profile import C_NM_GHZ, DeviceProfile
++from fbg.core.session import DeviceConfig, SessionConfig, SessionErrorKind, SessionState
++from fbg.io.config import AppConfig
++from fbg.io.packet_log import PacketLogConfig
++from fbg.sim.device_sim import DeviceSimulator
++from fbg.sim.scene import Grating, Scene
++from fbg.ui import models, texts
++from fbg.ui.app import AppController
++from fbg.ui.models import AppSnapshot
++
++PROFILE = DeviceProfile()
++DEVICE = DeviceConfig(
++    version_raw=410,
++    serial=94_401_220,
++    module=ModuleParams(
++        speed_code=0x00CA,
++        speed_hz=2000,
++        channels=4,
++        fbg_per_channel=30,
++        peak_gap_ghz=30,
++    ),
++    sweep=SweepConfig.from_params(1, 2, 5101, 2, PROFILE),
++    channels=tuple(
++        ChannelSetup(channel, None, GainSetting(manual=False, level=5)) for channel in range(4)
++    ),
++)
++
++QUIET = SessionConfig(
++    keepalive_period_s=30.0,
++    keepalive_failures_to_degrade=2,
++    stream_stall_floor_s=0.3,
++    backoff_schedule=(0.05, 0.1),
++    retry_pause_s=0.01,
++    reassembly_timeout_s=0.3,
++    watchdog_tick_s=0.02,
++    settle_before_readback_s=0.01,
++    auto_reconnect=False,
++)
++
++
++def snapshot(**changes: object) -> AppSnapshot:
++    values: dict[str, object] = {
++        "endpoint": Endpoint(),
++        "profile": PROFILE,
++        "state": SessionState.IDLE,
++        "device": DEVICE,
++    }
++    values.update(changes)
++    return AppSnapshot(**values)  # type: ignore[arg-type]
++
++
++class LyingThresholdSimulator(DeviceSimulator):
++    """Подтверждает 20 02, но не меняет порог — стимул для read-back mismatch."""
++
++    def _apply_threshold(self, request: bytes) -> bool:
++        return True
++
++
++class SaveReadbackMismatchSimulator(DeviceSimulator):
++    """После 20 06 меняет текущий порог: read-back обязан заметить расхождение."""
++
++    def _handle_write(self, fc: int, request: bytes) -> list[bytes]:
++        responses = super()._handle_write(fc, request)
++        if fc == 0x06:
++            self.state.thresholds[0] = 1234
++        return responses
++
++
++class ControllerStand:
++    """Мини-стенд для методов `AppController`, без виджетов."""
++
++    def __init__(self, tmp_path: Path, simulator: type[DeviceSimulator] = DeviceSimulator) -> None:
++        profile = DeviceProfile()
++        self.sim = simulator(
++            profile=profile,
++            scene=Scene(profile, [Grating(0, 0, 1545.0)]),
++            reply_to=("127.0.0.1", 1),
++            frame_rate_hz=200.0,
++        )
++        self.sim.start()
++        host, port = self.sim.address
++        endpoint = Endpoint(
++            device_ip=host,
++            device_port=port,
++            local_ip="127.0.0.1",
++            local_port=0,
++            read_timeout_s=0.15,
++            write_timeout_s=0.2,
++            retries=1,
++            rx_poll_timeout_s=0.02,
++        )
++        self.controller = AppController(
++            AppConfig(
++                endpoint=endpoint,
++                profile=profile,
++                session=QUIET,
++                pipeline=PipelineConfig(history_frames=256),
++                packet_log=PacketLogConfig(directory=None),
++            ),
++            config_path=tmp_path / "fbg_config.json",
++        )
++        self.controller.start()
++        self.controller.session._transport.open()
++        self.sim.reply_to = self.controller.session.local_address
++        self.controller.connect().unwrap()
++
++    def close(self) -> None:
++        self.sim.stop()
++        self.controller.shutdown()
++
++
++# --------------------------------------------------------------------------------------
++# Локальная валидация — до сети
++# --------------------------------------------------------------------------------------
++
++
++def test_номер_канала_проверяется_по_живому_числу_каналов() -> None:
++    assert models.validate_channel(0, 4) == 0
++    assert models.validate_channel(3, 4) == 3
++    with pytest.raises(ValueError, match="R14"):
++        models.validate_channel(4, 4)
++    with pytest.raises(ValueError, match="R14"):
++        models.validate_channel(-1, 4)
++
++
++def test_порог_строго_0_16383_а_ffff_только_через_авто() -> None:
++    assert models.threshold_value(False, 0, PROFILE.adc_max) == 0
++    assert models.threshold_value(False, 16383, PROFILE.adc_max) == 16383
++    assert models.threshold_value(True, 1234, PROFILE.adc_max) is None
++    with pytest.raises(ValueError):
++        models.threshold_value(False, 16384, PROFILE.adc_max)
++    with pytest.raises(ValueError):
++        models.threshold_value(False, 0xFFFF, PROFILE.adc_max)
++
++
++def test_уровень_усиления_строго_0_5() -> None:
++    assert models.gain_value(True, 0, PROFILE.gain_max_level) == GainSetting(True, 0)
++    assert models.gain_value(False, 5, PROFILE.gain_max_level) == GainSetting(False, 5)
++    with pytest.raises(ValueError):
++        models.gain_value(True, 6, PROFILE.gain_max_level)
++
++
++def test_развёртка_проверяет_инвариант_start_stop() -> None:
++    with pytest.raises(ValueError, match="start_param < stop_param"):
++        models.sweep_edit_model(PROFILE, 5101, 2, 1, 2)
++    with pytest.raises(ValueError, match="start_param < stop_param"):
++        models.sweep_edit_model(PROFILE, 1, 2, 1, 2)
++
++
++def test_развёртка_считает_точки_и_границы_в_нм() -> None:
++    sweep = models.sweep_edit_model(PROFILE, 1, 2, 5101, 2)
++    assert sweep.start_ghz == 196249
++    assert sweep.stop_ghz == 191149
++    assert sweep.adc_points == 2551
++    assert sweep.start_nm == pytest.approx(C_NM_GHZ / 196249)
++    assert sweep.stop_nm == pytest.approx(C_NM_GHZ / 191149)
++
++
++# --------------------------------------------------------------------------------------
++# Модель из снимка и разметка read-back
++# --------------------------------------------------------------------------------------
++
++
++def test_модель_строится_из_снимка_без_qt() -> None:
++    model = models.device_config_model(snapshot())
++    assert model.enabled
++    assert model.channel_count == 4
++    assert len(model.channels) == 4
++    assert model.channels[0].threshold is None
++    assert model.channels[0].gain == GainSetting(False, 5)
++    assert model.peak_gap_ghz == 30
++    assert model.sweep is not None and model.sweep.adc_points == 2551
++
++
++def test_модель_несёт_сводку_последнего_спектра_без_qt() -> None:
++    model = models.device_config_model(
++        snapshot(last_spectrum_max_adc=11123, last_spectrum_saturated_points=17)
++    )
++    assert model.last_spectrum_max_adc == 11123
++    assert model.last_spectrum_saturated_points == 17
++
++
++def test_подсказка_порога_предупреждает_если_он_выше_максимума() -> None:
++    text = texts.threshold_spectrum_hint(11123, 12000)
++    assert "11123" in text
++    assert "12000" in text
