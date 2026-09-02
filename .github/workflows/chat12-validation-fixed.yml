@@ -30,6 +30,8 @@ jobs:
           subprocess.run(['git', 'apply', 'chat12.patch'], check=True)
           subprocess.run(['git', 'apply', '--check', '.chat12/ruff-fix.patch'], check=True)
           subprocess.run(['git', 'apply', '.chat12/ruff-fix.patch'], check=True)
+          subprocess.run(['git', 'apply', '--check', '.chat12/format-fix.patch'], check=True)
+          subprocess.run(['git', 'apply', '.chat12/format-fix.patch'], check=True)
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -62,6 +64,7 @@ jobs:
           Path('chat12.patch').write_bytes(gzip.decompress(base64.b64decode(encoded)))
           subprocess.run(['git', 'apply', 'chat12.patch'], check=True)
           subprocess.run(['git', 'apply', '.chat12/ruff-fix.patch'], check=True)
+          subprocess.run(['git', 'apply', '.chat12/format-fix.patch'], check=True)
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -96,6 +99,7 @@ jobs:
           Path('chat12.patch').write_bytes(gzip.decompress(base64.b64decode(encoded)))
           subprocess.run(['git', 'apply', 'chat12.patch'], check=True)
           subprocess.run(['git', 'apply', '.chat12/ruff-fix.patch'], check=True)
+          subprocess.run(['git', 'apply', '.chat12/format-fix.patch'], check=True)
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -130,6 +134,7 @@ jobs:
           Path('chat12.patch').write_bytes(gzip.decompress(base64.b64decode(encoded)))
           subprocess.run(['git', 'apply', 'chat12.patch'], check=True)
           subprocess.run(['git', 'apply', '.chat12/ruff-fix.patch'], check=True)
+          subprocess.run(['git', 'apply', '.chat12/format-fix.patch'], check=True)
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
