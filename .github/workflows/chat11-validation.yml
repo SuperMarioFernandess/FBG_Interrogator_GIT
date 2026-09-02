@@ -1,0 +1,99 @@
+name: Chat 11 validation
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core:
+    name: Core ${{ matrix.os }} Python 3.12
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Apply chat 11 patch
+        shell: bash
+        run: |
+          cat .ci/chat11.patch.* > chat11.patch
+          git apply --check chat11.patch
+          git apply chat11.patch
+      - name: Install core dependencies
+        run: python -m pip install numpy pytest pytest-cov ruff
+      - name: Ruff check
+        run: ruff check fbg tests main.py
+      - name: Ruff format check
+        run: ruff format --check fbg tests main.py
+      - name: Core tests
+        run: pytest tests -m "not ui and not slow" -q
+
+  ui:
+    name: UI offscreen Python 3.12
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Apply chat 11 patch
+        run: |
+          cat .ci/chat11.patch.* > chat11.patch
+          git apply --check chat11.patch
+          git apply chat11.patch
+      - name: Qt system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libglib2.0-0 libxkbcommon0 libdbus-1-3
+      - name: Install dependencies
+        run: python -m pip install numpy pytest PySide6 pyqtgraph
+      - name: UI tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest tests -m ui -q
+
+  slow:
+    name: Slow 2 kHz Python 3.12
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Apply chat 11 patch
+        run: |
+          cat .ci/chat11.patch.* > chat11.patch
+          git apply --check chat11.patch
+          git apply chat11.patch
+      - name: Install dependencies
+        run: python -m pip install numpy pytest
+      - name: Slow tests
+        run: pytest tests -m slow -q -s
+
+  full:
+    name: Full pytest Python 3.12
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Apply chat 11 patch
+        run: |
+          cat .ci/chat11.patch.* > chat11.patch
+          git apply --check chat11.patch
+          git apply chat11.patch
+      - name: Qt system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libglib2.0-0 libxkbcommon0 libdbus-1-3
+      - name: Install dependencies
+        run: python -m pip install numpy pytest PySide6 pyqtgraph
+      - name: Full test suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest tests -q
