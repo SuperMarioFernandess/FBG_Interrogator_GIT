@@ -1,0 +1,38 @@
+--- a/fbg/ui/models.py
++++ b/fbg/ui/models.py
+@@ -393,7 +393,7 @@
+     expected = None if snapshot.metrics is None else snapshot.metrics.expected_rate_hz
+     rate_hz = float(expected or snapshot.profile.sweep_speed_hz)
+     rows = rate_hz * duration_s / config.decimation
+-    return int(round(rows * _estimated_row_bytes(snapshot, config, all_valid=all_valid)))
++    return round(rows * _estimated_row_bytes(snapshot, config, all_valid=all_valid))
+ 
+ 
+ def recording_panel_model(snapshot: AppSnapshot) -> RecordingPanelModel:
+--- a/tests/test_ui_measurement_model.py
++++ b/tests/test_ui_measurement_model.py
+@@ -16,11 +16,11 @@
+ from fbg.core.pipeline import Pipeline, PipelineConfig, TraceHistorySnapshot
+ from fbg.core.profile import DeviceProfile
+ from fbg.core.session import SessionState
+-from fbg.sim.device_sim import DeviceSimulator
+-from fbg.sim.scene import Grating, Scene
+ from fbg.io.config import AppConfig
+ from fbg.io.packet_log import PacketLogConfig
+ from fbg.io.recorder import RecorderConfig, RecorderStats
++from fbg.sim.device_sim import DeviceSimulator
++from fbg.sim.scene import Grating, Scene
+ from fbg.ui import models
+ from fbg.ui.app import AppController
+ from tests.synthetic import load_vectors
+--- a/tests/test_ui_measurement_widget.py
++++ b/tests/test_ui_measurement_widget.py
+@@ -205,7 +205,7 @@
+     assert panel.stop_record_button.isEnabled()
+     assert panel.record_state.text() == texts.RECORD_ACTIVE
+     assert "123" in panel.record_rows.text()
+-    assert "00:00:12" == panel.record_elapsed.text()
++    assert panel.record_elapsed.text() == "00:00:12"
+ 
+ 
+ def test_ошибка_и_gap_видны_на_панели(panel: MeasurementPanel, tmp_path: Path) -> None:
