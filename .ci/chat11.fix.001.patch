@@ -1,0 +1,44 @@
+diff --git a/fbg/ui/panels/device_config.py b/fbg/ui/panels/device_config.py
+index f7bbc57..adba40c 100644
+--- a/fbg/ui/panels/device_config.py
++++ b/fbg/ui/panels/device_config.py
+@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
+ from fbg.core.session import SessionState
+ from fbg.ui import models, texts
+ from fbg.ui.app import AppController
+-from fbg.ui.models import AppSnapshot, DeviceConfigModel
++from fbg.ui.models import AppSnapshot
+ 
+ 
+ class DeviceConfigPanel(QWidget):
+@@ -397,7 +397,7 @@ class DeviceConfigPanel(QWidget):
+     def _apply_peak_gap(self) -> None:
+         try:
+             result = self._controller.set_peak_gap(self.peak_gap.value())
+-        except ValueError as exc:
++        except (RuntimeError, ValueError) as exc:
+             self._report_local_error(exc)
+             return
+         if result.ok:
+@@ -419,7 +419,7 @@ class DeviceConfigPanel(QWidget):
+                 preview.stop_param,
+                 preview.adc_step_param,
+             )
+-        except ValueError as exc:
++        except (RuntimeError, ValueError) as exc:
+             self._report_local_error(exc)
+             return
+         if result.ok:
+@@ -427,7 +427,11 @@ class DeviceConfigPanel(QWidget):
+         self.refresh(self._controller.snapshot())
+ 
+     def _save_thresholds(self) -> None:
+-        result = self._controller.save_thresholds()
++        try:
++            result = self._controller.save_thresholds()
++        except RuntimeError as exc:
++            self._report_local_error(exc)
++            return
+         if result.ok:
+             self.save_status.setText(texts.SAVE_READBACK_OK)
+         self.refresh(self._controller.snapshot())
