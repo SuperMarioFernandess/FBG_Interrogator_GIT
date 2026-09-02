@@ -1,0 +1,100 @@
+--- a/fbg/core/pipeline.py
++++ b/fbg/core/pipeline.py
+@@ -848,9 +848,7 @@
+         selected = tuple(positions)
+         for channel, position in selected:
+             if not 0 <= channel < self._profile.channels:
+-                raise ValueError(
+-                    f"канал {channel} вне диапазона 0…{self._profile.channels - 1}"
+-                )
++                raise ValueError(f"канал {channel} вне диапазона 0…{self._profile.channels - 1}")
+             if not 0 <= position < self._fbg:
+                 raise ValueError(f"позиция {position} вне диапазона 0…{self._fbg - 1}")
+ 
+@@ -1055,11 +1053,7 @@
+         ring = self._history
+         rate = self.frame_rate_hz()
+         expected = self._expected_rate_hz
+-        loss = (
+-            None
+-            if expected is None or rate == 0.0
+-            else max(0.0, 1.0 - rate / expected)
+-        )
++        loss = None if expected is None or rate == 0.0 else max(0.0, 1.0 - rate / expected)
+         end = ring.written
+         if end:
+             filled = tuple(int(value) for value in ring.filled[(end - 1) % ring.capacity])
+--- a/fbg/ui/app.py
++++ b/fbg/ui/app.py
+@@ -522,8 +522,7 @@
+                 )
+             if not 0 <= position < self._config.profile.fbg_per_channel:
+                 raise ValueError(
+-                    f"позиция {position} вне диапазона "
+-                    f"0…{self._config.profile.fbg_per_channel - 1}"
++                    f"позиция {position} вне диапазона 0…{self._config.profile.fbg_per_channel - 1}"
+                 )
+         self._trace_positions = selected
+         self._trace_history_s = history_s
+@@ -697,9 +696,7 @@
+         session = self._session
+         recorder = self._recorder
+         recorder_stats = recorder.stats if recorder is not None else self._last_recorder_stats
+-        trace_history = self._pipeline.trace_history(
+-            self._trace_positions, self._trace_history_s
+-        )
++        trace_history = self._pipeline.trace_history(self._trace_positions, self._trace_history_s)
+         return AppSnapshot(
+             endpoint=self._config.endpoint,
+             profile=self._config.profile,
+--- a/tests/test_ui_measurement_model.py
++++ b/tests/test_ui_measurement_model.py
+@@ -345,6 +345,7 @@
+     assert pipeline.frame_rate_hz() > 2000.0
+     assert pipeline.metrics().loss_estimate == 0.0
+ 
++
+ # --------------------------------------------------------------------------------------
+ # Совместная нагрузка: поток + recorder + штатный журнал + модель графика
+ # --------------------------------------------------------------------------------------
+@@ -380,7 +381,9 @@
+     sim.start()
+     host, port = sim.address
+     endpoint = Endpoint(
+-        device_ip=host, device_port=port, **TEST_ENDPOINT_KWARGS  # type: ignore[arg-type]
++        device_ip=host,
++        device_port=port,
++        **TEST_ENDPOINT_KWARGS,  # type: ignore[arg-type]
+     )
+     controller = AppController(
+         AppConfig(
+@@ -477,4 +480,3 @@
+     finally:
+         controller.shutdown()
+         sim.stop()
+-
+--- a/tests/test_ui_measurement_widget.py
++++ b/tests/test_ui_measurement_widget.py
+@@ -105,10 +105,13 @@
+ 
+ def test_панель_строится_с_4x30_выбором(panel: MeasurementPanel) -> None:
+     assert panel.trace_tree.topLevelItemCount() == 4
+-    assert sum(
+-        panel.trace_tree.topLevelItem(channel).childCount()  # type: ignore[union-attr]
+-        for channel in range(panel.trace_tree.topLevelItemCount())
+-    ) == 120
++    assert (
++        sum(
++            panel.trace_tree.topLevelItem(channel).childCount()  # type: ignore[union-attr]
++            for channel in range(panel.trace_tree.topLevelItemCount())
++        )
++        == 120
++    )
+     selected = panel.selected_slots()
+     assert selected == tuple(models.SlotRef(0, position) for position in range(4))
+     assert panel.table_model.rowCount() == 30
+@@ -243,4 +246,3 @@
+ 
+     assert after != before
+     assert panel.record_decimation.value() == 2
+-
