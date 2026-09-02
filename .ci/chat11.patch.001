@@ -1,0 +1,320 @@
+ #: Байт ручного режима усиления.
+ SIM_GAIN_MANUAL_FLAG = 0x80
+ 
+-#: Допустимые длины кадра команды 20 01 на проводе (вопрос D3 открыт: прибор
+-#: принимает какую-то одну, симулятор принимает обе, чтобы не предрешать ответ).
+-SET_SWEEP_ACCEPTED_LENGTHS = (11, 12)
++#: D3 закрыт: точный кадр 20 01 имеет 12 байт, штатное ПО дополняет его
++#: четырьмя нулями до 16. Оба варианта наблюдались и принимаются прибором.
++SET_SWEEP_ACCEPTED_LENGTHS = (12, 16)
+ 
+ #: Таймаут приёмного сокета: определяет, как быстро останавливается RX-поток.
+ RX_POLL_TIMEOUT_S = 0.05
+@@ -438,6 +440,8 @@ class DeviceSimulator:
+         self._sock: socket.socket | None = None
+         self._shutdown = threading.Event()
+         self._streaming = threading.Event()
++        self._mode_requires_stop = False
++        """После 30 03/30 07, вытеснивших поток, новый 30 02 ждёт Stop (Р63)."""
+         self._lock = threading.Lock()
+         self._rx_thread: threading.Thread | None = None
+         self._tx_thread: threading.Thread | None = None
+@@ -459,6 +463,7 @@ class DeviceSimulator:
+         self._sock = sock
+         self._shutdown.clear()
+         self._streaming.clear()
++        self._mode_requires_stop = False
+         self._timer_raised = _enable_high_resolution_timer()
+         self._pacer.calibrate()
+         self._rx_thread = threading.Thread(target=self._rx_loop, name="sim-rx", daemon=True)
+@@ -528,6 +533,7 @@ class DeviceSimulator:
+             self.state = DeviceState.factory(self.profile)
+             self.stats.reboots += 1
+         self._streaming.clear()
++        self._mode_requires_stop = False
+         self._set_state(SimState.IDLE)
+ 
+     # --- Автомат состояний -------------------------------------------------------------
+@@ -628,14 +634,22 @@ class DeviceSimulator:
+     def _handle(self, request: bytes) -> list[bytes]:
+         """Разбирает команду и возвращает список ответов (пустой — прибор молчит).
+ 
+-        Поле LEN запроса намеренно **не проверяется**: реакция прибора на
+-        неверный LEN — открытый вопрос N10 (сценарий G6 в KB_06). Придумывать
+-        её значило бы зафиксировать в тестах несуществующее поведение.
++        N10 закрыт скринингом 01.09.2026: запрос, чьё объявленное LEN больше
++        реально пришедшего кадра (`10 01 FF 00`), прибор молча игнорирует.
++        Дополнение после объявленной длины не запрещается: штатное ПО так
++        отправляет `20 01` (D3).
+         """
+         if len(request) < 3:
+             self.stats.unknown_requests += 1
+             return []
+         ident, fc = request[0], request[1]
++        if ident not in (SIM_ID_READ, SIM_ID_WRITE, SIM_ID_MODE):
++            self.stats.unknown_requests += 1
++            return []
++        declared = request[2]
++        if declared > len(request):
++            self.stats.rejected_requests += 1
++            return []
+         with self._lock:
+             if ident == SIM_ID_READ:
+                 return self._handle_read(fc)
+@@ -677,9 +691,11 @@ class DeviceSimulator:
+     def _handle_write(self, fc: int, request: bytes) -> list[bytes]:
+         """Команды записи 0x20 — меняют состояние и подтверждаются ответом.
+ 
+-        Отказ (`00 00` вместо `00 01`) отдаётся на аргумент вне допустимого
+-        диапазона. Это **гипотеза**: настоящая реакция прибора на такой
+-        аргумент — открытый вопрос N10, сценарии G7 и G8 из KB_06.
++        Для некорректных аргументов симулятор остаётся защитным и отвечает
++        отказом. Это намеренно **не** моделирует R14: реальный прибор принимает
++        опасные номера каналов и может портить другие настройки, но точное
++        правило порчи неизвестно. Поэтому клиентская валидация проверяется
++        тестом «датаграмма вообще не отправлена», а не реакцией симулятора.
+         """
+         if fc == 0x01:
+             return [encode_write_ack(fc, self._apply_sweep(request))]
+@@ -697,7 +713,7 @@ class DeviceSimulator:
+         return []
+ 
+     def _apply_sweep(self, request: bytes) -> bool:
+-        """20 01 — развёртка. Принимаются обе длины кадра из вопроса D3."""
++        """20 01 — развёртка; D3: 12 байт точно либо 16 с нулевым padding."""
+         if len(request) not in SET_SWEEP_ACCEPTED_LENGTHS:
+             self.stats.rejected_requests += 1
+             return False
+@@ -760,6 +776,7 @@ class DeviceSimulator:
+         width = self.profile.mode_len_width
+         if fc == 0x01:
+             self._streaming.clear()
++            self._mode_requires_stop = False
+             self._set_state(SimState.IDLE)
+             return [encode_stop_ack(True, width)]
+         if fc == 0x02:
+@@ -772,7 +789,13 @@ class DeviceSimulator:
+         return []
+ 
+     def _start_stream(self, request: bytes) -> list[bytes]:
+-        """30 02 — старт потока. Подтверждения нет: сразу начинается телеметрия."""
++        """30 02 — старт потока.
++
++        После вытесняющей команды 30 03/30 07 прибор по Р63 не возвращается
++        в поток простым повтором 30 02: сначала нужен 30 01.
++        """
++        if self._mode_requires_stop:
++            return []
+         if len(request) >= 5:
+             code = int.from_bytes(request[3:5], "big")
+             if code != SIM_SPEED_KEEP_CURRENT:
+@@ -782,7 +805,10 @@ class DeviceSimulator:
+         return []
+ 
+     def _run_debug(self, width: int) -> list[bytes]:
+-        """30 03 — однократная развёртка: состояние возвращается в исходное.
++        """30 03 — однократная развёртка.
++
++        Если команда пришла во время Streaming, она вытесняет поток (Р62)
++        и оставляет прибор требующим Stop перед новым 30 02 (Р63).
+ 
+         ✅ Скрининг показал, что команда порождает **два** ответа с разными
+         парами (ID, FC): сначала отдельной датаграммой приходит кадр телеметрии
+@@ -793,20 +819,30 @@ class DeviceSimulator:
+         Порядок здесь важен: сессия обязана пережить незапрошенный `30 02`,
+         не сломав корреляцию по (ID, FC), и симулятор её этим нагружает.
+         """
+-        previous = self.sim_state
++        was_streaming = self._streaming.is_set()
++        if was_streaming:
++            self._streaming.clear()
++            self._mode_requires_stop = True
+         self._set_state(SimState.DEBUG)
+         telemetry = self.scene.measurement_frame()
+         payload = self.scene.debug_payload(self.state.gain_modes, self.state.gain_levels)
+-        self._set_state(previous)
++        self._set_state(SimState.IDLE)
+         return [telemetry, encode_debug(payload, width)]
+ 
+     def _read_raw_adc(self, request: bytes, width: int) -> list[bytes]:
+         """30 07 — сырые отсчёты АЦП одного канала.
+ 
+-        Номер канала вне диапазона оставляется без ответа: реакция прибора
+-        на такой запрос неизвестна (сценарий G7 в KB_06), а молчание —
+-        единственный вариант, который ничего не утверждает о приборе.
++        Во время Streaming команда вытесняет поток и требует Stop перед
++        следующим 30 02 (Р62, Р63).
++
++        Для UI номер канала всё равно проверяется до отправки (R14). Поведение
++        чтения 30 07 вне диапазона известно по скринингу, но здесь оно не
++        используется как способ проверки валидации записи.
+         """
++        if self._streaming.is_set():
++            self._streaming.clear()
++            self._mode_requires_stop = True
++            self._set_state(SimState.IDLE)
+         if len(request) < 6:
+             self.stats.rejected_requests += 1
+             return []
+diff --git a/fbg/ui/app.py b/fbg/ui/app.py
+index d85cb37..73571b5 100644
+--- a/fbg/ui/app.py
++++ b/fbg/ui/app.py
+@@ -47,6 +47,7 @@ from pathlib import Path
+ from types import TracebackType
+ 
+ from fbg.core.endpoint import Endpoint
++from fbg.core.frames import ChannelSetup, GainSetting, SweepConfig
+ from fbg.core.pipeline import Pipeline
+ from fbg.core.session import (
+     DeviceConfig,
+@@ -324,6 +325,151 @@ class AppController:
+         """Останавливает поток телеметрии."""
+         return self._session.stop_stream()
+ 
++    # --- Настройка прибора -------------------------------------------------------------
++
++    def _require_configurable_profile(self) -> None:
++        """Не пишет геометрию, пока профиль приложения расходится с прибором."""
++        if self._profile_mismatch:
++            raise RuntimeError(
++                "настройка прибора заблокирована: сначала примите его геометрию и "
++                "переподключитесь"
++            )
++
++    def _live_channel_count(self) -> int:
++        """Число каналов по живому ответу 10 04, а не по профилю (R14)."""
++        device = self._session.device_config
++        if device is None:
++            raise RuntimeError("настройка канала доступна только после опроса прибора")
++        return device.module.channels
++
++    def _validate_live_channel(self, channel: int) -> None:
++        count = self._live_channel_count()
++        if not 0 <= channel < count:
++            raise ValueError(
++                f"номер канала {channel} вне диапазона 0…{count - 1}; "
++                "прибор не проверяет канал и может испортить настройки других каналов (R14)"
++            )
++
++    def _remember_command_result[T](self, label: str, result: Result[T]) -> Result[T]:
++        """Сохраняет отказ для строки состояния и сообщает его оператору."""
++        self._last_error = result.error
++        if result.error is not None:
++            self.note(f"{label}: {result.error}")
++        return result
++
++    def set_threshold(self, channel: int, threshold: int | None) -> Result[ChannelSetup]:
++        """20 02 + обязательный read-back 10 06. Разрешено и в Streaming (Р62)."""
++        self._require_configurable_profile()
++        self._validate_live_channel(channel)
++        if threshold is not None and not 0 <= threshold <= self._config.profile.adc_max:
++            raise ValueError(
++                f"порог {threshold} вне диапазона 0…{self._config.profile.adc_max}; "
++                "авторежим задаётся только значением None"
++            )
++        return self._remember_command_result(
++            f"порог канала {channel + 1}", self._session.set_threshold(channel, threshold)
++        )
++
++    def set_gain(self, channel: int, manual: bool, level: int) -> Result[ChannelSetup]:
++        """20 03 + обязательный read-back 10 06. Разрешено и в Streaming (Р62)."""
++        self._require_configurable_profile()
++        self._validate_live_channel(channel)
++        if not 0 <= level <= self._config.profile.gain_max_level:
++            raise ValueError(
++                f"уровень усиления {level} вне диапазона 0…{self._config.profile.gain_max_level}"
++            )
++        gain = GainSetting(manual=manual, level=level)
++        return self._remember_command_result(
++            f"усиление канала {channel + 1}", self._session.set_gain(channel, gain)
++        )
++
++    def _cache_live_geometry(self) -> None:
++        """Кэширует подтверждённые 10 04/10 05 в `AppConfig` после записи."""
++        device = self._session.device_config
++        if device is None:
++            return
++        profile = config_module.profile_from_device(
++            self._config.profile, device.module, device.sweep
++        )
++        self._last_device = device
++        if profile == self._config.profile:
++            return
++        self._config = self._config.with_profile(profile)
++        self._save()
++
++    def set_peak_gap(self, gap_ghz: int) -> Result[int]:
++        """20 04 + обязательный read-back 10 04."""
++        self._require_configurable_profile()
++        if not 1 <= gap_ghz <= 0xFF:
++            raise ValueError(f"интервал пиков {gap_ghz} ГГц вне диапазона 1…255")
++        result = self._remember_command_result(
++            "интервал пиков", self._session.set_peak_gap(gap_ghz)
++        )
++        if result.ok:
++            self._cache_live_geometry()
++        return result
++
++    def set_sweep(
++        self, start_param: int, step_param: int, stop_param: int, adc_step_param: int
++    ) -> Result[SweepConfig]:
++        """20 01 + read-back; при новой геометрии пересобирает тракт.
++
++        Сама команда 0x20 разрешена в Streaming по Р62. Но границы развёртки
++        входят в `DeviceProfile`, которым pipeline валидирует телеметрию. После
++        подтверждённого изменения старый профиль использовать нельзя, поэтому
++        сессия останавливается, профиль сохраняется и тракт пересобирается.
++        Следующее подключение уже работает с новыми границами.
++        """
++        self._require_configurable_profile()
++        if self._recorder is not None:
++            raise RuntimeError("развёртку нельзя менять во время записи измерений")
++        for name, value in (
++            ("start_param", start_param),
++            ("step_param", step_param),
++            ("stop_param", stop_param),
++            ("adc_step_param", adc_step_param),
++        ):
++            if not 0 <= value <= 0xFFFF:
++                raise ValueError(f"{name}={value} не помещается в 16 бит")
++        if start_param >= stop_param:
++            raise ValueError(
++                "нарушен инвариант развёртки: start_param должен быть меньше stop_param"
++            )
++        if step_param < 1 or adc_step_param < 1:
++            raise ValueError("шаг развёртки и шаг АЦП должны быть не меньше 1 ГГц")
++        sweep = SweepConfig.from_params(
++            start_param, step_param, stop_param, adc_step_param, self._config.profile
++        )
++        result = self._remember_command_result("развёртка", self._session.set_sweep(sweep))
++        if result.ok:
++            self._rebuild_after_sweep_change()
++        return result
++
++    def _rebuild_after_sweep_change(self) -> None:
++        """Пересобирает parser/log/session, если 10 05 подтвердил новые границы."""
++        device = self._session.device_config
++        if device is None:
++            return
++        updated = config_module.profile_from_device(
++            self._config.profile, device.module, device.sweep
++        )
++        self._last_device = device
++        if updated == self._config.profile:
++            return
++        self._session.disconnect()
++        self._config = self._config.with_profile(updated)
++        self._save()
++        self._rebuild()
++        self.note(
++            "развёртка применена и подтверждена; тракт пересобран под новые границы, "
++            "подключитесь снова"
++        )
++
++    def save_thresholds(self) -> Result[tuple[ChannelSetup, ...]]:
++        """20 06 без ответа, задержка, затем read-back 10 06 (D4 подтверждён)."""
++        self._require_configurable_profile()
++        return self._remember_command_result("сохранение порогов", self._session.save_thresholds())
++
+     def start_recording(self) -> Recorder:
