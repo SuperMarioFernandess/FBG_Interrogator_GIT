@@ -1,0 +1,66 @@
+diff --git a/fbg/ui/app.py b/fbg/ui/app.py
+--- a/fbg/ui/app.py
++++ b/fbg/ui/app.py
+@@ -331,8 +331,7 @@ class AppController:
+         """Не пишет геометрию, пока профиль приложения расходится с прибором."""
+         if self._profile_mismatch:
+             raise RuntimeError(
+-                "настройка прибора заблокирована: сначала примите его геометрию и "
+-                "переподключитесь"
++                "настройка прибора заблокирована: сначала примите его геометрию и переподключитесь"
+             )
+ 
+     def _live_channel_count(self) -> int:
+diff --git a/fbg/ui/panels/device_config.py b/fbg/ui/panels/device_config.py
+--- a/fbg/ui/panels/device_config.py
++++ b/fbg/ui/panels/device_config.py
+@@ -277,9 +277,7 @@ class DeviceConfigPanel(QWidget):
+         )
+ 
+     def _update_gain_hint(self) -> None:
+-        self.gain_hint.setText(
+-            texts.gain_spectrum_hint(self._model.last_spectrum_saturated_points)
+-        )
++        self.gain_hint.setText(texts.gain_spectrum_hint(self._model.last_spectrum_saturated_points))
+ 
+     def _update_verification_status(self) -> None:
+         self._update_channel_status()
+diff --git a/tests/test_sim.py b/tests/test_sim.py
+--- a/tests/test_sim.py
++++ b/tests/test_sim.py
+@@ -533,9 +533,7 @@ def test_неизвестная_команда_остаётся_без_отве
+ # ======================================================================================
+ 
+ 
+-def test_чтения_и_записи_не_останавливают_поток(
+-    profile: DeviceProfile, scene: Scene
+-) -> None:
++def test_чтения_и_записи_не_останавливают_поток(profile: DeviceProfile, scene: Scene) -> None:
+     """Р62: симулятор не должен врать, что 0x10/0x20 вытесняют Streaming."""
+     sim = DeviceSimulator(profile=profile, scene=scene, reply_to=("127.0.0.1", 1))
+     sim._handle(codec.build_start_stream())
+diff --git a/tests/test_ui_config_widget.py b/tests/test_ui_config_widget.py
+--- a/tests/test_ui_config_widget.py
++++ b/tests/test_ui_config_widget.py
+@@ -32,9 +32,7 @@ DEVICE = DeviceConfig(
+     serial=94_401_220,
+     module=ModuleParams(0x00CA, 2000, 4, 30, 30),
+     sweep=SweepConfig.from_params(1, 2, 5101, 2, PROFILE),
+-    channels=tuple(
+-        ChannelSetup(channel, None, GainSetting(False, 5)) for channel in range(4)
+-    ),
++    channels=tuple(ChannelSetup(channel, None, GainSetting(False, 5)) for channel in range(4)),
+ )
+ 
+ 
+@@ -156,9 +154,7 @@ def test_развёртка_предупреждает_о_переподключ
+ 
+ 
+ def test_подсказки_используют_последний_спектр(panel: DeviceConfigPanel) -> None:
+-    panel.refresh(
+-        snapshot(last_spectrum_max_adc=11123, last_spectrum_saturated_points=17)
+-    )
++    panel.refresh(snapshot(last_spectrum_max_adc=11123, last_spectrum_saturated_points=17))
+     panel.threshold_auto.setChecked(False)
+     panel.threshold_spin.setValue(12000)
+     assert "11123" in panel.threshold_hint.text()
