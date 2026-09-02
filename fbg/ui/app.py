@@ -60,7 +60,7 @@ from fbg.core.session import (
 from fbg.io import config as config_module
 from fbg.io.config import PROFILE_DEVICE_FIELDS, AppConfig
 from fbg.io.packet_log import Direction, PacketLog, PacketRecord, filter_records
-from fbg.io.recorder import Recorder
+from fbg.io.recorder import Recorder, RecorderConfig, RecorderStats
 from fbg.ui.models import AppSnapshot, ProfileDifference
 
 #: Сколько сообщений держать для панели. Ограничение обязательно: колбэки
@@ -118,6 +118,11 @@ class AppController:
         self._connect_thread: threading.Thread | None = None
         self._connect_result: Result[DeviceConfig] | None = None
         self._recorder: Recorder | None = None
+        self._last_recorder_stats: RecorderStats | None = None
+        self._recording_started_mono: float | None = None
+        self._last_recording_elapsed_s = 0.0
+        self._trace_positions: tuple[tuple[int, int], ...] = ()
+        self._trace_history_s = 5.0
         self._last_device: DeviceConfig | None = None
         self._last_error: SessionError | None = None
         self._profile_mismatch: tuple[ProfileDifference, ...] = ()
@@ -173,6 +178,7 @@ class AppController:
     @property
     def recorder(self) -> Recorder | None:
         """Писатель измерений. None — запись не идёт."""
+        self._reap_failed_recorder()
         return self._recorder
 
     @property
@@ -193,6 +199,7 @@ class AppController:
     @property
     def is_recording(self) -> bool:
         """Идёт ли запись измерений."""
+        self._reap_failed_recorder()
         return self._recorder is not None
 
     def note(self, message: str) -> None:
@@ -420,7 +427,7 @@ class AppController:
         Следующее подключение уже работает с новыми границами.
         """
         self._require_configurable_profile()
-        if self._recorder is not None:
+        if self.is_recording:
             raise RuntimeError("развёртку нельзя менять во время записи измерений")
         for name, value in (
             ("start_param", start_param),
@@ -469,25 +476,113 @@ class AppController:
         self._require_configurable_profile()
         return self._remember_command_result("сохранение порогов", self._session.save_thresholds())
 
+    def configure_recording(
+        self,
+        *,
+        directory: Path,
+        decimation: int,
+        fbg_limit: int | None,
+    ) -> RecorderConfig:
+        """Сохраняет настройки следующей записи.
+
+        Менять их посреди открытого файла нельзя: шапка уже зафиксировала
+        `decimation` и `fbg_written`. Панель поэтому сначала останавливает
+        запись, затем меняет параметры и только потом создаёт новый Recorder.
+        """
+        if self.is_recording:
+            raise RuntimeError("настройки записи нельзя менять во время записи")
+        recorder = replace(
+            self._config.recorder,
+            directory=directory,
+            decimation=decimation,
+            fbg_limit=fbg_limit,
+        )
+        self._config = replace(self._config, recorder=recorder)
+        self._save()
+        return recorder
+
+    def set_measurement_trace_request(
+        self,
+        positions: Sequence[tuple[int, int]],
+        history_s: float,
+    ) -> None:
+        """Задаёт, какую историю включать в следующий `AppSnapshot`.
+
+        Хранится только маленький запрос пользователя. Само кольцо остаётся
+        внутри pipeline, а `snapshot()` получает из него копию выбранных линий
+        через `Pipeline.trace_history` (Р36).
+        """
+        if history_s <= 0:
+            raise ValueError(f"history_s={history_s} должен быть положительным")
+        selected = tuple(positions)
+        for channel, position in selected:
+            if not 0 <= channel < self._config.profile.channels:
+                raise ValueError(
+                    f"канал {channel} вне диапазона 0…{self._config.profile.channels - 1}"
+                )
+            if not 0 <= position < self._config.profile.fbg_per_channel:
+                raise ValueError(
+                    f"позиция {position} вне диапазона 0…{self._config.profile.fbg_per_channel - 1}"
+                )
+        self._trace_positions = selected
+        self._trace_history_s = history_s
+
+    def _recording_elapsed_s(self) -> float:
+        """Длительность текущей либо последней записи для панели."""
+        started = self._recording_started_mono
+        if started is None:
+            return self._last_recording_elapsed_s
+        return max(0.0, time.perf_counter() - started)
+
+    def _remember_recorder_end(self, recorder: Recorder) -> None:
+        """Сохраняет итоговый снимок записи после штатной остановки или отказа."""
+        self._last_recorder_stats = recorder.stats
+        started = self._recording_started_mono
+        if started is not None:
+            self._last_recording_elapsed_s = max(0.0, time.perf_counter() - started)
+        self._recording_started_mono = None
+
+    def _reap_failed_recorder(self) -> None:
+        """Отцепляет Recorder, который сам остановился из-за ошибки файла.
+
+        Ошибка диска завершает только поток записи (Р47). После его завершения
+        активного писателя уже нет, поэтому `recording` обязан стать False,
+        но статистика и причина остаются на панели до следующего старта.
+        """
+        recorder = self._recorder
+        if recorder is None:
+            return
+        stats = recorder.stats
+        if stats.error is None or recorder.is_running:
+            return
+        self._remember_recorder_end(recorder)
+        self._recorder = None
+
     def start_recording(self) -> Recorder:
         """Начинает запись измерений. Повторный вызов возвращает того же писателя.
 
         Recorder создаётся здесь, а не в `_build`: его шапка обязана нести
         серийный номер и прошивку, а они известны только после `Probing`.
         """
+        self._reap_failed_recorder()
         if self._recorder is not None:
             return self._recorder
         recorder = Recorder(self._pipeline, self._config.recorder_config(), on_error=self.note)
         recorder.start()
         self._recorder = recorder
+        self._last_recorder_stats = None
+        self._recording_started_mono = time.perf_counter()
+        self._last_recording_elapsed_s = 0.0
         return recorder
 
     def stop_recording(self) -> None:
         """Останавливает запись, дописав хвост кольца. Повторный вызов безвреден."""
+        self._reap_failed_recorder()
         recorder = self._recorder
-        self._recorder = None
         if recorder is not None:
             recorder.stop()
+            self._remember_recorder_end(recorder)
+            self._recorder = None
 
     # --- Сверка профиля с прибором -----------------------------------------------------
 
@@ -537,7 +632,7 @@ class AppController:
         """
         if self._session.state is not SessionState.DISCONNECTED:
             raise RuntimeError("принять геометрию прибора можно только при закрытой связи")
-        if self._recorder is not None:
+        if self.is_recording:
             raise RuntimeError("принять геометрию прибора можно только при остановленной записи")
         device = self._last_device
         if device is None or not self._profile_mismatch:
@@ -597,8 +692,11 @@ class AppController:
         Собирается целиком здесь, чтобы панель не ходила по живым объектам
         ядра и не могла случайно удержать кольцо (Р36).
         """
+        self._reap_failed_recorder()
         session = self._session
         recorder = self._recorder
+        recorder_stats = recorder.stats if recorder is not None else self._last_recorder_stats
+        trace_history = self._pipeline.trace_history(self._trace_positions, self._trace_history_s)
         return AppSnapshot(
             endpoint=self._config.endpoint,
             profile=self._config.profile,
@@ -617,8 +715,11 @@ class AppController:
             transport=session.transport_stats,
             metrics=self._pipeline.metrics(),
             ui=self._pipeline.snapshot(),
+            trace_history=trace_history,
             log=self._packet_log.stats,
-            recorder=None if recorder is None else recorder.stats,
+            recorder_config=self._config.recorder,
+            recorder=recorder_stats,
+            recording_elapsed_s=self._recording_elapsed_s(),
             connected=session.state is not SessionState.DISCONNECTED,
             recording=recorder is not None,
             connecting=self.is_connecting,

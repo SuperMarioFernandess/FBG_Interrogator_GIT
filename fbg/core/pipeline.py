@@ -13,8 +13,10 @@ Pipeline — единственный потребитель телеметри�
 ===================  ==========================  ==========================
 запись в файл        все кадры, по порядку,      `FrameCursor` — курсор
                      потеря только с отметкой    по кольцу с номерами
-график и таблица     последний кадр и агрегаты,  `UiSnapshot` — публикуемый
-                     ~20 Гц, история не нужна    снимок, децимация по времени
+таблица              последний кадр и агрегаты,  `UiSnapshot` — публикуемый
+                     ~20 Гц                      снимок, децимация по времени
+график               выбранные слоты истории    `TraceHistorySnapshot` — копия
+                     по запросу UI               только выбранных столбцов
 метрики связи        темп и счётчики             `PipelineMetrics` — расчёт
                                                  из того же кольца по запросу
 ===================  ==========================  ==========================
@@ -22,9 +24,10 @@ Pipeline — единственный потребитель телеметри�
 Общее хранилище одно — кольцо, но **дисциплины чтения разные**, и это главное
 проектное решение модуля. Писателю нужна полнота: он идёт по кольцу
 последовательно, своим номером кадра, и по разрыву номеров узнаёт, сколько
-кадров его обогнало. UI нужна свежесть: он не читает кольцо вовсе, а получает
-готовый снимок последнего кадра, собранный отдельным потоком не чаще
-`ui_period_s`. Один буфер, из которого оба читали бы одинаково, обслужил бы
+кадров его обогнало. UI нужна свежесть: таблица получает готовый снимок последнего кадра,
+собранный отдельным потоком не чаще `ui_period_s`, а график по таймеру
+запрашивает отдельную копию только выбранных столбцов истории. Само кольцо
+виджетам не отдаётся. Один буфер, из которого оба читали бы одинаково, обслужил бы
 плохо обоих: очередь на выброс старейшего теряла бы кадры у писателя,
 а очередь без выброса упиралась бы в UI и останавливала приём.
 
@@ -70,6 +73,7 @@ Pipeline — единственный потребитель телеметри�
 import math
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from types import TracebackType
 
@@ -97,13 +101,15 @@ DEFAULT_UI_PERIOD_S = 0.05
 #: Окно скользящих агрегатов по умолчанию, секунды.
 DEFAULT_AGGREGATE_WINDOW_S = 1.0
 
-#: Окно измерения фактического темпа, секунды и кадры.
+#: Окно измерения фактического темпа, секунды и кадры (Р65).
 #:
-#: Ограничения два, и берётся более сильное: по времени — чтобы при 3 Гц
-#: не усреднять минуту истории, по кадрам — чтобы при 2 кГц не читать
-#: всё кольцо ради одной цифры.
-DEFAULT_RATE_WINDOW_S = 1.0
-DEFAULT_RATE_WINDOW_FRAMES = 4096
+#: Реальный поток 2 кГц приходит пачками: мгновенный темп на коротком окне
+#: гуляет при нулевой сквозной потере. Оператору нужна долгосрочная скорость,
+#: поэтому метрика использует всю доступную десятисекундную историю. Для
+#: медленных приборов ограничение по времени по-прежнему не даёт усреднять
+#: минуты данных.
+DEFAULT_RATE_WINDOW_S = 10.0
+DEFAULT_RATE_WINDOW_FRAMES = DEFAULT_HISTORY_FRAMES
 
 
 @dataclass(frozen=True)
@@ -311,8 +317,8 @@ class UiSnapshot:
     """Снимок для графика и таблицы: последний кадр плюс агрегаты.
 
     Неизменяем и самодостаточен: UI читает его, не касаясь кольца и не мешая
-    ни приёму, ни записи. История в нём отсутствует намеренно — графику нужна
-    свежесть, а не прошлое.
+    ни приёму, ни записи. История здесь намеренно отсутствует: для графика
+    есть отдельный узкий :class:`TraceHistorySnapshot` только выбранных слотов.
 
     Позиции — слоты кадра, а не номера датчиков (решение Р30): `freq_ghz[c][i]`
     означает «в канале c позицию i занял пик с такой частотой», и какой это
@@ -350,6 +356,40 @@ class UiSnapshot:
     def filled_total(self) -> int:
         """Сколько позиций заполнено во всём кадре."""
         return int(self.filled.sum())
+
+
+@dataclass(frozen=True)
+class TraceHistorySnapshot:
+    """Копия истории только выбранных позиций для графика UI.
+
+    Это второй вид снимка рядом с :class:`UiSnapshot`: последний кадр нужен
+    всем панелям, а многотысячная история — только графику и только для тех
+    позиций, которые отметил пользователь. Кольцо наружу не отдаётся (Р36).
+
+    `wavelength_nm[:, i]` соответствует `positions[i]`. NaN сохраняется
+    буквально: график обязан показать разрыв и не имеет права интерполировать
+    ненайденный пик (KB_05 №7).
+    """
+
+    positions: tuple[tuple[int, int], ...]
+    """Пары `(channel, position)`, оба индекса 0-based."""
+
+    seq_start: int
+    seq_stop: int
+    t_mono: np.ndarray
+    wavelength_nm: np.ndarray
+
+    @property
+    def frames(self) -> int:
+        """Сколько кадров вошло в снимок истории."""
+        return int(self.t_mono.size)
+
+    @property
+    def span_s(self) -> float:
+        """Фактическая глубина истории по времени."""
+        if self.t_mono.size < 2:
+            return 0.0
+        return float(self.t_mono[-1] - self.t_mono[0])
 
 
 # --------------------------------------------------------------------------------------
@@ -788,6 +828,76 @@ class Pipeline:
         """
         return self._snapshot
 
+    def trace_history(
+        self,
+        positions: Sequence[tuple[int, int]],
+        history_s: float,
+    ) -> TraceHistorySnapshot:
+        """Копирует историю выбранных позиций за последние `history_s` секунд.
+
+        UI не читает :attr:`history` напрямую (Р36). Публичный контракт здесь
+        намеренно узкий: копируются только выбранные линии, поэтому обычные
+        2–4 кривые не превращают каждый такт интерфейса в копирование всех
+        120 позиций кольца.
+
+        Глубина физически ограничена кольцом. Если пользователь запросил
+        больше, возвращается вся доступная история — выдумывать прошлое нельзя.
+        """
+        if history_s <= 0:
+            raise ValueError(f"history_s={history_s} должен быть положительным")
+        selected = tuple(positions)
+        for channel, position in selected:
+            if not 0 <= channel < self._profile.channels:
+                raise ValueError(f"канал {channel} вне диапазона 0…{self._profile.channels - 1}")
+            if not 0 <= position < self._fbg:
+                raise ValueError(f"позиция {position} вне диапазона 0…{self._fbg - 1}")
+
+        ring = self._history
+        end = ring.written
+        if not selected or end == 0:
+            return TraceHistorySnapshot(
+                positions=selected,
+                seq_start=end,
+                seq_stop=end,
+                t_mono=np.empty(0, dtype=np.float64),
+                wavelength_nm=np.empty((0, len(selected)), dtype=np.float64),
+            )
+
+        channels = np.fromiter((channel for channel, _ in selected), dtype=np.intp)
+        slots = np.fromiter((position for _, position in selected), dtype=np.intp)
+        for _ in range(3):
+            end = ring.written
+            start, stamps = self._window_start(end, history_s, ring.capacity)
+            blocks = [
+                ring.freq_ghz[first:last][:, channels, slots].copy()
+                for first, last in ring.segments(start, end)
+            ]
+            if not blocks:
+                freq = np.empty((0, len(selected)), dtype=np.float64)
+            elif len(blocks) == 1:
+                freq = blocks[0]
+            else:
+                freq = np.concatenate(blocks, axis=0)
+
+            # Seqlock-проверка после обеих копий. Если первый кадр успели
+            # вытеснить, повторяем с новым диапазоном вместо смешения эпох.
+            if start < ring.oldest_seq:
+                continue
+            nm = np.full(freq.shape, np.nan, dtype=np.float64)
+            np.divide(C_NM_GHZ, freq, out=nm, where=np.isfinite(freq) & (freq > 0.0))
+            return TraceHistorySnapshot(selected, start, end, stamps, nm)
+
+        # Приём обогнал три копирования подряд. Возвращается честный пустой
+        # снимок; UI попробует снова через 100 мс, а приём не ждёт ни секунды.
+        end = ring.written
+        return TraceHistorySnapshot(
+            positions=selected,
+            seq_start=end,
+            seq_stop=end,
+            t_mono=np.empty(0, dtype=np.float64),
+            wavelength_nm=np.empty((0, len(selected)), dtype=np.float64),
+        )
+
     def publish_now(self) -> UiSnapshot | None:
         """Собирает и публикует снимок немедленно, в потоке вызывающего.
 
@@ -943,7 +1053,7 @@ class Pipeline:
         ring = self._history
         rate = self.frame_rate_hz()
         expected = self._expected_rate_hz
-        loss = None if expected is None or rate == 0.0 else 1.0 - rate / expected
+        loss = None if expected is None or rate == 0.0 else max(0.0, 1.0 - rate / expected)
         end = ring.written
         if end:
             filled = tuple(int(value) for value in ring.filled[(end - 1) % ring.capacity])

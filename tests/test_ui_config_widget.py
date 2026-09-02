@@ -131,6 +131,15 @@ def test_расхождение_геометрии_блокирует_кнопк
     assert texts.CONFIG_PROFILE_MISMATCH in panel.availability_label.text()
 
 
+def test_развёртка_заблокирована_во_время_записи(panel: DeviceConfigPanel) -> None:
+    """Р67 приходит из `AppSnapshot.recording`, без второго флага панели."""
+    panel.refresh(snapshot(SessionState.STREAMING, recording=True))
+    assert panel.apply_threshold_button.isEnabled()
+    assert panel.apply_gain_button.isEnabled()
+    assert not panel.apply_sweep_button.isEnabled()
+    assert texts.CONFIG_RECORDING_SWEEP_LOCKED in panel.availability_label.text()
+
+
 def test_невалидная_развёртка_не_может_быть_отправлена(panel: DeviceConfigPanel) -> None:
     panel.refresh(snapshot())
     panel.start_param.setValue(5101)

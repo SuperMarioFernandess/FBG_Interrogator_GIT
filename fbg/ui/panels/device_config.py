@@ -318,7 +318,7 @@ class DeviceConfigPanel(QWidget):
                 preview.stop_nm,
             )
         )
-        self.apply_sweep_button.setEnabled(self._model.enabled)
+        self.apply_sweep_button.setEnabled(self._model.sweep_enabled)
 
     def refresh(self, snapshot: AppSnapshot) -> None:
         """Обновляет поля снимком, не затирая ввод пользователя на каждом тике."""
@@ -334,11 +334,16 @@ class DeviceConfigPanel(QWidget):
             self._load_sweep()
 
         enabled = self._model.enabled
-        for group in (self.channel_group, self.gap_group, self.sweep_group, self.save_group):
+        for group in (self.channel_group, self.gap_group, self.save_group):
             group.setEnabled(enabled)
+        self.sweep_group.setEnabled(self._model.sweep_enabled)
         self.threshold_spin.setEnabled(enabled and not self.threshold_auto.isChecked())
         if snapshot.profile_mismatch:
             availability = texts.CONFIG_PROFILE_MISMATCH
+        elif snapshot.recording and enabled:
+            availability = (
+                texts.CONFIG_STREAMING_ALLOWED + "\n" + texts.CONFIG_RECORDING_SWEEP_LOCKED
+            )
         elif snapshot.state is SessionState.STREAMING and enabled:
             availability = texts.CONFIG_STREAMING_ALLOWED
         elif enabled:

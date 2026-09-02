@@ -18,6 +18,7 @@ from fbg.ui.app import AppController
 from fbg.ui.panels.connection import ConnectionPanel
 from fbg.ui.panels.device_config import DeviceConfigPanel
 from fbg.ui.panels.device_info import DeviceInfoPanel
+from fbg.ui.panels.measurement import MeasurementPanel
 from fbg.ui.panels.packet_log import PacketLogPanel
 
 #: Период обновления панелей, мс. 10 Гц — тот же порядок, что у децимации
@@ -26,7 +27,7 @@ UI_PERIOD_MS = 100
 
 
 class MainWindow(QMainWindow):
-    """Главное окно: четыре вкладки и строка состояния."""
+    """Главное окно: пять вкладок и строка состояния."""
 
     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -35,12 +36,14 @@ class MainWindow(QMainWindow):
         self.resize(1100, 750)
 
         self.connection_panel = ConnectionPanel(controller)
+        self.measurement_panel = MeasurementPanel(controller)
         self.device_panel = DeviceInfoPanel(controller)
         self.device_config_panel = DeviceConfigPanel(controller)
         self.packet_log_panel = PacketLogPanel(controller)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self.connection_panel, texts.TAB_CONNECTION)
+        self.tabs.addTab(self.measurement_panel, texts.TAB_MEASUREMENT)
         self.tabs.addTab(self.device_panel, texts.TAB_DEVICE)
         self.tabs.addTab(self.device_config_panel, texts.TAB_DEVICE_CONFIG)
         self.tabs.addTab(self.packet_log_panel, texts.TAB_PACKET_LOG)
@@ -60,6 +63,7 @@ class MainWindow(QMainWindow):
         """Все панели окна в порядке вкладок."""
         return (
             self.connection_panel,
+            self.measurement_panel,
             self.device_panel,
             self.device_config_panel,
             self.packet_log_panel,
@@ -83,6 +87,7 @@ class MainWindow(QMainWindow):
         """Один такт: снимок берётся один раз и раздаётся всем панелям."""
         snapshot = self._controller.snapshot()
         self.connection_panel.refresh(snapshot)
+        self.measurement_panel.refresh(snapshot)
         self.device_panel.refresh(snapshot)
         self.device_config_panel.refresh(snapshot)
         self.packet_log_panel.refresh(snapshot)

@@ -20,6 +20,7 @@ from fbg.core.session import SessionState
 APP_TITLE = "FBG-Interrogator — управление"
 
 TAB_CONNECTION = "Подключение"
+TAB_MEASUREMENT = "Измерение"
 TAB_DEVICE = "Прибор"
 TAB_DEVICE_CONFIG = "Настройка"
 TAB_PACKET_LOG = "Журнал пакетов"
@@ -30,6 +31,9 @@ BUTTON_START_STREAM = "Запустить поток"
 BUTTON_STOP_STREAM = "Остановить поток"
 BUTTON_EXPORT = "Экспорт…"
 BUTTON_APPLY_DEVICE_PROFILE = "Принять геометрию прибора"
+BUTTON_START_RECORDING = "Начать запись"
+BUTTON_STOP_RECORDING = "Остановить запись"
+BUTTON_BROWSE_DIRECTORY = "Папка…"
 
 UNKNOWN = "—"
 """Значение, которого ещё нет. Прочерк, а не ноль: ноль — это измерение."""
@@ -91,6 +95,62 @@ STREAM_INTERRUPTED = "поток был прерван восстановлен�
 """Решение Р24: пробник содержит Stop, перезапуск потока — дело оператора."""
 
 CONFIG_MISMATCH = "конфигурация прибора изменилась после восстановления связи"
+
+
+# --------------------------------------------------------------------------------------
+# Панель измерения
+# --------------------------------------------------------------------------------------
+
+GROUP_MEASUREMENT_GRAPH = "График λ(t)"
+GROUP_MEASUREMENT_TABLE = "Текущий кадр"
+GROUP_RECORDING = "Запись измерений"
+GROUP_TRACE_SELECTION = "Показывать позиции"
+
+LABEL_GRAPH_HISTORY = "История, с"
+LABEL_RECORD_DIRECTORY = "Папка"
+LABEL_RECORD_DECIMATION = "Децимация"
+LABEL_RECORD_FBG_LIMIT = "Позиций на канал"
+LABEL_RECORD_ESTIMATE = "Оценка на 10 минут"
+LABEL_RECORD_STATE = "Состояние"
+LABEL_RECORD_FILE = "Текущий файл"
+LABEL_RECORD_ROWS = "Строк"
+LABEL_RECORD_SIZE = "Записано"
+LABEL_RECORD_ELAPSED = "Прошло"
+LABEL_RECORD_GAPS = "Разрывы"
+
+GRAPH_AXIS_TIME = "Время до текущего кадра, с"
+GRAPH_AXIS_DELTA_NM = "Δλ от первого валидного значения, нм"
+GRAPH_BASELINE_HINT = (
+    "Каждая выбранная линия показана как Δλ относительно своего первого валидного значения "
+    "в видимой истории. Абсолютная длина волны остаётся в таблице. NaN рисуется разрывом."
+)
+GRAPH_NO_SELECTION = "Отметьте позиции слева, которые нужно рисовать."
+
+TABLE_POSITION = "Позиция"
+TABLE_WAVELENGTH = "λ, нм"
+TABLE_VALID = "валидно"
+TABLE_VALID_YES = "да"
+TABLE_VALID_NO = "нет"
+TABLE_TEMPERATURE = "Температура корпуса"
+
+RECORD_IDLE = "Запись не идёт"
+RECORD_ACTIVE = "Идёт запись"
+RECORD_START_REQUIRES_STREAM = "Начать запись можно только при работающем потоке телеметрии."
+RECORD_NO_GAPS = "разрывов нет"
+RECORD_GAP_WARNING = "ВНИМАНИЕ: в файле есть # GAP — запись содержит разрывы."
+RECORD_LIMIT_ALL = "Все"
+RECORD_ESTIMATE_SUFFIX = "по текущей заполненности / максимум"
+CONFIG_RECORDING_SWEEP_LOCKED = "Развёртка заблокирована на время записи измерений (Р67)."
+
+
+def slot_label(channel: int, position: int) -> str:
+    """Подпись слота без превращения его в датчик (Р30)."""
+    return f"Канал {channel + 1} · позиция {position + 1}"
+
+
+def channel_label(channel: int) -> str:
+    """Короткая подпись физического канала."""
+    return f"Канал {channel + 1}"
 
 
 # --------------------------------------------------------------------------------------

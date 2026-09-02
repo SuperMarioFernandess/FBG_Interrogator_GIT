@@ -15,14 +15,16 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
+
 from fbg.core.endpoint import Endpoint
 from fbg.core.frames import ChannelSetup, GainSetting
-from fbg.core.pipeline import PipelineMetrics, UiSnapshot
+from fbg.core.pipeline import PipelineMetrics, TraceHistorySnapshot, UiSnapshot
 from fbg.core.profile import C_NM_GHZ, DeviceProfile
 from fbg.core.session import DeviceConfig, SessionError, SessionState, SessionStats
 from fbg.core.transport import TransportStats
 from fbg.io.packet_log import Direction, PacketLogStats, PacketRecord, format_hex, format_id_fc
-from fbg.io.recorder import RecorderStats
+from fbg.io.recorder import RecorderConfig, RecorderStats, format_rows, row_format
 from fbg.ui import texts
 from fbg.ui.texts import Tone
 
@@ -32,6 +34,18 @@ HEX_DISPLAY_BYTES = 48
 #: Столбцы таблицы журнала. Порядок совпадает с файлом (`packet_log.COLUMNS`):
 #: hex стоит **до** расшифровки, потому что байты первичны (KB_05 №3).
 LOG_COLUMN_COUNT = len(texts.LOG_COLUMNS)
+
+#: Минимальный вертикальный диапазон графика Δλ. Два пикометра по длине
+#: волны (0.002 нм) сопоставимы с паспортной повторяемостью прибора ±2 пм и
+#: не дают pyqtgraph схлопнуть диапазон на идеально ровной линии.
+GRAPH_MIN_SPAN_NM = 0.002
+
+#: Запас сверху и снизу от видимого диапазона, чтобы экстремум не лежал
+#: непосредственно на рамке графика.
+GRAPH_RANGE_PADDING = 0.10
+
+#: Оценка объёма показывается для стандартных десяти минут из требования чата.
+RECORDING_ESTIMATE_SECONDS = 600.0
 
 
 # --------------------------------------------------------------------------------------
@@ -82,8 +96,11 @@ class AppSnapshot:
     transport: TransportStats = field(default_factory=TransportStats)
     metrics: PipelineMetrics | None = None
     ui: UiSnapshot | None = None
+    trace_history: TraceHistorySnapshot | None = None
     log: PacketLogStats | None = None
+    recorder_config: RecorderConfig | None = None
     recorder: RecorderStats | None = None
+    recording_elapsed_s: float = 0.0
 
     last_spectrum_max_adc: int | None = None
     last_spectrum_saturated_points: int | None = None
@@ -133,6 +150,279 @@ def format_threshold(setup: ChannelSetup) -> str:
 
 
 # --------------------------------------------------------------------------------------
+# Панель измерения: график, таблица, запись
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, order=True)
+class SlotRef:
+    """Одна позиция телеметрии: физический канал и слот, оба 0-based.
+
+    Это **не датчик** (Р30). Идентификатор нужен только для выбора кривой
+    и строки таблицы; физическая решётка появится этажом выше, в калибровке.
+    """
+
+    channel: int
+    position: int
+
+
+def slot_token(slot: SlotRef) -> str:
+    """Строка для `QVariant`: типы Python там не сохраняются (KB_05 №36)."""
+    return f"{slot.channel}:{slot.position}"
+
+
+def parse_slot_token(token: str) -> SlotRef:
+    """Обратное преобразование строки элемента Qt в ссылку на слот."""
+    try:
+        channel_text, position_text = token.split(":", 1)
+        channel = int(channel_text)
+        position = int(position_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"неверный идентификатор позиции {token!r}") from exc
+    if channel < 0 or position < 0:
+        raise ValueError(f"неверный идентификатор позиции {token!r}")
+    return SlotRef(channel, position)
+
+
+def available_slots(profile: DeviceProfile) -> tuple[SlotRef, ...]:
+    """Все слоты профиля в порядке канал → позиция."""
+    return tuple(
+        SlotRef(channel, position)
+        for channel in range(profile.channels)
+        for position in range(profile.fbg_per_channel)
+    )
+
+
+@dataclass(frozen=True)
+class GraphTrace:
+    """Одна выбранная линия графика в координатах Δλ(t)."""
+
+    slot: SlotRef
+    delta_nm: np.ndarray
+    baseline_nm: float | None
+    latest_nm: float | None
+    valid_points: int
+
+
+@dataclass(frozen=True)
+class MeasurementGraphModel:
+    """Готовые данные графика из копии истории pipeline."""
+
+    t_s: np.ndarray
+    """Время относительно последнего кадра: правый край всегда 0 с."""
+
+    traces: tuple[GraphTrace, ...]
+    y_min_nm: float
+    y_max_nm: float
+    history_span_s: float
+
+
+def _visible_y_range(values: Sequence[np.ndarray]) -> tuple[float, float]:
+    """Диапазон Y только по конечным точкам видимых выбранных линий.
+
+    Сначала каждая линия уже приведена к Δλ относительно своего первого
+    валидного значения. Это сохраняет пикометровую динамику даже если две
+    решётки лежат на 1545 и 1551 нм. Затем диапазон строится только по тем
+    линиям, которые действительно выбраны пользователем.
+    """
+    finite_blocks = [block[np.isfinite(block)] for block in values]
+    finite_blocks = [block for block in finite_blocks if block.size]
+    if not finite_blocks:
+        half = GRAPH_MIN_SPAN_NM / 2.0
+        return -half, half
+    low = min(float(block.min()) for block in finite_blocks)
+    high = max(float(block.max()) for block in finite_blocks)
+    span = high - low
+    if span < GRAPH_MIN_SPAN_NM:
+        center = (low + high) / 2.0
+        half = GRAPH_MIN_SPAN_NM / 2.0
+        return center - half, center + half
+    padding = span * GRAPH_RANGE_PADDING
+    return low - padding, high + padding
+
+
+def measurement_graph_model(
+    snapshot: AppSnapshot,
+    selected: Sequence[SlotRef],
+) -> MeasurementGraphModel:
+    """Строит Δλ(t) выбранных слотов из `TraceHistorySnapshot`.
+
+    Базой каждой линии служит **первое валидное значение в видимой истории**.
+    Так абсолютный уровень около 1550 нм не съедает пикометровые изменения,
+    при этом единица оси остаётся нанометром. NaN вычитается как NaN и тем
+    самым остаётся разрывом — никакого заполнения последним значением нет.
+    """
+    history = snapshot.trace_history
+    if history is None or history.frames == 0:
+        low, high = _visible_y_range(())
+        return MeasurementGraphModel(np.empty(0), (), low, high, 0.0)
+
+    columns = {SlotRef(*pair): index for index, pair in enumerate(history.positions)}
+    t_s = history.t_mono - history.t_mono[-1]
+    traces: list[GraphTrace] = []
+    deltas: list[np.ndarray] = []
+    for slot in selected:
+        column = columns.get(slot)
+        if column is None:
+            continue
+        absolute = history.wavelength_nm[:, column]
+        finite = np.flatnonzero(np.isfinite(absolute))
+        if finite.size:
+            baseline = float(absolute[int(finite[0])])
+            latest = float(absolute[int(finite[-1])])
+            delta = absolute - baseline
+            valid_points = int(finite.size)
+        else:
+            baseline = None
+            latest = None
+            delta = np.full(absolute.shape, np.nan, dtype=np.float64)
+            valid_points = 0
+        deltas.append(delta)
+        traces.append(GraphTrace(slot, delta, baseline, latest, valid_points))
+    low, high = _visible_y_range(deltas)
+    return MeasurementGraphModel(t_s, tuple(traces), low, high, history.span_s)
+
+
+@dataclass(frozen=True)
+class MeasurementTableModel:
+    """Последний кадр как таблица канал × позиция, без привязки к датчикам."""
+
+    wavelength_nm: np.ndarray
+    valid: np.ndarray
+    case_temp_c: np.ndarray
+
+    @property
+    def channels(self) -> int:
+        return int(self.wavelength_nm.shape[0])
+
+    @property
+    def positions(self) -> int:
+        return int(self.wavelength_nm.shape[1])
+
+
+def measurement_table_model(snapshot: AppSnapshot) -> MeasurementTableModel:
+    """Строит полную таблицу 4×30 (или геометрию текущего профиля) одним снимком."""
+    shape = (snapshot.profile.channels, snapshot.profile.fbg_per_channel)
+    if snapshot.ui is None:
+        wavelength = np.full(shape, np.nan, dtype=np.float64)
+        temperature = np.full(snapshot.profile.channels, np.nan, dtype=np.float64)
+    else:
+        wavelength = snapshot.ui.wavelength_nm.copy()
+        temperature = snapshot.ui.case_temp_c.copy()
+    valid = np.isfinite(wavelength)
+    return MeasurementTableModel(wavelength, valid, temperature)
+
+
+@dataclass(frozen=True)
+class RecordingPanelModel:
+    """Состояние и прогноз записи, которые панель показывает одним тактом."""
+
+    active: bool
+    directory: Path
+    decimation: int
+    fbg_limit: int | None
+    path: Path | None
+    rows: int
+    bytes_written: int
+    elapsed_s: float
+    gaps: int
+    lost_frames: int
+    pending_gap: int
+    error: str | None
+    estimated_bytes_10m: int
+    estimated_max_bytes_10m: int
+
+    @property
+    def has_gaps(self) -> bool:
+        """True и для уже записанного, и для ещё не сброшенного `# GAP`."""
+        return self.gaps > 0 or self.pending_gap > 0 or self.lost_frames > 0
+
+
+def _estimated_row_bytes(
+    snapshot: AppSnapshot,
+    config: RecorderConfig,
+    *,
+    all_valid: bool,
+) -> int:
+    """Длина характерной CSV-строки тем же форматтером, что использует Recorder."""
+    channels = snapshot.profile.channels
+    fbg_written = (
+        snapshot.profile.fbg_per_channel
+        if config.fbg_limit is None
+        else min(config.fbg_limit, snapshot.profile.fbg_per_channel)
+    )
+    if all_valid:
+        nm = np.full((channels, fbg_written), 1550.0, dtype=np.float64)
+    elif snapshot.ui is None:
+        nm = np.full((channels, fbg_written), np.nan, dtype=np.float64)
+    else:
+        nm = snapshot.ui.wavelength_nm[:, :fbg_written].copy()
+    if snapshot.ui is None:
+        temp = np.full(channels, 20.0, dtype=np.float64)
+    else:
+        temp = snapshot.ui.case_temp_c.copy()
+        temp[~np.isfinite(temp)] = 20.0
+    row = format_rows(
+        row_format(channels, fbg_written),
+        np.asarray([1_000_000], dtype=np.int64),
+        np.asarray([1_000_000.0], dtype=np.float64),
+        np.asarray([1_700_000_000.0], dtype=np.float64),
+        nm[np.newaxis, :, :],
+        temp[np.newaxis, :],
+    )
+    return len(row.encode("ascii"))
+
+
+def estimate_recording_bytes(
+    snapshot: AppSnapshot,
+    config: RecorderConfig,
+    *,
+    duration_s: float = RECORDING_ESTIMATE_SECONDS,
+    all_valid: bool = False,
+) -> int:
+    """Оценивает размер CSV заранее по темпу, децимации и ширине строки.
+
+    Для обычной оценки используется текущая заполненность последнего кадра:
+    `nan` в ASCII заметно короче `1550.0000`, поэтому реальная линия с 2–3
+    найденными пиками даёт около 660 МБ за 10 минут при 2 кГц, а полностью
+    заполненные 120 позиций заметно больше. `all_valid=True` даёт верхнюю
+    оценку для выбранного `fbg_limit`.
+    """
+    if duration_s < 0:
+        raise ValueError("duration_s не может быть отрицательной")
+    expected = None if snapshot.metrics is None else snapshot.metrics.expected_rate_hz
+    rate_hz = float(expected or snapshot.profile.sweep_speed_hz)
+    rows = rate_hz * duration_s / config.decimation
+    return round(rows * _estimated_row_bytes(snapshot, config, all_valid=all_valid))
+
+
+def recording_panel_model(snapshot: AppSnapshot) -> RecordingPanelModel:
+    """Собирает состояние записи и прогноз из одного `AppSnapshot`."""
+    config = snapshot.recorder_config
+    if config is None:
+        # В нормальном AppController поле всегда есть; умолчание нужно только
+        # для лёгких синтетических снимков тестов модели.
+        config = RecorderConfig(directory=Path("data"))
+    stats = snapshot.recorder
+    return RecordingPanelModel(
+        active=snapshot.recording,
+        directory=config.directory,
+        decimation=config.decimation,
+        fbg_limit=config.fbg_limit,
+        path=None if stats is None else stats.path,
+        rows=0 if stats is None else stats.rows,
+        bytes_written=0 if stats is None else stats.bytes_written,
+        elapsed_s=snapshot.recording_elapsed_s,
+        gaps=0 if stats is None else stats.gaps,
+        lost_frames=0 if stats is None else stats.lost_frames,
+        pending_gap=0 if stats is None else stats.pending_gap,
+        error=None if stats is None else stats.error,
+        estimated_bytes_10m=estimate_recording_bytes(snapshot, config),
+        estimated_max_bytes_10m=estimate_recording_bytes(snapshot, config, all_valid=True),
+    )
+
+
+# --------------------------------------------------------------------------------------
 # Панель настройки прибора
 # --------------------------------------------------------------------------------------
 
@@ -169,6 +459,7 @@ class DeviceConfigModel:
     """Вся модель панели настройки, построенная из одного `AppSnapshot`."""
 
     enabled: bool
+    sweep_enabled: bool
     channel_count: int
     channels: tuple[ChannelConfigModel, ...]
     peak_gap_ghz: int | None
@@ -269,6 +560,7 @@ def device_config_model(snapshot: AppSnapshot) -> DeviceConfigModel:
     if device is None:
         return DeviceConfigModel(
             enabled=False,
+            sweep_enabled=False,
             channel_count=0,
             channels=(),
             peak_gap_ghz=None,
@@ -303,6 +595,7 @@ def device_config_model(snapshot: AppSnapshot) -> DeviceConfigModel:
     )
     return DeviceConfigModel(
         enabled=enabled,
+        sweep_enabled=enabled and not snapshot.recording,
         channel_count=channel_count,
         channels=channels,
         peak_gap_ghz=device.module.peak_gap_ghz,

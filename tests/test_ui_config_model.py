@@ -228,6 +228,13 @@ def test_расхождение_геометрии_блокирует_редак
     assert not models.device_config_model(snapshot(profile_mismatch=(mismatch,))).enabled
 
 
+def test_развёртка_блокируется_тем_же_snapshot_recording_что_и_панель_измерения() -> None:
+    """Р67: единственный источник состояния записи — `AppSnapshot.recording`."""
+    model = models.device_config_model(snapshot(state=SessionState.STREAMING, recording=True))
+    assert model.enabled, "порог и усиление во время потока по Р62 остаются доступны"
+    assert not model.sweep_enabled
+
+
 def test_unconfirmed_размечается_существующими_ключами_сессии() -> None:
     model = models.device_config_model(
         snapshot(
