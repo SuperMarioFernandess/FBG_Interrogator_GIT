@@ -1,0 +1,395 @@
++    assert "0 пиков" in text
++
++
++def test_подсказка_усиления_сообщает_о_насыщении() -> None:
++    text = texts.gain_spectrum_hint(17)
++    assert "17" in text
++    assert "Насыщение" in text
++
++
++@pytest.mark.parametrize(
++    ("state", "enabled"),
++    [
++        (SessionState.DISCONNECTED, False),
++        (SessionState.PROBING, False),
++        (SessionState.IDLE, True),
++        (SessionState.STREAMING, True),
++        (SessionState.DEBUG, False),
++        (SessionState.DEGRADED, False),
++        (SessionState.RECONNECTING, False),
++    ],
++)
++def test_запись_разрешена_только_в_idle_и_streaming(state: SessionState, enabled: bool) -> None:
++    assert models.device_config_model(snapshot(state=state)).enabled is enabled
++
++
++def test_расхождение_геометрии_блокирует_редактирование() -> None:
++    mismatch = models.ProfileDifference("channels", 8, 4)
++    assert not models.device_config_model(snapshot(profile_mismatch=(mismatch,))).enabled
++
++
++def test_unconfirmed_размечается_существующими_ключами_сессии() -> None:
++    model = models.device_config_model(
++        snapshot(
++            unconfirmed=frozenset(
++                {"threshold:0", "gain:1", "peak_gap", "sweep", "saved_thresholds"}
++            )
++        )
++    )
++    assert model.channels[0].threshold_unconfirmed
++    assert model.channels[1].gain_unconfirmed
++    assert model.peak_gap_unconfirmed
++    assert model.sweep is not None and model.sweep.unconfirmed
++    assert model.saved_thresholds_unconfirmed
++
++
++# --------------------------------------------------------------------------------------
++# Контроллер: валидация, read-back и 20 06
++# --------------------------------------------------------------------------------------
++
++
++def test_контроллер_не_выпускает_опасный_номер_канала(tmp_path: Path) -> None:
++    stand = ControllerStand(tmp_path)
++    try:
++        before = stand.sim.stats.requests
++        with pytest.raises(ValueError, match="R14"):
++            stand.controller.set_threshold(4, 1000)
++        assert stand.sim.stats.requests == before
++    finally:
++        stand.close()
++
++
++def test_контроллер_не_выпускает_опасный_порог_и_усиление(tmp_path: Path) -> None:
++    stand = ControllerStand(tmp_path)
++    try:
++        before = stand.sim.stats.requests
++        with pytest.raises(ValueError, match="0…16383"):
++            stand.controller.set_threshold(0, 16384)
++        with pytest.raises(ValueError, match="0…16383"):
++            stand.controller.set_threshold(0, -1)
++        with pytest.raises(ValueError, match="0…5"):
++            stand.controller.set_gain(0, True, 6)
++        with pytest.raises(ValueError, match="0…5"):
++            stand.controller.set_gain(0, True, -1)
++        assert stand.sim.stats.requests == before
++    finally:
++        stand.close()
++
++
++def test_подтверждённая_геометрия_обновляет_кэш_профиля(tmp_path: Path) -> None:
++    stand = ControllerStand(tmp_path)
++    try:
++        assert stand.controller.set_peak_gap(40).ok
++        assert stand.controller.config.profile.peak_gap_ghz == 40
++        assert stand.controller.set_sweep(0, 2, 5100, 2).ok
++        profile = stand.controller.config.profile
++        assert (profile.start_param, profile.stop_param) == (0, 5100)
++        assert stand.controller.session.state is SessionState.DISCONNECTED
++        assert "подключитесь снова" in " ".join(stand.controller.notices)
++        assert (tmp_path / "fbg_config.json").is_file()
++    finally:
++        stand.close()
++
++
++def test_readback_подтверждает_запись_и_снимает_unconfirmed(tmp_path: Path) -> None:
++    stand = ControllerStand(tmp_path)
++    try:
++        result = stand.controller.set_threshold(0, 1000)
++        assert result.ok and result.unwrap().threshold == 1000
++        assert "threshold:0" not in stand.controller.snapshot().unconfirmed
++    finally:
++        stand.close()
++
++
++def test_readback_расхождение_остаётся_unconfirmed(tmp_path: Path) -> None:
++    stand = ControllerStand(tmp_path, LyingThresholdSimulator)
++    try:
++        result = stand.controller.set_threshold(0, 1000)
++        assert result.error is not None
++        assert result.error.kind is SessionErrorKind.VERIFICATION_MISMATCH
++        assert "threshold:0" in stand.controller.snapshot().unconfirmed
++    finally:
++        stand.close()
++
++
++def test_20_06_не_ждёт_ответа_и_проверяет_пороги_чтением(tmp_path: Path) -> None:
++    stand = ControllerStand(tmp_path)
++    try:
++        assert stand.controller.set_threshold(0, 1000).ok
++        before = stand.sim.stats.requests
++        result = stand.controller.save_thresholds()
++        assert result.ok
++        assert stand.sim.stats.requests - before == 2  # 20 06 без ответа + read-back 10 06
++        assert stand.sim.state.saved_thresholds == stand.sim.state.thresholds
++        assert "saved_thresholds" not in stand.controller.snapshot().unconfirmed
++    finally:
++        stand.close()
++
++
++def test_20_06_readback_расхождение_остаётся_unconfirmed(tmp_path: Path) -> None:
++    stand = ControllerStand(tmp_path, SaveReadbackMismatchSimulator)
++    try:
++        assert stand.controller.set_threshold(0, 1000).ok
++        result = stand.controller.save_thresholds()
++        assert result.error is not None
++        assert result.error.kind is SessionErrorKind.VERIFICATION_MISMATCH
++        assert "saved_thresholds" in stand.controller.snapshot().unconfirmed
++        assert stand.sim.state.saved_thresholds is not None
++        assert stand.sim.state.saved_thresholds[0] == 1000
++    finally:
++        stand.close()
++
++
++def test_порог_можно_менять_во_время_streaming(tmp_path: Path) -> None:
++    stand = ControllerStand(tmp_path)
++    try:
++        assert stand.controller.start_stream().ok
++        result = stand.controller.set_threshold(0, 1000)
++        assert result.ok
++        assert stand.controller.session.state is SessionState.STREAMING
++        assert stand.sim.streaming
++    finally:
++        stand.close()
+diff --git a/tests/test_ui_config_widget.py b/tests/test_ui_config_widget.py
+new file mode 100644
+index 0000000..c5b786a
+--- /dev/null
++++ b/tests/test_ui_config_widget.py
+@@ -0,0 +1,212 @@
++"""Виджет панели настройки. Маркер `ui`, гоняется offscreen.
++
++Проверяется устройство панели и блокировки. Внешний вид, ширины и читаемость
++остаётся визуальной приёмкой на Windows.
++"""
++
++import os
++from collections.abc import Iterator
++
++import pytest
++
++pytest.importorskip("PySide6", reason="тесты интерфейса требуют Qt")
++os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
++
++from PySide6.QtWidgets import QApplication
++
++from fbg.core.endpoint import Endpoint
++from fbg.core.frames import ChannelSetup, GainSetting, ModuleParams, SweepConfig
++from fbg.core.profile import DeviceProfile
++from fbg.core.session import DeviceConfig, Result, SessionState
++from fbg.io.config import AppConfig
++from fbg.io.packet_log import PacketLogConfig
++from fbg.ui import models, texts
++from fbg.ui.app import AppController
++from fbg.ui.panels.device_config import DeviceConfigPanel
++
++pytestmark = pytest.mark.ui
++
++PROFILE = DeviceProfile()
++DEVICE = DeviceConfig(
++    version_raw=410,
++    serial=94_401_220,
++    module=ModuleParams(0x00CA, 2000, 4, 30, 30),
++    sweep=SweepConfig.from_params(1, 2, 5101, 2, PROFILE),
++    channels=tuple(
++        ChannelSetup(channel, None, GainSetting(False, 5)) for channel in range(4)
++    ),
++)
++
++
++@pytest.fixture(scope="session")
++def application() -> QApplication:
++    existing = QApplication.instance()
++    if isinstance(existing, QApplication):
++        return existing
++    return QApplication([])
++
++
++@pytest.fixture
++def controller() -> Iterator[AppController]:
++    app_controller = AppController(AppConfig(packet_log=PacketLogConfig(directory=None)))
++    app_controller.start()
++    try:
++        yield app_controller
++    finally:
++        app_controller.shutdown()
++
++
++@pytest.fixture
++def panel(application: QApplication, controller: AppController) -> Iterator[DeviceConfigPanel]:
++    widget = DeviceConfigPanel(controller)
++    try:
++        yield widget
++    finally:
++        widget.close()
++        widget.deleteLater()
++
++
++def snapshot(state: SessionState = SessionState.IDLE, **changes: object) -> models.AppSnapshot:
++    values: dict[str, object] = {
++        "endpoint": Endpoint(),
++        "profile": PROFILE,
++        "state": state,
++        "device": DEVICE,
++    }
++    values.update(changes)
++    return models.AppSnapshot(**values)  # type: ignore[arg-type]
++
++
++def test_поля_имеют_жёсткие_диапазоны(panel: DeviceConfigPanel) -> None:
++    panel.refresh(snapshot())
++    assert panel.channel_box.count() == 4
++    assert panel.threshold_spin.minimum() == 0
++    assert panel.threshold_spin.maximum() == 16383
++    assert panel.gain_level.minimum() == 0
++    assert panel.gain_level.maximum() == 5
++    assert panel.peak_gap.minimum() == 1
++    assert panel.peak_gap.maximum() == 255
++
++
++def test_автопорог_не_вводится_как_ffff(panel: DeviceConfigPanel) -> None:
++    panel.refresh(snapshot())
++    assert panel.threshold_auto.isChecked()
++    assert not panel.threshold_spin.isEnabled()
++    panel.threshold_auto.setChecked(False)
++    assert panel.threshold_spin.isEnabled()
++    assert panel.threshold_spin.maximum() != 0xFFFF
++
++
++@pytest.mark.parametrize(
++    ("state", "enabled"),
++    [
++        (SessionState.DISCONNECTED, False),
++        (SessionState.PROBING, False),
++        (SessionState.IDLE, True),
++        (SessionState.STREAMING, True),
++        (SessionState.DEBUG, False),
++        (SessionState.DEGRADED, False),
++        (SessionState.RECONNECTING, False),
++    ],
++)
++def test_кнопки_блокируются_по_состоянию(
++    panel: DeviceConfigPanel, state: SessionState, enabled: bool
++) -> None:
++    panel.refresh(snapshot(state))
++    assert panel.apply_threshold_button.isEnabled() is enabled
++    assert panel.apply_gain_button.isEnabled() is enabled
++    assert panel.apply_peak_gap_button.isEnabled() is enabled
++    assert panel.apply_sweep_button.isEnabled() is enabled
++    assert panel.save_button.isEnabled() is enabled
++    if state is SessionState.STREAMING:
++        assert texts.CONFIG_STREAMING_ALLOWED in panel.availability_label.text()
++
++
++def test_расхождение_геометрии_блокирует_кнопки(panel: DeviceConfigPanel) -> None:
++    mismatch = models.ProfileDifference("channels", 8, 4)
++    panel.refresh(snapshot(profile_mismatch=(mismatch,)))
++    assert not panel.apply_threshold_button.isEnabled()
++    assert not panel.apply_gain_button.isEnabled()
++    assert not panel.apply_peak_gap_button.isEnabled()
++    assert not panel.apply_sweep_button.isEnabled()
++    assert not panel.save_button.isEnabled()
++    assert texts.CONFIG_PROFILE_MISMATCH in panel.availability_label.text()
++
++
++def test_невалидная_развёртка_не_может_быть_отправлена(panel: DeviceConfigPanel) -> None:
++    panel.refresh(snapshot())
++    panel.start_param.setValue(5101)
++    panel.stop_param.setValue(1)
++    assert not panel.apply_sweep_button.isEnabled()
++    assert "Настройка не отправлена" in panel.sweep_preview.text()
++
++
++def test_preview_показывает_точки_и_границы_в_нм(panel: DeviceConfigPanel) -> None:
++    panel.refresh(snapshot())
++    text = panel.sweep_preview.text()
++    assert "2551" in text
++    assert "196249" in text
++    assert "191149" in text
++    assert "нм" in text
++
++
++def test_развёртка_предупреждает_о_переподключении(panel: DeviceConfigPanel) -> None:
++    panel.refresh(snapshot())
++    assert "подключитесь снова" in panel.sweep_hint.text()
++
++
++def test_подсказки_используют_последний_спектр(panel: DeviceConfigPanel) -> None:
++    panel.refresh(
++        snapshot(last_spectrum_max_adc=11123, last_spectrum_saturated_points=17)
++    )
++    panel.threshold_auto.setChecked(False)
++    panel.threshold_spin.setValue(12000)
++    assert "11123" in panel.threshold_hint.text()
++    assert "0 пиков" in panel.threshold_hint.text()
++    assert "17" in panel.gain_hint.text()
++    assert "Насыщение" in panel.gain_hint.text()
++
++
++def test_unconfirmed_показывается_у_того_же_поля(panel: DeviceConfigPanel) -> None:
++    panel.refresh(snapshot(unconfirmed=frozenset({"threshold:0", "gain:0", "sweep"})))
++    assert panel.threshold_status.text() == texts.UNCONFIRMED
++    assert panel.gain_status.text() == texts.UNCONFIRMED
++    assert panel.sweep_status.text() == texts.UNCONFIRMED
++
++
++def test_unconfirmed_не_теряется_когда_поле_редактируется(panel: DeviceConfigPanel) -> None:
++    panel.refresh(snapshot())
++    panel.threshold_auto.setChecked(False)
++    panel.threshold_spin.setValue(1000)
++    panel.start_param.setValue(2)
++
++    panel.refresh(snapshot(unconfirmed=frozenset({"threshold:0", "sweep"})))
++    assert panel.threshold_spin.value() == 1000
++    assert panel.threshold_status.text() == texts.UNCONFIRMED
++    assert panel.start_param.value() == 2
++    assert panel.sweep_status.text() == texts.UNCONFIRMED
++
++
++def test_сохранение_честно_описывает_границы_подтверждения(panel: DeviceConfigPanel) -> None:
++    panel.refresh(snapshot())
++    hint = panel.save_hint.text()
++    assert "только пороги" in hint
++    assert "уровень 5" in hint
++    assert "перезапуск питания" in hint
++
++
++def test_автопорог_отправляется_как_none(
++    panel: DeviceConfigPanel, controller: AppController, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    calls: list[tuple[int, int | None]] = []
++
++    def fake_set_threshold(channel: int, threshold: int | None) -> Result[ChannelSetup]:
++        calls.append((channel, threshold))
++        return Result(value=DEVICE.channels[channel])
++
++    monkeypatch.setattr(controller, "set_threshold", fake_set_threshold)
++    panel.refresh(snapshot())
++    panel.channel_box.setCurrentIndex(2)
++    panel.threshold_auto.setChecked(True)
++    panel.apply_threshold_button.click()
++    assert calls == [(2, None)]
+diff --git a/tests/test_ui_widgets.py b/tests/test_ui_widgets.py
+index de8f68d..807d2a6 100644
+--- a/tests/test_ui_widgets.py
++++ b/tests/test_ui_widgets.py
+@@ -77,12 +77,17 @@ def push(controller: AppController, count: int, prefix: bytes = b"\x10\x04\x04\x
+ # --------------------------------------------------------------------------------------
+ 
+ 
+-def test_окно_создаётся_с_тремя_вкладками(window: MainWindow) -> None:
++def test_окно_создаётся_с_четырьмя_вкладками(window: MainWindow) -> None:
+     """Вкладки на месте и подписаны по-русски."""
+     titles = [window.tabs.tabText(index) for index in range(window.tabs.count())]
+-    assert titles == [texts.TAB_CONNECTION, texts.TAB_DEVICE, texts.TAB_PACKET_LOG]
++    assert titles == [
++        texts.TAB_CONNECTION,
++        texts.TAB_DEVICE,
++        texts.TAB_DEVICE_CONFIG,
++        texts.TAB_PACKET_LOG,
++    ]
+     assert window.windowTitle() == texts.APP_TITLE
+-    assert len(window.panels) == 3
++    assert len(window.panels) == 4
+ 
+ 
+ def test_таймер_запускается_и_гаснет(window: MainWindow) -> None:
