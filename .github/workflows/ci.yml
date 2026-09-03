@@ -17,24 +17,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Скачать проверенный патч предыдущего прогона
+      - name: Скачать последнюю зелёную основу чата 13
         uses: actions/download-artifact@v4
         with:
-          name: chat13-normalized-patch
+          name: chat13-final-patch
           github-token: ${{ secrets.GITHUB_TOKEN }}
           repository: ${{ github.repository }}
-          run-id: 33736295351
+          run-id: 33738254342
 
-      - name: Применить проверенный патч и deltas чата 13
+      - name: Применить основу и финальный delta
         shell: bash
         run: |
-          git apply --index chat13_normalized.patch
-          base64 -d chat13_delta.patch.gz.b64 > /tmp/chat13_delta.patch.gz
-          gzip -dc /tmp/chat13_delta.patch.gz > /tmp/chat13_delta.patch
-          git apply /tmp/chat13_delta.patch
-          base64 -d chat13_sources_delta.patch.gz.b64 > /tmp/chat13_sources_delta.patch.gz
-          gzip -dc /tmp/chat13_sources_delta.patch.gz > /tmp/chat13_sources_delta.patch
-          git apply /tmp/chat13_sources_delta.patch
+          git apply --index chat13_final.patch
+          cat chat13_post37_delta.part0 chat13_post37_delta.part1 chat13_post37_delta.part2 chat13_post37_delta.part3 | base64 -d > /tmp/chat13_post37_delta.patch.gz
+          gzip -dc /tmp/chat13_post37_delta.patch.gz > /tmp/chat13_post37_delta.patch
+          git apply /tmp/chat13_post37_delta.patch
           git add -A README.md fbg tests main.py
 
       - uses: actions/setup-python@v5
@@ -54,14 +51,14 @@ jobs:
           ruff check fbg tests main.py
           ruff format --check fbg tests main.py
 
-      - name: Собрать нормализованный diff
+      - name: Собрать финальный diff
         shell: bash
-        run: git diff --cached --binary > chat13_final.patch
+        run: git diff --cached --binary > chat13_final_v2.patch
 
       - uses: actions/upload-artifact@v4
         with:
-          name: chat13-final-patch
-          path: chat13_final.patch
+          name: chat13-final-v2-patch
+          path: chat13_final_v2.patch
           if-no-files-found: error
 
   core:
@@ -77,11 +74,11 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: chat13-final-patch
+          name: chat13-final-v2-patch
 
       - name: Применить финальный патч
         shell: bash
-        run: git apply --index chat13_final.patch
+        run: git apply --index chat13_final_v2.patch
 
       - uses: actions/setup-python@v5
         with:
@@ -111,10 +108,10 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: chat13-final-patch
+          name: chat13-final-v2-patch
 
       - name: Применить финальный патч
-        run: git apply --index chat13_final.patch
+        run: git apply --index chat13_final_v2.patch
 
       - uses: actions/setup-python@v5
         with:
@@ -145,10 +142,10 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: chat13-final-patch
+          name: chat13-final-v2-patch
 
       - name: Применить финальный патч
-        run: git apply --index chat13_final.patch
+        run: git apply --index chat13_final_v2.patch
 
       - uses: actions/setup-python@v5
         with:
@@ -172,10 +169,10 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: chat13-final-patch
+          name: chat13-final-v2-patch
 
       - name: Применить финальный патч
-        run: git apply --index chat13_final.patch
+        run: git apply --index chat13_final_v2.patch
 
       - uses: actions/setup-python@v5
         with:
