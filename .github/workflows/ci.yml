@@ -25,14 +25,17 @@ jobs:
           repository: ${{ github.repository }}
           run-id: 33736295351
 
-      - name: Применить проверенный патч и финальный delta
+      - name: Применить проверенный патч и deltas чата 13
         shell: bash
         run: |
           git apply --index chat13_normalized.patch
           base64 -d chat13_delta.patch.gz.b64 > /tmp/chat13_delta.patch.gz
           gzip -dc /tmp/chat13_delta.patch.gz > /tmp/chat13_delta.patch
           git apply /tmp/chat13_delta.patch
-          git add fbg/ui/app.py tests/test_ui_app.py
+          base64 -d chat13_sources_delta.patch.gz.b64 > /tmp/chat13_sources_delta.patch.gz
+          gzip -dc /tmp/chat13_sources_delta.patch.gz > /tmp/chat13_sources_delta.patch
+          git apply /tmp/chat13_sources_delta.patch
+          git add -A README.md fbg tests main.py
 
       - uses: actions/setup-python@v5
         with:
