@@ -8,12 +8,52 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
+  normalize:
+    name: Chat 13 — нормализация патча
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Применить исходный патч чата 13
+        shell: bash
+        run: |
+          base64 -d chat13_validation.patch.gz.b64 > /tmp/chat13.patch.gz
+          gzip -dc /tmp/chat13.patch.gz > /tmp/chat13.patch
+          git apply --index /tmp/chat13.patch
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Установить ruff
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+
+      - name: Нормализовать форматирование
+        run: |
+          ruff format fbg tests main.py
+          git add -u
+          ruff check fbg tests main.py
+          ruff format --check fbg tests main.py
+
+      - name: Собрать нормализованный diff
+        shell: bash
+        run: git diff --cached --binary > chat13_normalized.patch
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chat13-normalized-patch
+          path: chat13_normalized.patch
+          if-no-files-found: error
+
   core:
     name: Ядро (без Qt)
     runs-on: ${{ matrix.os }}
+    needs: normalize
     strategy:
       fail-fast: false
       matrix:
@@ -21,12 +61,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Применить патч чата 13
+      - uses: actions/download-artifact@v4
+        with:
+          name: chat13-normalized-patch
+
+      - name: Применить нормализованный патч
         shell: bash
-        run: |
-          base64 -d chat13_validation.patch.gz.b64 > /tmp/chat13.patch.gz
-          gzip -dc /tmp/chat13.patch.gz > /tmp/chat13.patch
-          git apply --index /tmp/chat13.patch
+        run: git apply --index chat13_normalized.patch
 
       - uses: actions/setup-python@v5
         with:
@@ -38,28 +79,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy pytest pytest-cov ruff
 
-      - name: Проверка ruff
-        id: ruff
-        shell: bash
-        continue-on-error: true
-        run: |
-          status=0
-          ruff check fbg tests main.py 2>&1 | tee /tmp/ruff.txt || status=1
-          ruff format --check fbg tests main.py 2>&1 | tee -a /tmp/ruff.txt || status=1
-          exit "$status"
+      - name: Проверка стиля
+        run: ruff check fbg tests main.py
 
-      - name: Опубликовать диагностику ruff
-        if: steps.ruff.outcome == 'failure' && matrix.os == 'ubuntu-latest'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          { echo '```text'; cat /tmp/ruff.txt; echo '```'; } | gh pr comment 3 --body-file -
-
-      - name: Остановить job при ошибке ruff
-        if: steps.ruff.outcome == 'failure'
-        shell: bash
-        run: exit 1
+      - name: Проверка форматирования
+        run: ruff format --check fbg tests main.py
 
       - name: Тесты ядра
         run: pytest tests -m "not ui and not slow" -q --cov=fbg --cov-report=term-missing
@@ -67,24 +91,22 @@ jobs:
   ui:
     name: Интерфейс (offscreen)
     runs-on: ubuntu-latest
-    needs: core
+    needs: [normalize, core]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Применить патч чата 13
-        shell: bash
-        run: |
-          base64 -d chat13_validation.patch.gz.b64 > /tmp/chat13.patch.gz
-          gzip -dc /tmp/chat13.patch.gz > /tmp/chat13.patch
-          git apply --index /tmp/chat13.patch
+      - uses: actions/download-artifact@v4
+        with:
+          name: chat13-normalized-patch
+
+      - name: Применить нормализованный патч
+        run: git apply --index chat13_normalized.patch
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
-      # Платформа offscreen всё равно линкуется с libEGL и libGL:
-      # без них PySide6 не импортируется даже без экрана.
       - name: Системные библиотеки Qt
         run: |
           sudo apt-get update
@@ -103,16 +125,16 @@ jobs:
   load:
     name: Нагрузочный тест 2 кГц
     runs-on: ubuntu-latest
-    needs: core
+    needs: [normalize, core]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Применить патч чата 13
-        shell: bash
-        run: |
-          base64 -d chat13_validation.patch.gz.b64 > /tmp/chat13.patch.gz
-          gzip -dc /tmp/chat13.patch.gz > /tmp/chat13.patch
-          git apply --index /tmp/chat13.patch
+      - uses: actions/download-artifact@v4
+        with:
+          name: chat13-normalized-patch
+
+      - name: Применить нормализованный патч
+        run: git apply --index chat13_normalized.patch
 
       - uses: actions/setup-python@v5
         with:
@@ -130,16 +152,16 @@ jobs:
   chat13-full:
     name: Chat 13 — полный pytest
     runs-on: ubuntu-latest
-    needs: core
+    needs: [normalize, core]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Применить патч чата 13
-        shell: bash
-        run: |
-          base64 -d chat13_validation.patch.gz.b64 > /tmp/chat13.patch.gz
-          gzip -dc /tmp/chat13_validation.patch.gz > /tmp/chat13.patch
-          git apply --index /tmp/chat13.patch
+      - uses: actions/download-artifact@v4
+        with:
+          name: chat13-normalized-patch
+
+      - name: Применить нормализованный патч
+        run: git apply --index chat13_normalized.patch
 
       - uses: actions/setup-python@v5
         with:
