@@ -7,6 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -16,12 +17,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Применить исходный патч чата 13
+      - name: Скачать проверенный патч предыдущего прогона
+        uses: actions/download-artifact@v4
+        with:
+          name: chat13-normalized-patch
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 33736295351
+
+      - name: Применить проверенный патч и финальный delta
         shell: bash
         run: |
-          base64 -d chat13_validation.patch.gz.b64 > /tmp/chat13.patch.gz
-          gzip -dc /tmp/chat13.patch.gz > /tmp/chat13.patch
-          git apply --index /tmp/chat13.patch
+          git apply --index chat13_normalized.patch
+          base64 -d chat13_delta.patch.gz.b64 > /tmp/chat13_delta.patch.gz
+          gzip -dc /tmp/chat13_delta.patch.gz > /tmp/chat13_delta.patch
+          git apply /tmp/chat13_delta.patch
+          git add fbg/ui/app.py tests/test_ui_app.py
 
       - uses: actions/setup-python@v5
         with:
@@ -42,12 +53,12 @@ jobs:
 
       - name: Собрать нормализованный diff
         shell: bash
-        run: git diff --cached --binary > chat13_normalized.patch
+        run: git diff --cached --binary > chat13_final.patch
 
       - uses: actions/upload-artifact@v4
         with:
-          name: chat13-normalized-patch
-          path: chat13_normalized.patch
+          name: chat13-final-patch
+          path: chat13_final.patch
           if-no-files-found: error
 
   core:
@@ -63,11 +74,11 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: chat13-normalized-patch
+          name: chat13-final-patch
 
-      - name: Применить нормализованный патч
+      - name: Применить финальный патч
         shell: bash
-        run: git apply --index chat13_normalized.patch
+        run: git apply --index chat13_final.patch
 
       - uses: actions/setup-python@v5
         with:
@@ -97,10 +108,10 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: chat13-normalized-patch
+          name: chat13-final-patch
 
-      - name: Применить нормализованный патч
-        run: git apply --index chat13_normalized.patch
+      - name: Применить финальный патч
+        run: git apply --index chat13_final.patch
 
       - uses: actions/setup-python@v5
         with:
@@ -131,10 +142,10 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: chat13-normalized-patch
+          name: chat13-final-patch
 
-      - name: Применить нормализованный патч
-        run: git apply --index chat13_normalized.patch
+      - name: Применить финальный патч
+        run: git apply --index chat13_final.patch
 
       - uses: actions/setup-python@v5
         with:
@@ -158,10 +169,10 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: chat13-normalized-patch
+          name: chat13-final-patch
 
-      - name: Применить нормализованный патч
-        run: git apply --index chat13_normalized.patch
+      - name: Применить финальный патч
+        run: git apply --index chat13_final.patch
 
       - uses: actions/setup-python@v5
         with:
