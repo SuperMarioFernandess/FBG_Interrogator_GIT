@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   core:
     name: Ядро (без Qt)
@@ -34,11 +38,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy pytest pytest-cov ruff
 
-      - name: Проверка стиля
-        run: ruff check fbg tests main.py
+      - name: Проверка ruff
+        id: ruff
+        shell: bash
+        continue-on-error: true
+        run: |
+          status=0
+          ruff check fbg tests main.py 2>&1 | tee /tmp/ruff.txt || status=1
+          ruff format --check fbg tests main.py 2>&1 | tee -a /tmp/ruff.txt || status=1
+          exit "$status"
 
-      - name: Проверка форматирования
-        run: ruff format --check fbg tests main.py
+      - name: Опубликовать диагностику ruff
+        if: steps.ruff.outcome == 'failure' && matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          { echo '```text'; cat /tmp/ruff.txt; echo '```'; } | gh pr comment 3 --body-file -
+
+      - name: Остановить job при ошибке ruff
+        if: steps.ruff.outcome == 'failure'
+        shell: bash
+        run: exit 1
 
       - name: Тесты ядра
         run: pytest tests -m "not ui and not slow" -q --cov=fbg --cov-report=term-missing
@@ -117,7 +138,7 @@ jobs:
         shell: bash
         run: |
           base64 -d chat13_validation.patch.gz.b64 > /tmp/chat13.patch.gz
-          gzip -dc /tmp/chat13.patch.gz > /tmp/chat13.patch
+          gzip -dc /tmp/chat13_validation.patch.gz > /tmp/chat13.patch
           git apply --index /tmp/chat13.patch
 
       - uses: actions/setup-python@v5
