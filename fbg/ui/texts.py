@@ -415,3 +415,36 @@ PROFILE_MISMATCH_ROW = "{field}: в настройках {configured}, приб�
 def shutdown_failure(step: str, error: str) -> str:
     """Строка отчёта об отказе при остановке одного из компонентов."""
     return f"при остановке «{step}» — {error}"
+
+
+# --------------------------------------------------------------------------------------
+# Панель спектра
+# --------------------------------------------------------------------------------------
+
+TAB_SPECTRUM = "Спектр"
+GROUP_SPECTRUM_CONTROL = "Съём спектра"
+GROUP_SPECTRUM_GRAPH = "Спектр канала"
+GROUP_SPECTRUM_REGIONS = "Области выше порога"
+BUTTON_TAKE_SPECTRUM = "Снять спектр"
+BUTTON_START_SPECTRUM = "Запустить непрерывно"
+BUTTON_STOP_SPECTRUM = "Остановить непрерывный режим"
+LABEL_SPECTRUM_CHANNEL = "Канал"
+LABEL_SPECTRUM_PERIOD = "Период, с"
+LABEL_SPECTRUM_FREQUENCY = "Эквивалентная частота, Гц"
+LABEL_SPECTRUM_THRESHOLD = "Порог анализа ADC"
+LABEL_SPECTRUM_SCALE = "Ось Y"
+LABEL_SPECTRUM_MAX = "Максимум ADC"
+LABEL_SPECTRUM_SATURATION = "Насыщение"
+SPECTRUM_SCALE_ADC = "ADC"
+SPECTRUM_SCALE_DBM = "дБм"
+SPECTRUM_WARNING_STREAM = (
+    "30 07 — режимная команда: каждый снимок останавливает поток телеметрии. "
+    "Если поток шёл, приложение выполняет Stop → снимок → Stop → опрос → Start."
+)
+SPECTRUM_RECORDING_LOCKED = (
+    "Во время записи измерений спектр заблокирован, чтобы не создавать скрытый разрыв файла."
+)
+SPECTRUM_SATURATION_WARNING = (
+    "АЦП насыщен: форма и положение пиков искажены. Понизьте усиление на вкладке «Настройка». "
+    "Для насыщенных областей положение вершины, центроид и FWHM не рассчитываются."
+)

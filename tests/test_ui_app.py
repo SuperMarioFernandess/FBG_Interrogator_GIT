@@ -9,6 +9,7 @@ Qt здесь нет и быть не должно. `fbg/ui/app.py` — это �
 """
 
 import json
+import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -18,7 +19,7 @@ import pytest
 from fbg.core.endpoint import Endpoint
 from fbg.core.pipeline import PipelineConfig, RingHistory
 from fbg.core.profile import DeviceProfile
-from fbg.core.session import SessionConfig, SessionState
+from fbg.core.session import Result, SessionConfig, SessionState
 from fbg.io.config import AppConfig, load
 from fbg.io.packet_log import Direction, PacketLogConfig
 from fbg.io.recorder import RecorderConfig
@@ -545,3 +546,88 @@ def test_отказ_сохранения_настроек_не_роняет_по
         assert any("не сохранены" in notice for notice in stand.controller.notices)
     finally:
         stand.close()
+
+
+# --------------------------------------------------------------------------------------
+# Спектр: режим 30 07 вытесняет поток и приложение обязано вернуть его
+# --------------------------------------------------------------------------------------
+
+
+def test_спектр_во_время_потока_полностью_перезапускает_поток(rig: Rig) -> None:
+    rig.controller.connect().unwrap()
+    assert rig.controller.start_stream().ok
+    assert wait_until(lambda: rig.controller.session.stats().telemetry_frames > 3)
+    before = rig.controller.session.stats().telemetry_frames
+    spectrum = rig.controller.take_spectrum(0, 3000).unwrap()
+    assert spectrum.adc.size == rig.controller.config.profile.adc_points
+    assert rig.controller.session.state is SessionState.STREAMING
+    assert wait_until(lambda: rig.controller.session.stats().telemetry_frames > before)
+    snap = rig.controller.snapshot()
+    assert snap.last_spectrum_max_adc == spectrum.max_adc
+    assert snap.last_spectrum_saturated_points == spectrum.saturated_points
+
+
+def test_спектр_из_idle_после_30_07_обязательно_посылает_stop(rig: Rig) -> None:
+    rig.controller.connect().unwrap()
+    before = len(rig.controller.packet_records(direction=Direction.TX))
+    rig.controller.take_spectrum(0, 3000).unwrap()
+    outgoing = rig.controller.packet_records(direction=Direction.TX)[before:]
+    assert [record.id_fc for record in outgoing] == [(0x30, 0x07), (0x30, 0x01)]
+    assert rig.controller.session.state is SessionState.IDLE
+
+
+def test_одиночный_спектр_не_блокирует_вызывающий_поток(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig.controller.connect().unwrap()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_take(_channel: int, _threshold_adc: int = 3000) -> Result[None]:
+        entered.set()
+        assert release.wait(2.0)
+        return Result(value=None)
+
+    monkeypatch.setattr(rig.controller, "take_spectrum", slow_take)
+    assert rig.controller.take_spectrum_async(0, 3000)
+    assert entered.wait(1.0)
+    assert rig.controller.spectrum_busy
+    assert not rig.controller.take_spectrum_async(0, 3000)
+    release.set()
+    assert wait_until(lambda: not rig.controller.spectrum_busy)
+
+
+def test_debug_из_idle_после_30_03_обязательно_посылает_stop(rig: Rig) -> None:
+    rig.controller.connect().unwrap()
+    before = len(rig.controller.packet_records(direction=Direction.TX))
+    spectra = rig.controller.take_debug_spectra(3000).unwrap()
+    assert len(spectra) == rig.controller.config.profile.channels
+    outgoing = rig.controller.packet_records(direction=Direction.TX)[before:]
+    assert [record.id_fc for record in outgoing] == [(0x30, 0x03), (0x30, 0x01)]
+    assert rig.controller.session.state is SessionState.IDLE
+
+
+def test_спектр_во_время_записи_запрещён(rig: Rig) -> None:
+    rig.controller.connect().unwrap()
+    assert rig.controller.start_stream().ok
+    assert wait_until(lambda: rig.controller.session.stats().telemetry_frames > 3)
+    rig.controller.start_recording()
+    try:
+        with pytest.raises(RuntimeError, match="во время записи"):
+            rig.controller.take_spectrum(0, 3000)
+    finally:
+        rig.controller.stop_recording()
+
+
+def test_непрерывный_спектр_делает_несколько_снимков_без_наложения(rig: Rig) -> None:
+    rig.controller.connect().unwrap()
+    assert rig.controller.start_stream().ok
+    assert rig.controller.start_spectrum_continuous(0, 0.15, 3000)
+    assert wait_until(lambda: rig.controller.snapshot().last_spectrum_max_adc is not None)
+    first_commands = rig.controller.session.stats().commands
+    assert wait_until(
+        lambda: rig.controller.session.stats().commands > first_commands + 5, timeout=3.0
+    )
+    rig.controller.stop_spectrum_continuous()
+    assert not rig.controller.spectrum_running
+    assert rig.controller.session.state is SessionState.STREAMING

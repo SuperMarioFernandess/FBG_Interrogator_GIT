@@ -61,7 +61,7 @@ from fbg.io import config as config_module
 from fbg.io.config import PROFILE_DEVICE_FIELDS, AppConfig
 from fbg.io.packet_log import Direction, PacketLog, PacketRecord, filter_records
 from fbg.io.recorder import Recorder, RecorderConfig, RecorderStats
-from fbg.ui.models import AppSnapshot, ProfileDifference
+from fbg.ui.models import AppSnapshot, ProfileDifference, SpectrumModel, spectrum_model
 
 #: Сколько сообщений держать для панели. Ограничение обязательно: колбэки
 #: сессии приходят из чужих потоков, и неограниченный список рос бы вечно.
@@ -91,9 +91,10 @@ class AppController:
         ...
         controller.shutdown()
 
-    Все методы зовутся из потока UI. Чужие потоки трогают только `_notices`
-    (через колбэки сессии) — это `deque` с ограничением, и `append` на нём
-    атомарен.
+    Команды, которые могут ждать сеть секунды, UI-поток не блокируют:
+    подключение и спектр выполняются обычными `threading.Thread`, а окно
+    забирает их состояние существующим таймером через `snapshot()` (KB_05 №34).
+    Одновременно команда всё равно только одна — это гарантирует Session.
     """
 
     def __init__(
@@ -125,6 +126,11 @@ class AppController:
         self._trace_history_s = 5.0
         self._last_device: DeviceConfig | None = None
         self._last_error: SessionError | None = None
+        self._last_spectrum: SpectrumModel | None = None
+        self._spectrum_thread: threading.Thread | None = None
+        self._spectrum_stop = threading.Event()
+        self._spectrum_continuous = False
+        self._spectrum_period_s = 1.0
         self._profile_mismatch: tuple[ProfileDifference, ...] = ()
 
         self._packet_log: PacketLog
@@ -321,7 +327,8 @@ class AppController:
             thread.join(timeout=timeout)
 
     def disconnect(self) -> None:
-        """Закрывает связь. `Stop` уходит внутри `Session.disconnect` (правило №6)."""
+        """Закрывает связь, сначала завершая периодический спектр."""
+        self.stop_spectrum_continuous()
         self._session.disconnect()
 
     def start_stream(self) -> Result[None]:
@@ -331,6 +338,176 @@ class AppController:
     def stop_stream(self) -> Result[bool]:
         """Останавливает поток телеметрии."""
         return self._session.stop_stream()
+
+    @property
+    def spectrum_busy(self) -> bool:
+        """Идёт ли сейчас одиночный либо периодический спектральный цикл."""
+        thread = self._spectrum_thread
+        return thread is not None and thread.is_alive()
+
+    @property
+    def spectrum_running(self) -> bool:
+        """Идёт ли именно периодическое снятие спектра."""
+        return self._spectrum_continuous and self.spectrum_busy
+
+    def _finish_mode_command(self, was_streaming: bool) -> Result[None]:
+        """Выходит из 30 07/30 03 через Stop; при прежнем потоке выполняет Р63."""
+        stopped = self._session.stop_stream()
+        if stopped.error is not None:
+            return Result(error=stopped.error)
+        if not was_streaming:
+            return Result(value=None)
+        refreshed = self._session.refresh_config()
+        if refreshed.error is not None:
+            return Result(error=refreshed.error)
+        return self._session.start_stream()
+
+    def take_spectrum(self, channel: int, threshold_adc: int = 3000) -> Result[SpectrumModel]:
+        """Один снимок 30 07; при прежнем Streaming автоматически восстанавливает поток."""
+        if self.is_recording:
+            raise RuntimeError("снимать спектр во время записи измерений нельзя")
+        if self._session.state not in (SessionState.IDLE, SessionState.STREAMING):
+            raise RuntimeError(
+                f"спектр доступен только из Idle/Streaming, сейчас {self._session.state.name}"
+            )
+        self._validate_live_channel(channel)
+        was_streaming = self._session.state is SessionState.STREAMING
+        if was_streaming:
+            stopped = self._session.stop_stream()
+            if stopped.error is not None:
+                return Result(error=stopped.error)
+        cleanup: Result[None]
+        try:
+            raw = self._session.read_raw_adc(channel)
+        finally:
+            cleanup = self._finish_mode_command(was_streaming)
+        if raw.error is not None:
+            if cleanup.error is not None:
+                self.note(f"спектр: после ошибки 30 07 не удалось выйти из режима: {cleanup.error}")
+            return Result(error=raw.error)
+        if cleanup.error is not None:
+            return Result(error=cleanup.error)
+        assert raw.value is not None
+        model = spectrum_model(raw.value, self._config.profile, threshold_adc)
+        self._last_spectrum = model
+        return Result(value=model)
+
+    def take_spectrum_async(self, channel: int, threshold_adc: int = 3000) -> bool:
+        """Запускает один снимок без блокировки UI; результат попадёт в следующий snapshot."""
+        if self.is_recording:
+            raise RuntimeError("снимать спектр во время записи измерений нельзя")
+        if self._session.state not in (SessionState.IDLE, SessionState.STREAMING):
+            raise RuntimeError(
+                f"спектр доступен только из Idle/Streaming, сейчас {self._session.state.name}"
+            )
+        self._validate_live_channel(channel)
+        if self.spectrum_busy:
+            return False
+        self._spectrum_continuous = False
+        self._spectrum_stop.clear()
+        self._spectrum_thread = threading.Thread(
+            target=self._spectrum_once_worker,
+            args=(channel, threshold_adc),
+            name="fbg-spectrum-once",
+            daemon=True,
+        )
+        self._spectrum_thread.start()
+        return True
+
+    def _spectrum_once_worker(self, channel: int, threshold_adc: int) -> None:
+        try:
+            result = self.take_spectrum(channel, threshold_adc)
+            if result.error is not None:
+                self.note(f"спектр: {result.error}")
+        except Exception as exc:
+            self.note(f"спектр: {type(exc).__name__}: {exc}")
+
+    def take_debug_spectra(self, threshold_adc: int = 3000) -> Result[tuple[SpectrumModel, ...]]:
+        """Один 30 03 по всем каналам; UI пока использует 30 07 как основной путь."""
+        if self.is_recording:
+            raise RuntimeError("режим отладки во время записи измерений нельзя запускать")
+        if self._session.state not in (SessionState.IDLE, SessionState.STREAMING):
+            raise RuntimeError(
+                "режим отладки доступен только из Idle/Streaming, "
+                f"сейчас {self._session.state.name}"
+            )
+        was_streaming = self._session.state is SessionState.STREAMING
+        if was_streaming:
+            stopped = self._session.stop_stream()
+            if stopped.error is not None:
+                return Result(error=stopped.error)
+        cleanup: Result[None]
+        try:
+            debug = self._session.debug_once()
+        finally:
+            cleanup = self._finish_mode_command(was_streaming)
+        if debug.error is not None:
+            if cleanup.error is not None:
+                self.note(
+                    f"отладка: после ошибки 30 03 не удалось выйти из режима: {cleanup.error}"
+                )
+            return Result(error=debug.error)
+        if cleanup.error is not None:
+            return Result(error=cleanup.error)
+        assert debug.value is not None
+        models = tuple(
+            spectrum_model(block, self._config.profile, threshold_adc)
+            for block in debug.value.blocks
+        )
+        return Result(value=models)
+
+    def start_spectrum_continuous(
+        self, channel: int, period_s: float, threshold_adc: int = 3000
+    ) -> bool:
+        """Периодически делает отдельные 30 07; новый цикл не накладывается на предыдущий."""
+        if self.is_recording:
+            raise RuntimeError("непрерывный спектр нельзя запускать во время записи измерений")
+        if self._session.state not in (SessionState.IDLE, SessionState.STREAMING):
+            raise RuntimeError(
+                "непрерывный спектр доступен только из Idle/Streaming, "
+                f"сейчас {self._session.state.name}"
+            )
+        self._validate_live_channel(channel)
+        if period_s <= 0.0:
+            raise ValueError("период спектра должен быть положительным")
+        if self.spectrum_busy:
+            return False
+        self._spectrum_period_s = period_s
+        self._spectrum_stop.clear()
+        self._spectrum_continuous = True
+        self._spectrum_thread = threading.Thread(
+            target=self._spectrum_loop,
+            args=(channel, threshold_adc),
+            name="fbg-spectrum",
+            daemon=True,
+        )
+        self._spectrum_thread.start()
+        return True
+
+    def _spectrum_loop(self, channel: int, threshold_adc: int) -> None:
+        """Последовательные снимки с периодом между началами циклов."""
+        while not self._spectrum_stop.is_set():
+            started = time.perf_counter()
+            try:
+                result = self.take_spectrum(channel, threshold_adc)
+                if result.error is not None:
+                    self.note(f"спектр: {result.error}")
+            except Exception as exc:
+                self.note(f"спектр: {type(exc).__name__}: {exc}")
+            left = self._spectrum_period_s - (time.perf_counter() - started)
+            if left > 0.0:
+                self._spectrum_stop.wait(left)
+
+    def stop_spectrum_continuous(self) -> None:
+        """Останавливает периодический режим и дожидается любого текущего цикла."""
+        self._spectrum_stop.set()
+        thread = self._spectrum_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=15.0)
+            if thread.is_alive():
+                raise RuntimeError("поток спектра не завершился за 15 секунд")
+        self._spectrum_thread = None
+        self._spectrum_continuous = False
 
     # --- Настройка прибора -------------------------------------------------------------
 
@@ -567,6 +744,8 @@ class AppController:
         self._reap_failed_recorder()
         if self._recorder is not None:
             return self._recorder
+        if self.spectrum_busy:
+            raise RuntimeError("запись нельзя запускать во время снятия спектра")
         recorder = Recorder(self._pipeline, self._config.recorder_config(), on_error=self.note)
         recorder.start()
         self._recorder = recorder
@@ -720,6 +899,16 @@ class AppController:
             recorder_config=self._config.recorder,
             recorder=recorder_stats,
             recording_elapsed_s=self._recording_elapsed_s(),
+            spectrum=self._last_spectrum,
+            spectrum_busy=self.spectrum_busy,
+            spectrum_running=self.spectrum_running,
+            spectrum_period_s=self._spectrum_period_s,
+            last_spectrum_max_adc=(
+                None if self._last_spectrum is None else self._last_spectrum.max_adc
+            ),
+            last_spectrum_saturated_points=(
+                None if self._last_spectrum is None else self._last_spectrum.saturated_points
+            ),
             connected=session.state is not SessionState.DISCONNECTED,
             recording=recorder is not None,
             connecting=self.is_connecting,
@@ -766,6 +955,7 @@ class AppController:
         # Подключение могло остаться в полёте: команда уже отправлена, и Stop
         # не должен уйти одновременно с чтением конфигурации.
         self._step("фоновое подключение", self.join_connect, failures)
+        self._step("спектр", self.stop_spectrum_continuous, failures)
         self._step("Stop прибору", self._stop_device, failures)
         self._step("сессия", self._session.disconnect, failures)
         self._step("запись измерений", self.stop_recording, failures)

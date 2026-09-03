@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 
 from fbg.core.endpoint import Endpoint
-from fbg.core.frames import ChannelSetup, GainSetting
+from fbg.core.frames import AdcBlock, ChannelSetup, GainSetting
 from fbg.core.pipeline import PipelineMetrics, TraceHistorySnapshot, UiSnapshot
 from fbg.core.profile import C_NM_GHZ, DeviceProfile
 from fbg.core.session import DeviceConfig, SessionError, SessionState, SessionStats
@@ -102,6 +102,10 @@ class AppSnapshot:
     recorder: RecorderStats | None = None
     recording_elapsed_s: float = 0.0
 
+    spectrum: "SpectrumModel | None" = None
+    spectrum_busy: bool = False
+    spectrum_running: bool = False
+    spectrum_period_s: float = 1.0
     last_spectrum_max_adc: int | None = None
     last_spectrum_saturated_points: int | None = None
     """Сводка последнего спектра; `None` означает, что спектра в приложении ещё не было."""
@@ -954,3 +958,169 @@ def export_suggested_name(now: float | None = None) -> str:
 def export_path(directory: Path, now: float | None = None) -> Path:
     """Полный путь экспорта по умолчанию."""
     return directory / export_suggested_name(now)
+
+
+# --------------------------------------------------------------------------------------
+# Панель спектра: снимок 30 07 без Qt
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SpectrumPeakRegion:
+    """Одна непрерывная область спектра выше порога."""
+
+    start_index: int
+    stop_index: int
+    peak_index: float | None
+    peak_nm: float | None
+    centroid_nm: float | None
+    amplitude_adc: int
+    amplitude_dbm: float | None
+    width_nm: float
+    fwhm_nm: float | None
+    saturated_points: int
+
+
+@dataclass(frozen=True)
+class SpectrumModel:
+    """Один снимок 30 07 в координатах длины волны."""
+
+    channel: int
+    gain: GainSetting
+    wavelength_nm: np.ndarray
+    adc: np.ndarray
+    power_dbm: np.ndarray
+    threshold_adc: int
+    max_adc: int
+    saturated_points: int
+    regions: tuple[SpectrumPeakRegion, ...]
+
+    @property
+    def saturated(self) -> bool:
+        return self.saturated_points > 0
+
+
+def adc_to_dbm(adc: np.ndarray, gain_level: int, profile: DeviceProfile) -> np.ndarray:
+    """Пересчитывает ADC в дБм по подтверждённой N6 формуле.
+
+    Значения на уровне тёмного смещения и ниже физически не имеют положительной
+    мощности в линейной модели и возвращаются как NaN.
+    """
+    if not 0 <= gain_level < len(profile.gain_power_coefficients):
+        raise ValueError(
+            f"уровень усиления {gain_level} вне диапазона "
+            f"0…{len(profile.gain_power_coefficients) - 1}"
+        )
+    linear = (adc.astype(np.float64) - profile.adc_dark_offset) * profile.gain_power_coefficients[
+        gain_level
+    ]
+    out = np.full(linear.shape, np.nan, dtype=np.float64)
+    valid = linear > 0.0
+    out[valid] = 10.0 * np.log10(linear[valid])
+    return out
+
+
+def _quadratic_peak_index(adc: np.ndarray, peak: int) -> float:
+    """Уточняет вершину по трём отсчётам локальной параболой.
+
+    Точная интерполяция штатного ПО неизвестна. Это прозрачная локальная
+    оценка приложения: на краю, плато или не-вогнутой тройке остаётся целый
+    индекс максимального отсчёта.
+    """
+    if peak <= 0 or peak >= adc.size - 1:
+        return float(peak)
+    left = float(adc[peak - 1])
+    center = float(adc[peak])
+    right = float(adc[peak + 1])
+    denominator = left - 2.0 * center + right
+    if denominator >= 0.0:
+        return float(peak)
+    delta = 0.5 * (left - right) / denominator
+    if not math.isfinite(delta) or abs(delta) > 1.0:
+        return float(peak)
+    return float(peak) + delta
+
+
+def _half_crossing(adc: np.ndarray, peak: int, direction: int, half: float) -> float | None:
+    """Дробный индекс пересечения полувысоты слева либо справа от вершины."""
+    i = peak
+    end = 0 if direction < 0 else adc.size - 1
+    while i != end:
+        j = i + direction
+        yi = float(adc[i])
+        yj = float(adc[j])
+        if (yi >= half > yj) or (yi < half <= yj):
+            if yi == yj:
+                return float(j)
+            return float(i) + direction * ((yi - half) / (yi - yj))
+        i = j
+    return None
+
+
+def spectrum_model(block: AdcBlock, profile: DeviceProfile, threshold_adc: int) -> SpectrumModel:
+    """Строит модель спектра из `AdcBlock` и ищет непрерывные области над порогом."""
+    if not 0 <= threshold_adc <= profile.adc_max:
+        raise ValueError(f"порог {threshold_adc} вне диапазона 0…{profile.adc_max}")
+    adc = block.adc.astype(np.uint16, copy=True)
+    wavelength = np.asarray(
+        [profile.adc_index_to_nm(float(i)) for i in range(adc.size)], dtype=np.float64
+    )
+    power = adc_to_dbm(adc, block.gain.level, profile)
+    saturated_mask = adc >= profile.adc_max
+    regions: list[SpectrumPeakRegion] = []
+    mask = adc >= threshold_adc
+    starts = np.flatnonzero(mask & np.r_[True, ~mask[:-1]])
+    stops = np.flatnonzero(mask & np.r_[~mask[1:], True])
+    for start, stop in zip(starts, stops, strict=True):
+        start_i, stop_i = int(start), int(stop)
+        values = adc[start_i : stop_i + 1]
+        local_peak = int(np.argmax(values))
+        peak = start_i + local_peak
+        amplitude = int(adc[peak])
+        sat = int(np.count_nonzero(saturated_mask[start_i : stop_i + 1]))
+        width = abs(float(wavelength[stop_i]) - float(wavelength[start_i]))
+        amplitude_dbm = None if not np.isfinite(power[peak]) else float(power[peak])
+        if sat:
+            peak_nm = centroid_nm = fwhm = None
+            peak_index = None
+        else:
+            peak_index = _quadratic_peak_index(adc, peak)
+            peak_nm = profile.adc_index_to_nm(peak_index)
+            weights = np.maximum(values.astype(np.float64) - profile.adc_dark_offset, 0.0)
+            if float(weights.sum()) > 0.0:
+                centroid_nm = float(np.average(wavelength[start_i : stop_i + 1], weights=weights))
+            else:
+                centroid_nm = peak_nm
+            half = profile.adc_dark_offset + (amplitude - profile.adc_dark_offset) / 2.0
+            left = _half_crossing(adc, peak, -1, half)
+            right = _half_crossing(adc, peak, 1, half)
+            fwhm = (
+                None
+                if left is None or right is None
+                else abs(profile.adc_index_to_nm(right) - profile.adc_index_to_nm(left))
+            )
+        regions.append(
+            SpectrumPeakRegion(
+                start_i,
+                stop_i,
+                peak_index,
+                peak_nm,
+                centroid_nm,
+                amplitude,
+                amplitude_dbm,
+                width,
+                fwhm,
+                sat,
+            )
+        )
+    return SpectrumModel(
+        block.channel,
+        block.gain,
+        wavelength,
+        adc,
+        power,
+        threshold_adc,
+        int(adc.max(initial=0)),
+        int(np.count_nonzero(saturated_mask)),
+        tuple(regions),
+    )

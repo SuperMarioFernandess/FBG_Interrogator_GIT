@@ -37,18 +37,6 @@ DEFAULT_TEMP_COEFF_PM_PER_C = 10.0
 #: Джиттер положения пика, пм — паспортная повторяемость ±2 пм (KB_01).
 DEFAULT_JITTER_PM = 2.0
 
-#: Коэффициенты пересчёта АЦП → мощность по уровням усиления 0…5 (KB_02).
-#: 🟡 Для версии 2000 Гц применимость не подтверждена — открытый вопрос N6.
-#: Здесь используются только как отношение амплитуд между уровнями усиления.
-ADC_POWER_COEFF: tuple[float, ...] = (
-    2.36161e-5,  # уровень 0 — минимум усиления
-    1.50849e-5,
-    1.01289e-5,
-    6.4699e-6,
-    4.356e-6,
-    2.9059e-6,  # уровень 5 — максимум усиления
-)
-
 #: Амплитуда пика в отсчётах АЦП при максимальном усилении. Согласована со
 #: шкалой панели спектра штатного ПО: 0…12000 единиц по вертикали (KB_01).
 DEFAULT_PEAK_ADC = 10000.0
@@ -221,15 +209,18 @@ class Scene:
         пересчёта АЦП → мощность из KB_02 (при фиксированной оптической
         мощности отсчёт обратно пропорционален коэффициенту).
         """
-        if not 0 <= gain_level < len(ADC_POWER_COEFF):
-            raise ValueError(f"уровень усиления {gain_level} вне диапазона 0…5")
+        coefficients = self.profile.gain_power_coefficients
+        if not 0 <= gain_level < len(coefficients):
+            raise ValueError(
+                f"уровень усиления {gain_level} вне диапазона 0…{len(coefficients) - 1}"
+            )
 
         axis = self.freq_axis_ghz()
         spectrum = self._rng.normal(self.floor_adc, self.floor_noise_adc, axis.size)
 
         if channel not in self._disconnected:
             sigma = self.fwhm_ghz * FWHM_TO_SIGMA
-            amplitude = self.peak_adc * ADC_POWER_COEFF[-1] / ADC_POWER_COEFF[gain_level]
+            amplitude = self.peak_adc * coefficients[-1] / coefficients[gain_level]
             for grating in self.visible():
                 if grating.channel != channel:
                     continue

@@ -77,6 +77,20 @@ class DeviceProfile:
     threshold_auto: int = 0xFFFF
     gain_max_level: int = 5
 
+    # N6 ✅ скрининг 30.08.2026: тёмное смещение и коэффициенты пересчёта
+    # P[dBm] = 10*log10((ADC - adc_dark_offset) * X[gain]).
+    # Это физические параметры конкретного семейства прибора, поэтому живут
+    # в профиле, а не константами UI (KB_05: физические числа — profile.py).
+    adc_dark_offset: int = 68
+    gain_power_coefficients: tuple[float, ...] = (
+        2.36161e-5,
+        1.50849e-5,
+        1.01289e-5,
+        6.4699e-6,
+        4.356e-6,
+        2.9059e-6,
+    )
+
     # --- Спорные места протокола (KB_04) ---
 
     # D1 ✅ закрыт скринингом: поле хранит десятые доли ГГц.
@@ -153,6 +167,18 @@ class DeviceProfile:
             )
         if self.mode_len_width < 1:
             raise ValueError("mode_len_width должно быть ≥ 1")
+        if not 0 <= self.adc_dark_offset < self.adc_max:
+            raise ValueError(
+                f"adc_dark_offset={self.adc_dark_offset} вне диапазона 0…{self.adc_max - 1}"
+            )
+        expected_gain_levels = self.gain_max_level + 1
+        if len(self.gain_power_coefficients) != expected_gain_levels:
+            raise ValueError(
+                "число gain_power_coefficients должно совпадать с уровнями усиления: "
+                f"ожидалось {expected_gain_levels}, получено {len(self.gain_power_coefficients)}"
+            )
+        if any(coefficient <= 0.0 for coefficient in self.gain_power_coefficients):
+            raise ValueError("gain_power_coefficients должны быть положительными")
         if self.sweep_base_ghz - self.stop_param < 1:
             raise ValueError(
                 f"sweep_base_ghz={self.sweep_base_ghz} меньше stop_param={self.stop_param}: "

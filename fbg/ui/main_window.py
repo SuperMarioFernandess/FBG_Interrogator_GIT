@@ -20,6 +20,7 @@ from fbg.ui.panels.device_config import DeviceConfigPanel
 from fbg.ui.panels.device_info import DeviceInfoPanel
 from fbg.ui.panels.measurement import MeasurementPanel
 from fbg.ui.panels.packet_log import PacketLogPanel
+from fbg.ui.panels.spectrum import SpectrumPanel
 
 #: Период обновления панелей, мс. 10 Гц — тот же порядок, что у децимации
 #: снимков pipeline (Р39): человек больше не различает, а UI не захлёбывается.
@@ -27,7 +28,7 @@ UI_PERIOD_MS = 100
 
 
 class MainWindow(QMainWindow):
-    """Главное окно: пять вкладок и строка состояния."""
+    """Главное окно: шесть вкладок и строка состояния."""
 
     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -37,6 +38,7 @@ class MainWindow(QMainWindow):
 
         self.connection_panel = ConnectionPanel(controller)
         self.measurement_panel = MeasurementPanel(controller)
+        self.spectrum_panel = SpectrumPanel(controller)
         self.device_panel = DeviceInfoPanel(controller)
         self.device_config_panel = DeviceConfigPanel(controller)
         self.packet_log_panel = PacketLogPanel(controller)
@@ -44,6 +46,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self.connection_panel, texts.TAB_CONNECTION)
         self.tabs.addTab(self.measurement_panel, texts.TAB_MEASUREMENT)
+        self.tabs.addTab(self.spectrum_panel, texts.TAB_SPECTRUM)
         self.tabs.addTab(self.device_panel, texts.TAB_DEVICE)
         self.tabs.addTab(self.device_config_panel, texts.TAB_DEVICE_CONFIG)
         self.tabs.addTab(self.packet_log_panel, texts.TAB_PACKET_LOG)
@@ -64,6 +67,7 @@ class MainWindow(QMainWindow):
         return (
             self.connection_panel,
             self.measurement_panel,
+            self.spectrum_panel,
             self.device_panel,
             self.device_config_panel,
             self.packet_log_panel,
@@ -88,6 +92,7 @@ class MainWindow(QMainWindow):
         snapshot = self._controller.snapshot()
         self.connection_panel.refresh(snapshot)
         self.measurement_panel.refresh(snapshot)
+        self.spectrum_panel.refresh(snapshot)
         self.device_panel.refresh(snapshot)
         self.device_config_panel.refresh(snapshot)
         self.packet_log_panel.refresh(snapshot)
