@@ -124,9 +124,7 @@ def test_fit_параболы_по_четырем_точкам() -> None:
     """Явно выбранный квадратичный член восстанавливается от четырёх точек."""
     reference = 1550.0
     xs = (-0.3, -0.1, 0.1, 0.3)
-    points = tuple(
-        CalibrationPoint(reference + x, 5.0 + 2.0 * x + 3.0 * x * x) for x in xs
-    )
+    points = tuple(CalibrationPoint(reference + x, 5.0 + 2.0 * x + 3.0 * x * x) for x in xs)
     fit = fit_calibration(points, reference, kind=FitKind.QUADRATIC)
     assert fit.value0 == pytest.approx(5.0)
     assert fit.k1 == pytest.approx(2.0)
