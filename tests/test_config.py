@@ -600,8 +600,10 @@ def test_сохранение_новой_формы_откладывает_ст�
     from fbg.core.calibration import Sensor, SensorType
 
     path = tmp_path / "sensors.json"
-    old = '{"sensors":[{"id":"T1","channel":0,"type":0,"expected_nm":1544.8,' \
+    old = (
+        '{"sensors":[{"id":"T1","channel":0,"type":0,"expected_nm":1544.8,'
         '"window_nm":0.3,"c0":-154455,"c1":100,"c2":0}]}\n'
+    )
     path.write_text(old, encoding="utf-8")
     sensor = Sensor(
         id="T1",
