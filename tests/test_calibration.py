@@ -19,9 +19,9 @@ import pytest
 
 from fbg.core.calibration import (
     UNITS,
-    ReadingStatus,
     CalibrationPoint,
     FitKind,
+    ReadingStatus,
     Sensor,
     SensorType,
     TempCompensation,
