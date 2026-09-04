@@ -26,8 +26,7 @@ jobs:
           python -c "import base64,gzip,pathlib; d=''.join(pathlib.Path(f'.chat14/patch.part{i}').read_text() for i in range(1,5)); pathlib.Path('chat14.patch').write_bytes(gzip.decompress(base64.b64decode(d)))"
           git apply --check chat14.patch
           git apply chat14.patch
-          git apply --check .chat14/format-fix.patch
-          git apply .chat14/format-fix.patch
+          python .chat14/normalize.py
 
       - name: Install dependencies
         run: |
@@ -61,8 +60,7 @@ jobs:
           python -c "import base64,gzip,pathlib; d=''.join(pathlib.Path(f'.chat14/patch.part{i}').read_text() for i in range(1,5)); pathlib.Path('chat14.patch').write_bytes(gzip.decompress(base64.b64decode(d)))"
           git apply --check chat14.patch
           git apply chat14.patch
-          git apply --check .chat14/format-fix.patch
-          git apply .chat14/format-fix.patch
+          python .chat14/normalize.py
 
       - name: System Qt libraries
         run: |
@@ -97,8 +95,7 @@ jobs:
           python -c "import base64,gzip,pathlib; d=''.join(pathlib.Path(f'.chat14/patch.part{i}').read_text() for i in range(1,5)); pathlib.Path('chat14.patch').write_bytes(gzip.decompress(base64.b64decode(d)))"
           git apply --check chat14.patch
           git apply chat14.patch
-          git apply --check .chat14/format-fix.patch
-          git apply .chat14/format-fix.patch
+          python .chat14/normalize.py
 
       - name: Install dependencies
         run: |
