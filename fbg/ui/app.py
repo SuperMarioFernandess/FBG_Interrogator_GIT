@@ -135,9 +135,7 @@ class AppController:
         self._sensor_readings: dict[str, SensorReading] = {}
         self._sensor_last_ui_seq: int | None = None
         self._sensor_history_t: deque[float] = deque(maxlen=SENSOR_HISTORY_POINTS)
-        self._sensor_history_values: deque[tuple[float, ...]] = deque(
-            maxlen=SENSOR_HISTORY_POINTS
-        )
+        self._sensor_history_values: deque[tuple[float, ...]] = deque(maxlen=SENSOR_HISTORY_POINTS)
 
         # Привязка монотонных меток к настенным часам снимается один раз (Р45):
         # иначе колонка времени в панели журнала дёргалась бы вслед за NTP.
