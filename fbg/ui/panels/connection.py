@@ -210,10 +210,14 @@ class ConnectionPanel(QWidget):
         # Disconnected — команда только собирается уйти. Кнопка при этом
         # обязана быть выключена, иначе повторное нажатие даст WRONG_STATE.
         idle_ui = disconnected and not snapshot.connecting
+        recovering = snapshot.state in (SessionState.DEGRADED, SessionState.RECONNECTING)
         self.connect_button.setEnabled(idle_ui)
         # Отключение во время `Probing` — гонка: команда уже в полёте.
         # Пока поток жив, кнопка выключена, а состояние показывает `Probing`.
         self.disconnect_button.setEnabled(not idle_ui and not snapshot.connecting)
+        self.disconnect_button.setText(
+            texts.BUTTON_CANCEL_RECOVERY if recovering else texts.BUTTON_DISCONNECT
+        )
         self.device_ip.setEnabled(idle_ui)
         self.device_port.setEnabled(idle_ui)
         self.local_port.setEnabled(idle_ui)

@@ -21,7 +21,13 @@ from fbg.core.endpoint import Endpoint
 from fbg.core.frames import AdcBlock, ChannelSetup, GainSetting
 from fbg.core.pipeline import PipelineMetrics, TraceHistorySnapshot, UiSnapshot
 from fbg.core.profile import C_NM_GHZ, DeviceProfile
-from fbg.core.session import DeviceConfig, SessionError, SessionState, SessionStats
+from fbg.core.session import (
+    DeviceConfig,
+    SessionError,
+    SessionState,
+    SessionStats,
+    StreamRecoveryOutcome,
+)
 from fbg.core.transport import TransportStats
 from fbg.io.packet_log import Direction, PacketLogStats, PacketRecord, format_hex, format_id_fc
 from fbg.io.recorder import RecorderConfig, RecorderStats, format_rows, row_format
@@ -86,6 +92,7 @@ class AppSnapshot:
 
     device: DeviceConfig | None = None
     stream_interrupted: bool = False
+    stream_recovery_outcome: StreamRecoveryOutcome = StreamRecoveryOutcome.NONE
     config_mismatch: tuple[str, ...] = ()
     unconfirmed: frozenset[str] = frozenset()
     profile_mismatch: tuple[ProfileDifference, ...] = ()
@@ -641,8 +648,28 @@ def state_view(snapshot: AppSnapshot) -> StateView:
     """
     label, tone = texts.STATE_LABELS[snapshot.state]
     details: list[str] = []
-    if snapshot.stream_interrupted:
-        details.append(texts.STREAM_INTERRUPTED)
+    stats = snapshot.session
+    if snapshot.state is SessionState.DEGRADED and stats.stream_resume_wait_in_s is not None:
+        details.append(texts.STREAM_CONNECTION_LOST)
+        details.append(texts.RECOVERY_WAIT.format(seconds=stats.stream_resume_wait_in_s))
+        details.append(texts.RECOVERY_CANCEL)
+    elif snapshot.state is SessionState.DEGRADED and stats.recovery_attempt > 0:
+        details.append(texts.RECOVERY_ACTIVE.format(attempt=stats.recovery_attempt))
+        details.append(texts.RECOVERY_CANCEL)
+    elif snapshot.state is SessionState.RECONNECTING and stats.next_attempt_in_s is not None:
+        details.append(
+            texts.RECOVERY_RETRY.format(
+                attempt=max(stats.recovery_attempt, 1), seconds=stats.next_attempt_in_s
+            )
+        )
+        details.append(texts.RECOVERY_CANCEL)
+    elif snapshot.state is SessionState.STREAMING:
+        if snapshot.stream_recovery_outcome is StreamRecoveryOutcome.RESUMED:
+            details.append(texts.STREAM_RECOVERED_RESUMED)
+        elif snapshot.stream_recovery_outcome is StreamRecoveryOutcome.RESTARTED:
+            details.append(texts.STREAM_RECOVERED_RESTARTED)
+    elif snapshot.stream_recovery_outcome is StreamRecoveryOutcome.BLOCKED_CONFIG:
+        details.append(texts.STREAM_RECOVERY_BLOCKED_CONFIG)
     if snapshot.config_mismatch:
         details.append(texts.CONFIG_MISMATCH)
     return StateView(label=label, tone=tone, detail="; ".join(details))

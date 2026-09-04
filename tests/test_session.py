@@ -33,6 +33,7 @@ from fbg.core.session import (
     SessionError,
     SessionErrorKind,
     SessionState,
+    StreamRecoveryOutcome,
 )
 from fbg.sim import encode as sim_encode
 from fbg.sim.device_sim import (
@@ -67,6 +68,7 @@ QUIET = SessionConfig(
     keepalive_period_s=30.0,
     keepalive_failures_to_degrade=2,
     stream_stall_floor_s=0.3,
+    stream_resume_wait_s=0.5,
     backoff_schedule=(0.05, 0.1, 0.2),
     retry_pause_s=0.02,
     reassembly_timeout_s=0.3,
@@ -79,6 +81,7 @@ WATCHFUL = SessionConfig(
     keepalive_period_s=0.05,
     keepalive_failures_to_degrade=2,
     stream_stall_floor_s=0.3,
+    stream_resume_wait_s=0.5,
     backoff_schedule=(0.05, 0.1, 0.2),
     retry_pause_s=0.02,
     reassembly_timeout_s=0.3,
@@ -299,6 +302,7 @@ class Rig:
         self.telemetry: list[tuple[bytes, float]] = []
         self.states: list[tuple[SessionState, SessionState]] = []
         self.mismatches: list[tuple[str, ...]] = []
+        self.stream_gaps: list[tuple[float, float]] = []
         self.session = Session(
             self.endpoint,
             self.profile,
@@ -306,6 +310,7 @@ class Rig:
             on_telemetry=lambda data, t: self.telemetry.append((data, t)),
             on_state=lambda old, new: self.states.append((old, new)),
             on_config_mismatch=self.mismatches.append,
+            on_stream_gap=lambda before, after: self.stream_gaps.append((before, after)),
         )
 
     def connect(self) -> Result[DeviceConfig]:
@@ -377,6 +382,8 @@ def test_session_config_rejects_nonsense() -> None:
         SessionConfig(backoff_schedule=())
     with pytest.raises(ValueError, match="keepalive_failures_to_degrade"):
         SessionConfig(keepalive_failures_to_degrade=0)
+    with pytest.raises(ValueError, match="stream_resume_wait_s"):
+        SessionConfig(stream_resume_wait_s=0.0)
 
 
 def test_device_config_differences_lists_changes(rig: Rig) -> None:
@@ -962,43 +969,61 @@ def test_watchdog_degrades_on_silence_in_idle() -> None:
 
 
 def test_watchdog_degrades_on_stalled_stream() -> None:
-    """Streaming: телеметрия пропала → Degraded, keepalive при этом не шлётся."""
+    """N11: после пропажи кадров Streaming ждёт пассивно и не шлёт Stop."""
     stand = make_rig(session_config=WATCHFUL)
     try:
         assert stand.connect().ok
         assert stand.session.start_stream().ok
         assert wait_until(lambda: stand.session.stats().telemetry_frames > 3)
         commands_before = len(stand.sim.seen())
-        stand.sim.faults.frame_drop_probability = 1.0
+
+        # go_silent воспроизводит измеренный N11: флаг Streaming у симулятора
+        # не сбрасывается, после окончания тишины кадры возвращаются сами.
+        stand.sim.go_silent(0.6)
         assert wait_until(lambda: stand.session.state is SessionState.DEGRADED)
-        assert wait_until(lambda: len(stand.sim.seen()) > commands_before)
-        # За время потока сессия не отправила ни одной команды: keepalive
-        # в Streaming не шлётся, и первая же команда после — Stop пробника.
-        assert stand.sim.seen()[commands_before] == (codec.ID_MODE, codec.FC_STOP)
-        assert wait_until(lambda: stand.session.state is SessionState.IDLE)
-        assert stand.session.stream_interrupted
+        time.sleep(0.1)
+        assert stand.sim.seen()[commands_before:] == [], (
+            "до истечения окна ожидания сессия не имеет права посылать даже Stop"
+        )
+        stats = stand.session.stats()
+        assert stats.stream_resume_wait_in_s is not None
+        assert 0.0 < stats.stream_resume_wait_in_s <= WATCHFUL.stream_resume_wait_s
     finally:
-        stand.sim.faults.frame_drop_probability = 0.0
         stand.close()
 
 
-def test_recovery_returns_to_idle_not_streaming() -> None:
-    """После восстановления состояние Idle: пробник сам остановил поток.
-
-    Отступление от диаграммы KB_03 («возврат в прежнее состояние») сделано
-    осознанно: пробник содержит Stop, поэтому объявить Streaming значило бы,
-    что автомат врёт про прибор. Факт обрыва виден в `stream_interrupted`.
-    """
+def test_stream_resumes_itself_and_session_returns_to_streaming() -> None:
+    """Р72/N11: вернувшиеся кадры восстанавливают Streaming без режимных команд."""
     stand = make_rig(session_config=WATCHFUL)
     try:
         assert stand.connect().ok
         assert stand.session.start_stream().ok
         assert wait_until(lambda: stand.session.stats().telemetry_frames > 3)
-        stand.sim.faults.frame_drop_probability = 1.0
+        commands_before = len(stand.sim.seen())
+
+        stand.sim.go_silent(0.6)
         assert wait_until(lambda: stand.session.state is SessionState.DEGRADED)
-        stand.sim.faults.frame_drop_probability = 0.0
-        assert wait_until(lambda: stand.session.state is SessionState.IDLE)
+        assert wait_until(lambda: stand.session.state is SessionState.STREAMING)
         assert stand.session.stream_interrupted is True
+        assert stand.session.stream_recovery_outcome is StreamRecoveryOutcome.RESUMED
+        assert len(stand.stream_gaps) == 1
+        gap_from, gap_to = stand.stream_gaps[0]
+        assert gap_to > gap_from
+
+        assert wait_until(lambda: len(stand.sim.seen()) >= commands_before + 5)
+        recovery_commands = stand.sim.seen()[commands_before:]
+        assert (codec.ID_MODE, codec.FC_STOP) not in recovery_commands
+        assert (codec.ID_MODE, codec.FC_STREAM) not in recovery_commands
+        # После самовозобновления конфигурация перечитывается группой 0x10,
+        # которая по Р62 разрешена во время потока.
+        assert recovery_commands == [
+            (codec.ID_READ, codec.FC_VERSION),
+            (codec.ID_READ, codec.FC_SERIAL),
+            (codec.ID_READ, codec.FC_MODULE_PARAMS),
+            (codec.ID_READ, codec.FC_SWEEP),
+            (codec.ID_READ, codec.FC_CHANNEL_SETUP),
+        ]
+        assert stand.sim.streaming
     finally:
         stand.close()
 
@@ -1010,11 +1035,37 @@ def test_reconnect_uses_backoff_and_cancels() -> None:
         assert stand.connect().ok
         stand.sim.go_silent(30.0)
         assert wait_until(lambda: stand.session.state is SessionState.RECONNECTING)
+        progress = stand.session.stats()
+        assert progress.recovery_attempt >= 1
+        assert progress.next_attempt_in_s is not None
+        assert 0.0 <= progress.next_attempt_in_s <= max(WATCHFUL.backoff_schedule)
         assert wait_until(lambda: stand.session.stats().reconnect_attempts >= 2)
         # Отмена посреди backoff обязана отработать быстро, а не ждать паузу.
         started = time.perf_counter()
         stand.session.disconnect()
         assert time.perf_counter() - started < 2.0
+        assert stand.session.state is SessionState.DISCONNECTED
+    finally:
+        stand.sim.stop()
+        stand.session.disconnect()
+
+
+def test_cancel_during_active_stream_recovery_stops_cleanly() -> None:
+    """Отмена активного recovery не оставляет watchdog слать команды после Stop."""
+    stand = make_rig(session_config=WATCHFUL)
+    try:
+        assert stand.connect().ok
+        assert stand.session.start_stream().ok
+        assert wait_until(lambda: stand.session.stats().telemetry_frames > 3)
+        stand.sim.go_silent(30.0)
+        assert wait_until(lambda: stand.session.state is SessionState.DEGRADED)
+        assert wait_until(lambda: stand.session.stats().reconnect_attempts >= 1, timeout=2.0)
+
+        stand.session.disconnect()
+        seen_after_disconnect = tuple(stand.sim.seen())
+        assert seen_after_disconnect[-1] == (codec.ID_MODE, codec.FC_STOP)
+        time.sleep(0.1)
+        assert tuple(stand.sim.seen()) == seen_after_disconnect
         assert stand.session.state is SessionState.DISCONNECTED
     finally:
         stand.sim.stop()
@@ -1038,24 +1089,70 @@ def test_user_command_in_degraded_is_wrong_state() -> None:
 
 
 def test_reboot_mid_session_is_noticed() -> None:
-    """Прибор перезагрузился: расхождение конфигурации замечено, не перезаписано."""
+    """Гипотеза №12: нет кадров за окно → полный цикл и автоматический Start.
+
+    ⚠️ Захвата power-cycle **посреди Streaming** нет. Этот тест намеренно
+    закрепляет нашу политику отказоустойчивости, а не выдаёт её за наблюдение
+    прибора. Наблюдаемая часть — reboot симулятора сбрасывает поток и настройки.
+    """
     stand = make_rig(session_config=WATCHFUL)
     try:
         assert stand.connect().ok
         assert stand.session.set_peak_gap(40).ok
         assert stand.session.device_config is not None
         assert stand.session.device_config.module.peak_gap_ghz == 40
+        assert stand.session.start_stream().ok
+        assert wait_until(lambda: stand.session.stats().telemetry_frames > 3)
+        commands_before = len(stand.sim.seen())
 
-        stand.sim.go_silent(0.5)
+        stand.sim.go_silent(0.6)
         stand.sim.reboot()
         assert wait_until(lambda: stand.session.state is SessionState.DEGRADED)
-        assert wait_until(lambda: stand.session.state is SessionState.IDLE)
+        assert wait_until(lambda: stand.session.state is SessionState.STREAMING)
+        assert stand.session.stream_recovery_outcome is StreamRecoveryOutcome.RESTARTED
+        assert wait_until(lambda: len(stand.stream_gaps) == 1)
 
         assert stand.session.config_mismatch, "расхождение конфигурации не замечено"
         assert any("параметры модуля" in diff for diff in stand.session.config_mismatch)
         assert stand.mismatches, "колбэк о расхождении не вызван"
         # Молча возвращать 40 сессия не имеет права: решает оператор.
         assert stand.sim.state.peak_gap_ghz == stand.profile.peak_gap_ghz
+        assert stand.sim.seen()[commands_before:] == [
+            (codec.ID_MODE, codec.FC_STOP),
+            (codec.ID_READ, codec.FC_VERSION),
+            (codec.ID_READ, codec.FC_SERIAL),
+            (codec.ID_READ, codec.FC_MODULE_PARAMS),
+            (codec.ID_READ, codec.FC_SWEEP),
+            (codec.ID_READ, codec.FC_CHANNEL_SETUP),
+            (codec.ID_MODE, codec.FC_STREAM),
+        ]
+    finally:
+        stand.close()
+
+
+def test_reboot_with_changed_sweep_does_not_bypass_r67() -> None:
+    """Автовосстановление не запускает поток под старой геометрией pipeline.
+
+    ⚠️ Как и предыдущий тест, ветка «нет кадров за окно → reboot» является
+    гипотезой KB_05 №12. Проверяем здесь не прибор, а защиту Р67 нашего автомата.
+    """
+    stand = make_rig(session_config=WATCHFUL)
+    try:
+        assert stand.connect().ok
+        changed = SweepConfig.from_params(2, 2, 5100, 2, stand.profile)
+        assert stand.session.set_sweep(changed).ok
+        assert stand.session.start_stream().ok
+        assert wait_until(lambda: stand.session.stats().telemetry_frames > 3)
+
+        stand.sim.go_silent(0.6)
+        stand.sim.reboot()
+        assert wait_until(
+            lambda: stand.session.stream_recovery_outcome is StreamRecoveryOutcome.BLOCKED_CONFIG
+        )
+        assert stand.session.state is SessionState.IDLE
+        assert not stand.sim.streaming
+        assert stand.session.config_mismatch
+        assert any("развёртка" in diff for diff in stand.session.config_mismatch)
     finally:
         stand.close()
 

@@ -116,6 +116,15 @@ class SessionState(Enum):
     RECONNECTING = "переподключение с задержкой"
 
 
+class StreamRecoveryOutcome(Enum):
+    """Чем закончился последний обрыв потока после потери связи."""
+
+    NONE = "не было восстановления потока"
+    RESUMED = "поток возобновился сам"
+    RESTARTED = "поток перезапущен приложением"
+    BLOCKED_CONFIG = "поток не перезапущен из-за смены геометрии"
+
+
 class SessionErrorKind(Enum):
     """Причина отказа операции сессии."""
 
@@ -250,6 +259,17 @@ class SessionConfig:
     stream_stall_periods: int = 20
     """Окно тишины в периодах развёртки; период берётся из прочитанных 10 04."""
 
+    stream_resume_wait_s: float = 35.0
+    """Сколько ждать самовозобновления потока после обрыва связи.
+
+    N11 закрыт двумя прогонами сессии 4: после пауз телеметрии 33 и 31 с
+    прибор продолжил поток сам, без единой `30 02`. Значение 35 с — политика
+    приложения с небольшим запасом над этими наблюдениями, а не таймаут
+    прибора. Если кадров за окно нет, дальше используется **гипотеза**
+    KB_05 №12: считаем, что прибор мог перезагрузиться, и выполняем полный
+    `Stop → опрос → Start` по Р63.
+    """
+
     backoff_schedule: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0)
     """Паузы между попытками переподключения; последняя — потолок."""
 
@@ -273,6 +293,7 @@ class SessionConfig:
         for name, value in (
             ("keepalive_period_s", self.keepalive_period_s),
             ("stream_stall_floor_s", self.stream_stall_floor_s),
+            ("stream_resume_wait_s", self.stream_resume_wait_s),
             ("reassembly_timeout_s", self.reassembly_timeout_s),
             ("watchdog_tick_s", self.watchdog_tick_s),
         ):
@@ -308,6 +329,15 @@ class SessionStats:
     telemetry_frames: int = 0
     degraded_events: int = 0
     reconnect_attempts: int = 0
+    recovery_attempt: int = 0
+    """Номер следующей/текущей активной попытки восстановления в этом цикле."""
+
+    next_attempt_in_s: float | None = None
+    """Сколько осталось до следующей активной попытки; None — backoff не идёт."""
+
+    stream_resume_wait_in_s: float | None = None
+    """Остаток пассивного окна ожидания кадров после обрыва Streaming."""
+
     verification_mismatches: int = 0
     keepalive_failures: int = 0
     incomplete_responses: int = 0
@@ -387,6 +417,7 @@ class Session:
         on_telemetry: Callable[[bytes, float], None] | None = None,
         on_state: Callable[[SessionState, SessionState], None] | None = None,
         on_config_mismatch: Callable[[tuple[str, ...]], None] | None = None,
+        on_stream_gap: Callable[[float, float], None] | None = None,
         log_rx: Callable[[bytes, float], None] | None = None,
         log_tx: Callable[[bytes, float], None] | None = None,
     ) -> None:
@@ -396,6 +427,7 @@ class Session:
         self._on_telemetry = on_telemetry
         self._on_state = on_state
         self._on_config_mismatch = on_config_mismatch
+        self._on_stream_gap = on_stream_gap
         self._log_rx = log_rx
         self._log_tx = log_tx
 
@@ -417,6 +449,8 @@ class Session:
         self._mismatch: tuple[str, ...] = ()
         self._unconfirmed: set[str] = set()
         self._stream_interrupted = False
+        self._stream_recovery_outcome = StreamRecoveryOutcome.NONE
+        self._stream_speed_hz: int | None = None
 
         self._last_ok_mono = 0.0
         self._last_frame_mono = 0.0
@@ -424,6 +458,16 @@ class Session:
         self._state_before_degraded = SessionState.IDLE
         self._backoff_index = 0
         self._next_attempt_mono = 0.0
+        self._recovery_attempt = 0
+
+        # Ветка восстановления из Streaming начинается **пассивно**: пока
+        # окно не истекло, никаких команд прибору не отправляется (N11, Р72).
+        self._passive_stream_recovery = False
+        self._stream_resume_deadline_mono = 0.0
+        self._stream_gap_from_mono = 0.0
+        self._stream_gap_pending = False
+        self._stream_resume_mono: float | None = None
+        self._stream_resume_event = threading.Event()
 
     # --- Состояние ---------------------------------------------------------------------
 
@@ -454,6 +498,11 @@ class Session:
         return self._stream_interrupted
 
     @property
+    def stream_recovery_outcome(self) -> StreamRecoveryOutcome:
+        """Исход последнего восстановления потока после потери связи."""
+        return self._stream_recovery_outcome
+
+    @property
     def unconfirmed(self) -> frozenset[str]:
         """Значения, записанные без подтверждения read-back'ом."""
         return frozenset(self._unconfirmed)
@@ -481,6 +530,19 @@ class Session:
     def stats(self) -> SessionStats:
         """Снимок счётчиков сессии."""
         counters = self._counters
+        now = time.perf_counter()
+        next_attempt_in_s: float | None = None
+        stream_resume_wait_in_s: float | None = None
+        recovery_attempt = 0
+        state = self.state
+        if state is SessionState.RECONNECTING:
+            next_attempt_in_s = max(0.0, self._next_attempt_mono - now)
+            recovery_attempt = self._recovery_attempt + 1
+        elif state is SessionState.DEGRADED:
+            if self._passive_stream_recovery:
+                stream_resume_wait_in_s = max(0.0, self._stream_resume_deadline_mono - now)
+            else:
+                recovery_attempt = self._recovery_attempt
         return SessionStats(
             commands=counters.commands,
             retries=counters.retries,
@@ -489,6 +551,9 @@ class Session:
             telemetry_frames=counters.telemetry_frames,
             degraded_events=counters.degraded_events,
             reconnect_attempts=counters.reconnect_attempts,
+            recovery_attempt=recovery_attempt,
+            next_attempt_in_s=next_attempt_in_s,
+            stream_resume_wait_in_s=stream_resume_wait_in_s,
             verification_mismatches=counters.verification_mismatches,
             keepalive_failures=counters.keepalive_failures,
             incomplete_responses=counters.incomplete_responses,
@@ -547,17 +612,31 @@ class Session:
     def disconnect(self) -> None:
         """Останавливает прибор и закрывает связь. Повторный вызов безвреден.
 
-        `Stop` уходит в `finally` (KB_05 №6): что бы ни случилось выше,
-        прибор не должен остаться льющим поток в закрытый порт. Ошибка
-        отправки здесь игнорируется намеренно — связи может уже не быть,
+        `Stop` уходит в `finally` (KB_05 №6), но не поверх уже летящей
+        команды. Сначала выставляется `_shutdown`: ожидающий `_exchange`
+        замечает отмену за `POLL_SLICE_S`, освобождает единственный command
+        lock, и только после этого Stop отправляется на провод. Это важно для
+        явной отмены восстановления из UI: иначе Stop мог бы наложиться на
+        служебный `10 xx` и нарушить KB_05 №5.
+
+        Ошибка отправки Stop игнорируется намеренно — связи может уже не быть,
         а закрыть транспорт нужно в любом случае.
         """
+        self._shutdown.set()
+        acquired = False
         try:
             if self._transport.is_open:
-                self._send(codec.build_stop())
+                acquired = self._command_lock.acquire(
+                    timeout=self._endpoint.read_timeout_s + self._config.watchdog_tick_s + 0.5
+                )
+                if acquired:
+                    self._lock_owner = "internal"
+                    self._send(codec.build_stop())
         except (OSError, RuntimeError):
             pass
         finally:
+            if acquired:
+                self._release_command_lock()
             self._teardown()
 
     def close(self) -> None:
@@ -605,6 +684,23 @@ class Session:
         self._tap(self._log_rx, data, t_mono)
         key = codec.classify(data)
         if key == (codec.ID_MODE, codec.FC_STREAM):
+            gap: tuple[float, float] | None = None
+            # N11: при обычном обрыве линка прибор не прекращает Streaming.
+            # Первый кадр, пришедший в пассивном окне восстановления, — факт,
+            # что поток возобновился сам. Маркер разрыва отдаётся **до** кадра
+            # в pipeline, чтобы Recorder успел поставить `# GAP` перед первой
+            # строкой после паузы, не делая файловый I/O в приёмном потоке.
+            if self._stream_gap_pending:
+                self._stream_gap_pending = False
+                gap = (self._stream_gap_from_mono, t_mono)
+            if self._passive_stream_recovery and not self._stream_resume_event.is_set():
+                self._stream_resume_mono = t_mono
+                self._stream_resume_event.set()
+            if gap is not None and self._on_stream_gap is not None:
+                try:
+                    self._on_stream_gap(*gap)
+                except Exception:
+                    self._counters.tap_errors += 1
             self._last_frame_mono = t_mono
             self._counters.telemetry_frames += 1
             if self._on_telemetry is not None:
@@ -846,6 +942,8 @@ class Session:
         """Тело `_request` под уже взятым замком команды."""
         last: Result[T] = _fail(SessionErrorKind.TIMEOUT, "нет попыток")
         for attempt in range(max(attempts, 1)):
+            if self._shutdown.is_set():
+                return _fail(SessionErrorKind.CANCELLED, "сессия закрывается")
             if attempt:
                 self._counters.retries += 1
                 if self._shutdown.wait(self._config.retry_pause_s):
@@ -890,6 +988,8 @@ class Session:
                 SessionErrorKind.BUSY, f"команда {ident:02X} {fc:02X}: предыдущая в полёте"
             )
         try:
+            if self._shutdown.is_set():
+                return _fail(SessionErrorKind.CANCELLED, "сессия закрывается")
             self._counters.commands += 1
             if not self._send(request):
                 return _fail(
@@ -1184,8 +1284,13 @@ class Session:
         sent = self._send_only(codec.build_start_stream(speed_hz), codec.ID_MODE, codec.FC_STREAM)
         if sent.error is not None:
             return sent
+        self._stream_speed_hz = speed_hz
         self._last_frame_mono = time.perf_counter()
         self._stream_interrupted = False
+        self._stream_recovery_outcome = StreamRecoveryOutcome.NONE
+        self._passive_stream_recovery = False
+        self._stream_gap_pending = False
+        self._stream_resume_event.clear()
         self._set_state(SessionState.STREAMING)
         return _ok(None)
 
@@ -1349,14 +1454,40 @@ class Session:
             self._to_degraded()
 
     def _to_degraded(self) -> None:
-        """Переводит сессию в Degraded, запомнив состояние, из которого ушли."""
-        self._state_before_degraded = self.state
+        """Переводит сессию в Degraded, запомнив состояние, из которого ушли.
+
+        Для Streaming это **не** начало активного пробника. N11 закрыт
+        сессией 4: при обрыве линка прибор продолжает режим и после возврата
+        сети кадры появляются сами. Поэтому до истечения
+        `stream_resume_wait_s` сессия только ждёт телеметрию и не отправляет
+        ни Stop, ни любую другую команду (Р72).
+        """
+        previous = self.state
+        self._state_before_degraded = previous
         self._counters.degraded_events += 1
         self._keepalive_failures = 0
+        self._recovery_attempt = 0
+        if previous is SessionState.STREAMING:
+            now = time.perf_counter()
+            self._stream_interrupted = True
+            self._stream_recovery_outcome = StreamRecoveryOutcome.NONE
+            self._passive_stream_recovery = True
+            self._stream_resume_event.clear()
+            self._stream_resume_mono = None
+            self._stream_gap_from_mono = self._last_frame_mono
+            self._stream_gap_pending = True
+            self._stream_resume_deadline_mono = now + self._config.stream_resume_wait_s
+        else:
+            self._passive_stream_recovery = False
         self._set_state(SessionState.DEGRADED)
 
     def _liveness_probe(self) -> bool:
-        """Пробник: Stop и версия, по одной попытке. True — прибор отвечает."""
+        """Пробник Idle: Stop и версия, по одной попытке. True — прибор отвечает.
+
+        Этот старый пробник остаётся только для восстановления из Idle. Путь
+        из Streaming сюда **не попадает**: до решения о вероятной перезагрузке
+        Stop запрещён Р72.
+        """
         if not self._acquire_command_lock(internal=True):
             return False
         try:
@@ -1385,17 +1516,53 @@ class Session:
             self._release_command_lock()
 
     def _probe_degraded(self) -> None:
-        """Degraded: пробник. Успех — восстановление, неудача — Reconnecting."""
+        """Один шаг восстановления из Degraded."""
+        if self._state_before_degraded is SessionState.STREAMING:
+            self._probe_degraded_streaming()
+            return
         if self._liveness_probe():
-            self._after_recovery()
+            self._after_idle_recovery()
         else:
-            self._enter_reconnecting()
+            self._enter_reconnecting(reset_attempts=True)
 
-    def _enter_reconnecting(self) -> None:
-        """Переводит в Reconnecting и назначает первую паузу backoff."""
+    def _probe_degraded_streaming(self) -> None:
+        """Streaming: сначала ждать кадров, и только потом предполагать reboot.
+
+        ⚠️ Вторая ветка — **гипотеза KB_05 №12**. В захватах нет выключения
+        питания посреди потока. Измерено лишь, что обычный обрыв линка поток
+        не сбрасывает, а после power-cycle часть настроек (усиление) теряется.
+        Поэтому правило «кадров нет за окно → вероятна перезагрузка» является
+        нашей политикой отказоустойчивости, а не фактом о приборе.
+        """
+        if not self._passive_stream_recovery:
+            return
+        if self._stream_resume_event.is_set():
+            self._after_passive_stream_resume()
+            return
+        if time.perf_counter() < self._stream_resume_deadline_mono:
+            return
+
+        # Окно истекло без единого кадра. Только здесь путь Streaming получает
+        # право отправить первый Stop. До этой строки команды восстановления
+        # запрещены намеренно: иначе приложение само уничтожило бы N11.
+        self._passive_stream_recovery = False
+        if self._attempt_stream_restart():
+            return
+        self._enter_reconnecting(reset_attempts=False)
+
+    def _enter_reconnecting(self, *, reset_attempts: bool = True) -> None:
+        """Переводит в Reconnecting и назначает паузу backoff."""
+        if reset_attempts:
+            self._recovery_attempt = 0
         self._backoff_index = 0
         self._next_attempt_mono = time.perf_counter() + self._config.backoff_schedule[0]
         self._set_state(SessionState.RECONNECTING)
+
+    def _schedule_next_attempt(self) -> None:
+        """Сдвигает backoff к следующему интервалу после неудачной попытки."""
+        schedule = self._config.backoff_schedule
+        self._backoff_index = min(self._backoff_index + 1, len(schedule) - 1)
+        self._next_attempt_mono = time.perf_counter() + schedule[self._backoff_index]
 
     def _reconnect_step(self) -> None:
         """Одна попытка переподключения по расписанию backoff.
@@ -1406,43 +1573,108 @@ class Session:
         """
         if time.perf_counter() < self._next_attempt_mono:
             return
+        if self._state_before_degraded is SessionState.STREAMING:
+            if self._attempt_stream_restart():
+                return
+            self._schedule_next_attempt()
+            return
+
+        self._recovery_attempt += 1
         self._counters.reconnect_attempts += 1
         if self._liveness_probe():
-            self._after_recovery()
+            self._after_idle_recovery()
             return
-        schedule = self._config.backoff_schedule
-        self._backoff_index = min(self._backoff_index + 1, len(schedule) - 1)
-        self._next_attempt_mono = time.perf_counter() + schedule[self._backoff_index]
+        self._schedule_next_attempt()
 
-    def _after_recovery(self) -> None:
-        """Связь вернулась: перечитать конфигурацию и сравнить с прежней.
+    def _remember_recovered_config(self, config: DeviceConfig) -> bool:
+        """Запоминает свежий опрос и сообщает, совместима ли геометрия потока.
 
-        Прибор мог быть перезагружен по питанию и потерять всё, что мы в него
-        записали, поэтому конфигурация не перезаписывается молча: расхождение
-        попадает в `config_mismatch` и в колбэк, а решение принимает оператор.
-
-        Состояние после восстановления — всегда `Idle`, даже если уходили
-        из `Streaming`. Пробник содержит `Stop`, то есть поток остановлен
-        нашей же командой; объявить состояние `Streaming` значило бы, что
-        автомат врёт. Факт обрыва потока виден в `stream_interrupted`,
-        перезапуск — решение вызывающего, а не сессии.
+        Расхождение не применяется молча: оно остаётся в `config_mismatch`
+        и уходит в колбэк. Возвращаемое значение отдельно защищает Р67:
+        если после перезагрузки изменилась геометрия кадра или развёртка,
+        автоматический Start запрещён — pipeline собран по старому профилю.
         """
-        previous = self._state_before_degraded
-        fresh = self._probe(with_stop=False)
-        if fresh.error is not None:
-            self._enter_reconnecting()
-            return
         known = self._device
-        config = fresh.unwrap()
+        compatible = True
+        if known is not None:
+            compatible = (
+                known.module.channels == config.module.channels
+                and known.module.fbg_per_channel == config.module.fbg_per_channel
+                and known.sweep == config.sweep
+            )
+            diffs = known.differences(config)
+            self._mismatch = diffs
+            if diffs and self._on_config_mismatch is not None:
+                self._on_config_mismatch(diffs)
         self._device = config
         self._last_ok_mono = time.perf_counter()
         self._keepalive_failures = 0
-        if known is not None:
-            diffs = known.differences(config)
-            if diffs:
-                self._mismatch = diffs
-                if self._on_config_mismatch is not None:
-                    self._on_config_mismatch(diffs)
-        if previous is SessionState.STREAMING:
-            self._stream_interrupted = True
+        return compatible
+
+    def _after_passive_stream_resume(self) -> None:
+        """Кадры вернулись сами: не трогать режим и вернуться в Streaming.
+
+        Конфигурация перечитывается командами 0x10 **без Stop**. Р62 измерен
+        на приборе: чтения разрешены во время потока и телеметрию не сбивают.
+        Даже если этот служебный опрос не удался, состояние остаётся
+        `Streaming`: кадры уже доказали фактический режим прибора, и автомат
+        не имеет права врать о нём (KB_05 №17).
+        """
+        self._passive_stream_recovery = False
+        self._stream_recovery_outcome = StreamRecoveryOutcome.RESUMED
+        self._recovery_attempt = 0
+        self._last_ok_mono = time.perf_counter()
+        self._keepalive_failures = 0
+        self._set_state(SessionState.STREAMING)
+
+        fresh = self._probe(with_stop=False)
+        if fresh.ok:
+            self._remember_recovered_config(fresh.unwrap())
+
+    def _attempt_stream_restart(self) -> bool:
+        """Полный цикл восстановления потока после истёкшего пассивного окна.
+
+        ⚠️ Сам выбор этой ветки — гипотеза KB_05 №12: отсутствие кадров за
+        `stream_resume_wait_s` трактуется как вероятная перезагрузка прибора.
+        Дальнейший порядок уже не гипотеза: после режимной команды группа 0x30
+        требует `Stop → опрос → Start` по измеренному Р63.
+        """
+        self._recovery_attempt += 1
+        self._counters.reconnect_attempts += 1
+        probed = self._probe(with_stop=True)
+        if probed.error is not None:
+            return False
+
+        compatible = self._remember_recovered_config(probed.unwrap())
+        # Stop из полного цикла подтверждён, поэтому до нового Start прибор
+        # действительно Idle. Этот промежуточный переход не ложь автомата.
+        if not compatible:
+            self._stream_recovery_outcome = StreamRecoveryOutcome.BLOCKED_CONFIG
+            self._set_state(SessionState.IDLE)
+            return True
+        self._set_state(SessionState.IDLE)
+
+        sent = self._send_only(
+            codec.build_start_stream(self._stream_speed_hz),
+            codec.ID_MODE,
+            codec.FC_STREAM,
+            internal=True,
+        )
+        if sent.error is not None:
+            return False
+        self._last_frame_mono = time.perf_counter()
+        self._stream_interrupted = True
+        self._stream_recovery_outcome = StreamRecoveryOutcome.RESTARTED
+        self._recovery_attempt = 0
+        self._set_state(SessionState.STREAMING)
+        return True
+
+    def _after_idle_recovery(self) -> None:
+        """Связь вернулась из Idle: перечитать конфигурацию и остаться Idle."""
+        fresh = self._probe(with_stop=False)
+        if fresh.error is not None:
+            self._enter_reconnecting(reset_attempts=False)
+            return
+        self._remember_recovered_config(fresh.unwrap())
+        self._recovery_attempt = 0
         self._set_state(SessionState.IDLE)

@@ -27,7 +27,7 @@ recorder занят, кадры копятся в кольце (10 секунд 
 =========================  ==========================================
 кадр записан               строка с числами
 кадр был, пиков нет        строка, где все `*_nm` равны `nan`
-кадров не было             строка-комментарий `# GAP frames=…`
+кадров не было             строка-комментарий `# GAP frames=N/unknown`
 кадр сознательно пропущен  ничего; шаг `frame_no` равен `decimation`
 =========================  ==========================================
 
@@ -38,9 +38,12 @@ recorder занят, кадры копятся в кольце (10 секунд 
 
 Как постобработка отличает децимацию от потери
 ----------------------------------------------
-`frame_no` — сквозной номер кадра **прибора** от старта записи, а не номер
-строки. При `decimation=N` соседние записанные строки отличаются ровно на `N`,
-и это указано в шапке. Скачок, не кратный `N`, означает потерю.
+`frame_no` — сквозной номер **полученного** кадра от старта записи, а не номер
+строки. В протоколе телеметрии нет sequence number, поэтому сетевой пропуск
+сам по себе скачка в `frame_no` дать не может: его отмечает внешний
+`# GAP frames=unknown` с временными границами. При `decimation=N` соседние
+записанные строки отличаются ровно на `N`; больший скачок означает уже другой
+класс потери — Recorder отстал от кольца и знает точное число вытесненных кадров.
 
 Оговорка, которую честнее записать, чем умолчать: при `N > 1` потеря кадров,
 чьи номера и так не попадали в выборку, по одним номерам **не видна** — шаг
@@ -79,6 +82,7 @@ recorder закрывает файл, запоминает причину в `Re
 import contextlib
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -308,9 +312,10 @@ def build_header(
         f"t_wall_file={t_wall_file.isoformat()} file_part={part}",
         "t_mono=perf_counter_seconds t_wall=unix_epoch_seconds_utc",
         "wavelength=raw_nm uncalibrated nan=peak_not_found",
-        f"frame_no=device_frame_index_since_recording_start step={config.decimation}",
+        f"frame_no=received_frame_index_since_recording_start step={config.decimation}",
         "a frame_no step equal to decimation is an intentional skip, not a loss;",
-        'a larger step and a "# GAP frames=..." line mean lost frames',
+        "a larger frame_no step means recorder lag; # GAP frames=N records that loss",
+        "# GAP frames=unknown means a source/network gap; exact count is unavailable",
     ]
     comments = "".join(f"# {line}\n" for line in lines)
     return SEPARATOR.join(columns) + "\n" + comments
@@ -341,17 +346,21 @@ def format_rows(
     return (row_template * rows) % tuple(matrix.ravel().tolist())
 
 
-def format_gap(frames: int, t_mono_from: float, t_mono_to: float) -> str:
+def format_gap(frames: int | None, t_mono_from: float, t_mono_to: float) -> str:
     """Строка-маркер разрыва (решение Р42).
 
-    `t_mono_from` — метка последней записанной строки, `t_mono_to` — первой
-    строки после разрыва. Если разрыв случился до первой строки файла либо
-    запись остановлена, не дождавшись строки после него, соответствующая
-    граница равна `nan`: подставлять вместо неё что-то правдоподобное значило
-    бы придумывать данные.
+    Для потери Recorder `t_mono_from`/`t_mono_to` — последняя записанная строка
+    и первая после разрыва. Для сетевого разрыва Session передаёт точные метки
+    последнего **полученного** кадра до тишины и первого после неё; при
+    децимации эти кадры могут не быть строками файла. `frames=None` означает,
+    что точного числа нет в протоколе и печатается `unknown`, а не оценка.
+
+    Если граница действительно неизвестна, она равна `nan`: подставлять вместо
+    неё что-то правдоподобное значило бы придумывать данные.
     """
+    frame_text = "unknown" if frames is None else str(frames)
     return (
-        f"# GAP frames={frames} "
+        f"# GAP frames={frame_text} "
         f"t_mono_from={t_mono_from:.{TIME_DECIMALS}f} "
         f"t_mono_to={t_mono_to:.{TIME_DECIMALS}f}\n"
     )
@@ -398,6 +407,8 @@ class Recorder:
         self._last_frame_no: int | None = None
         self._last_t_mono = float("nan")
         self._pending_gap = 0
+        self._external_gaps: deque[tuple[float, float]] = deque()
+        self._external_gap_lock = threading.Lock()
         self._wall_offset = 0.0
         self._t_wall_start = datetime.now().astimezone()
 
@@ -452,6 +463,25 @@ class Recorder:
             last_frame_no=self._last_frame_no,
             error=self._error,
         )
+
+    def mark_gap(self, t_mono_from: float, t_mono_to: float) -> None:
+        """Отмечает внешний разрыв источника без файлового I/O в вызывающем потоке.
+
+        Нужен обрыву связи: pipeline нумерует только **полученные** кадры и не
+        способен сам увидеть, что несколько секунд датаграмм не было вообще.
+        Точное число потерянных кадров протокол тоже не даёт — sequence number
+        отсутствует, — поэтому маркер пишет `frames=unknown`, а не оценку по
+        паспортному темпу. Обе временные границы при этом известны точно:
+        последняя телеметрия до тишины и первая после неё.
+
+        Метод может вызываться из приёмного потока. Он только кладёт две
+        `float` в маленькую очередь; форматирование и файл остаются в потоке
+        Recorder (KB_05 №28).
+        """
+        if t_mono_to < t_mono_from:
+            raise ValueError("правая граница GAP не может быть раньше левой")
+        with self._external_gap_lock:
+            self._external_gaps.append((t_mono_from, t_mono_to))
 
     # --- Жизненный цикл ----------------------------------------------------------------
 
@@ -509,6 +539,7 @@ class Recorder:
             # Разрыв, после которого строк уже не будет: правая граница
             # неизвестна и остаётся nan.
             self._emit_gap(float("nan"))
+        self._emit_remaining_external_gaps()
         try:
             self._file.flush()
         except OSError as exc:
@@ -584,31 +615,74 @@ class Recorder:
             nm = nm[:, :, : self._fbg_written]
 
         total = len(batch)
-        chunk = self._config.chunk_frames
-        for start in range(0, total, chunk):
-            stop = min(start + chunk, total)
+        cursor = 0
+        for gap_from, gap_to in self._take_external_gaps_through(float(batch.t_mono[-1])):
+            split = int(np.searchsorted(batch.t_mono, gap_to, side="left"))
+            split = max(cursor, min(split, total))
+            if split > cursor:
+                self._write_rows_range(batch, frame_no, t_wall, nm, cursor, split)
             self._rotate_if_needed()
-            if self._pending_gap:
-                self._emit_gap(float(batch.t_mono[start]))
-            text = format_rows(
-                self._row_template,
-                frame_no[start:stop],
-                batch.t_mono[start:stop],
-                t_wall[start:stop],
-                nm[start:stop],
-                batch.case_temp_c[start:stop],
-            )
-            self._write(text)
-            self._rows += stop - start
+            self._emit_external_gap(gap_from, gap_to)
+            cursor = split
+        if cursor < total:
+            self._write_rows_range(batch, frame_no, t_wall, nm, cursor, total)
         self._last_frame_no = int(frame_no[-1])
         self._last_t_mono = float(batch.t_mono[-1])
         self._maybe_flush()
         return total
 
+    def _write_rows_range(
+        self,
+        batch: FrameBatch,
+        frame_no: np.ndarray,
+        t_wall: np.ndarray,
+        nm: np.ndarray,
+        start: int,
+        stop: int,
+    ) -> None:
+        """Пишет непрерывный диапазон пачки, сохраняя прежнее chunking."""
+        chunk = self._config.chunk_frames
+        for offset in range(start, stop, chunk):
+            end = min(offset + chunk, stop)
+            self._rotate_if_needed()
+            if self._pending_gap:
+                self._emit_gap(float(batch.t_mono[offset]))
+            text = format_rows(
+                self._row_template,
+                frame_no[offset:end],
+                batch.t_mono[offset:end],
+                t_wall[offset:end],
+                nm[offset:end],
+                batch.case_temp_c[offset:end],
+            )
+            self._write(text)
+            self._rows += end - offset
+
+    def _take_external_gaps_through(self, t_mono: float) -> tuple[tuple[float, float], ...]:
+        """Забирает внешние GAP, правая граница которых уже попала в пачку."""
+        ready: list[tuple[float, float]] = []
+        with self._external_gap_lock:
+            while self._external_gaps and self._external_gaps[0][1] <= t_mono:
+                ready.append(self._external_gaps.popleft())
+        return tuple(ready)
+
+    def _emit_remaining_external_gaps(self) -> None:
+        """При закрытии не теряет уже известные сетевые разрывы без строки после."""
+        with self._external_gap_lock:
+            remaining = tuple(self._external_gaps)
+            self._external_gaps.clear()
+        for gap_from, gap_to in remaining:
+            self._emit_external_gap(gap_from, gap_to)
+
     def _emit_gap(self, t_mono_to: float) -> None:
         """Записывает маркер разрыва и обнуляет накопленный счёт."""
         self._write(format_gap(self._pending_gap, self._last_t_mono, t_mono_to))
         self._pending_gap = 0
+        self._gaps += 1
+
+    def _emit_external_gap(self, t_mono_from: float, t_mono_to: float) -> None:
+        """Пишет разрыв источника с неизвестным числом кадров."""
+        self._write(format_gap(None, t_mono_from, t_mono_to))
         self._gaps += 1
 
     def _write(self, text: str) -> None:

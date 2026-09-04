@@ -6,6 +6,7 @@
 захвата сам по себе не содержит.
 """
 
+import dataclasses
 import time
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from fbg.sim.scene import Grating, Scene
 from fbg.ui import models
 from fbg.ui.app import AppController
 from tests.synthetic import load_vectors
+from tests.test_recorder import files_of, frame_numbers, gap_lines
 from tests.test_session import QUIET, TEST_ENDPOINT_KWARGS, wait_until
 
 PROFILE = DeviceProfile()
@@ -435,6 +437,10 @@ def test_одновременная_запись_журнал_и_график_н
         assert wait_until(lambda: not sim.streaming, timeout=2.0)
         time.sleep(0.5)  # долёт сокета, recorder и packet_log добирают свои очереди
         controller.stop_recording()
+        # KB_05, «Тесты»: сравнивать счётчик потребителя с принятым можно
+        # только после опустошения очереди транспорта. Иначе последняя
+        # датаграмма уже принята RX-потоком, но ещё не дошла до session tap.
+        assert wait_until(lambda: controller.session._transport.queue_depth == 0, timeout=5.0)
         assert wait_until(lambda: controller.packet_log.stats.queue_depth == 0, timeout=5.0)
 
         final = controller.snapshot()
@@ -477,6 +483,103 @@ def test_одновременная_запись_журнал_и_график_н
         assert log_stats.lost_records == 0
         assert snapshots >= int(elapsed * 8.0), "модель графика не выдержала обновление около 10 Гц"
         assert graph_points > 0
+    finally:
+        controller.shutdown()
+        sim.stop()
+
+
+@pytest.mark.slow
+def test_запись_2кгц_переживает_сетевой_обрыв_с_одним_gap(tmp_path: Path) -> None:
+    """2 кГц + Recorder + N11: запись продолжается через двухсекундную тишину.
+
+    `go_silent` оставляет флаг Streaming прибора включённым — это именно
+    наблюдаемое поведение N11, а не гипотеза reboot. Пассивное окно здесь
+    длиннее тишины, поэтому ни Stop, ни Start восстановлению не нужны.
+    """
+    rate_hz = 2000.0
+    profile = DeviceProfile()
+    sim = DeviceSimulator(
+        profile=profile,
+        scene=Scene(profile, [Grating(0, 0, 1544.80), Grating(0, 1, 1551.50)]),
+        reply_to=("127.0.0.1", 1),
+        frame_rate_hz=rate_hz,
+    )
+    sim.start()
+    host, port = sim.address
+    endpoint = Endpoint(
+        device_ip=host,
+        device_port=port,
+        **TEST_ENDPOINT_KWARGS,  # type: ignore[arg-type]
+    )
+    session_config = dataclasses.replace(
+        QUIET,
+        stream_stall_floor_s=0.3,
+        stream_resume_wait_s=3.0,
+        backoff_schedule=(0.05, 0.1),
+    )
+    controller = AppController(
+        AppConfig(
+            endpoint=endpoint,
+            profile=profile,
+            session=session_config,
+            pipeline=PipelineConfig(history_frames=20_000, expected_rate_hz=rate_hz),
+            recorder=RecorderConfig(
+                directory=tmp_path / "data",
+                rotate_bytes=None,
+                rotate_seconds=None,
+            ),
+            packet_log=PacketLogConfig(directory=None),
+        )
+    )
+    try:
+        controller.start()
+        controller.session._transport.open()
+        sim.reply_to = controller.session.local_address
+        assert controller.connect().ok
+        assert controller.start_stream().ok
+        assert wait_until(lambda: controller.pipeline.sequence >= 100, timeout=2.0)
+        recorder = controller.start_recording()
+        assert wait_until(lambda: recorder.stats.rows >= 100, timeout=2.0)
+        commands_before = controller.session.stats().commands
+
+        sim.go_silent(2.0)
+        assert wait_until(lambda: controller.session.state is SessionState.DEGRADED, timeout=2.0)
+        assert controller.is_recording
+        assert wait_until(lambda: controller.session.state is SessionState.STREAMING, timeout=4.0)
+        assert controller.is_recording
+        assert wait_until(lambda: recorder.stats.gaps == 1, timeout=2.0)
+        assert wait_until(lambda: recorder.stats.rows >= 300, timeout=2.0)
+
+        assert controller.stop_stream().ok
+        assert wait_until(lambda: not sim.streaming, timeout=2.0)
+        assert wait_until(lambda: controller.session._transport.queue_depth == 0, timeout=2.0)
+        controller.stop_recording()
+
+        paths = files_of(tmp_path / "data")
+        numbers = frame_numbers(paths)
+        marks = [mark for path in paths for mark in gap_lines(path)]
+        stats = recorder.stats
+        transport = controller.session.transport_stats
+
+        print("\n--- чат 14: 2 кГц + recorder + N11 ---")
+        print(
+            f"строк {stats.rows}, GAP {stats.gaps}, потеряно recorder {stats.lost_frames}, "
+            f"потери транспорта {transport.dropped_queue_full}"
+        )
+        print(f"маркер: {marks[0] if marks else 'нет'}")
+
+        assert stats.error is None
+        assert stats.gaps == 1
+        assert stats.lost_frames == 0
+        assert len(marks) == 1
+        assert "frames=unknown" in marks[0]
+        assert transport.dropped_queue_full == 0
+        assert numbers == list(range(len(numbers))), (
+            "локальные номера полученных кадров непрерывны; сетевой провал отмечает # GAP"
+        )
+        # После N11 добавились только пять чтений конфигурации 0x10 и штатный
+        # Stop от явного завершения теста. Восстановление не посылало Start.
+        assert controller.session.stats().commands >= commands_before + 5
     finally:
         controller.shutdown()
         sim.stop()

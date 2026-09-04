@@ -19,6 +19,7 @@ from fbg.core.session import (
     SessionErrorKind,
     SessionState,
     SessionStats,
+    StreamRecoveryOutcome,
 )
 from fbg.core.transport import TransportStats
 from fbg.io import packet_log as packet_log_module
@@ -80,11 +81,57 @@ def test_degraded_и_reconnecting_выглядят_иначе_чем_disconnecte
     assert texts.TONE_COLORS[Tone.WARN] != texts.TONE_COLORS[Tone.NEUTRAL]
 
 
-def test_прерванный_поток_виден_в_подписи() -> None:
-    """Р24: после восстановления автомат в Idle, а поток сам не возобновится."""
-    view = models.state_view(snapshot(state=SessionState.IDLE, stream_interrupted=True))
-    assert view.tone is Tone.OK
-    assert texts.STREAM_INTERRUPTED in view.text
+def test_три_этапа_восстановления_потока_различимы_в_подписи() -> None:
+    """Оператор различает потерю, самовозобновление и наш перезапуск."""
+    lost = models.state_view(
+        snapshot(
+            state=SessionState.DEGRADED,
+            session=SessionStats(stream_resume_wait_in_s=12.3),
+        )
+    )
+    resumed = models.state_view(
+        snapshot(
+            state=SessionState.STREAMING,
+            stream_recovery_outcome=StreamRecoveryOutcome.RESUMED,
+        )
+    )
+    restarted = models.state_view(
+        snapshot(
+            state=SessionState.STREAMING,
+            stream_recovery_outcome=StreamRecoveryOutcome.RESTARTED,
+        )
+    )
+
+    assert texts.STREAM_CONNECTION_LOST in lost.text
+    assert "12.3" in lost.text
+    assert texts.STREAM_RECOVERED_RESUMED in resumed.text
+    assert texts.STREAM_RECOVERED_RESTARTED in restarted.text
+    assert len({lost.text, resumed.text, restarted.text}) == 3
+
+
+def test_активная_попытка_восстановления_видна_и_отменяема() -> None:
+    """Во время сетевого опроса UI не теряет номер активной попытки."""
+    view = models.state_view(
+        snapshot(
+            state=SessionState.DEGRADED,
+            session=SessionStats(recovery_attempt=2),
+        )
+    )
+    assert "попытка 2 выполняется" in view.text
+    assert texts.RECOVERY_CANCEL in view.text
+
+
+def test_reconnecting_показывает_номер_срок_и_отмену() -> None:
+    """Backoff не выглядит как зависание: видны попытка, срок и способ отмены."""
+    view = models.state_view(
+        snapshot(
+            state=SessionState.RECONNECTING,
+            session=SessionStats(recovery_attempt=3, next_attempt_in_s=1.25),
+        )
+    )
+    assert "попытка 3" in view.text
+    assert "1.2" in view.text
+    assert texts.RECOVERY_CANCEL in view.text
 
 
 def test_расхождение_конфигурации_видно_в_подписи() -> None:

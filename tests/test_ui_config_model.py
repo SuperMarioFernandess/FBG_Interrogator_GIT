@@ -43,6 +43,7 @@ QUIET = SessionConfig(
     keepalive_period_s=30.0,
     keepalive_failures_to_degrade=2,
     stream_stall_floor_s=0.3,
+    stream_resume_wait_s=0.5,
     backoff_schedule=(0.05, 0.1),
     retry_pause_s=0.01,
     reassembly_timeout_s=0.3,

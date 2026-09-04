@@ -236,10 +236,11 @@ def test_шапка_содержит_все_поля(pipeline: Pipeline, tmp_pat
         "t_wall_start=",
         "t_wall_file=",
         "file_part=1",
-        "frame_no=device_frame_index_since_recording_start step=5",
+        "frame_no=received_frame_index_since_recording_start step=5",
         "t_wall=unix_epoch_seconds_utc",
         "nan=peak_not_found",
-        "# GAP frames=...",
+        "# GAP frames=N",
+        "# GAP frames=unknown",
     ):
         assert token in text, f"в шапке нет «{token}»"
 
@@ -365,6 +366,31 @@ def test_разрыв_это_комментарий_а_не_строка_nan(pro
         assert not all(value == "nan" for value in row.split(";")[3:-4])
 
 
+def test_сетевой_разрыв_пишется_один_раз_с_точными_границами(
+    pipeline: Pipeline, tmp_path: Path
+) -> None:
+    """Обрыв источника виден, хотя pipeline не может посчитать потерянные кадры.
+
+    У телеметрии нет sequence number, поэтому число кадров во время сетевой
+    тишины не угадывается по 2000 Гц. Session сообщает Recorder только две
+    реально наблюдённые границы, а тот ставит `frames=unknown` ровно между
+    последним кадром до паузы и первым после неё.
+    """
+    recorder = recorder_for(pipeline, tmp_path)
+    recorder.open()
+    feed(pipeline, 4, start_s=10.0)
+    recorder.mark_gap(10.0015, 20.0)
+    feed(pipeline, 3, start_s=20.0)
+    recorder.pump()
+    recorder.close()
+
+    marks = gap_lines(recorder.path)  # type: ignore[arg-type]
+    assert marks == ["# GAP frames=unknown t_mono_from=10.001500 t_mono_to=20.000000"]
+    assert frame_numbers([recorder.path]) == list(range(7))  # type: ignore[list-item]
+    assert recorder.stats.gaps == 1
+    assert recorder.stats.lost_frames == 0, "неизвестное число кадров нельзя выдавать за оценку"
+
+
 def test_маркер_разрыва_несёт_границы_по_времени(profile: DeviceProfile, tmp_path: Path) -> None:
     """`t_mono_from` — последняя записанная строка, `t_mono_to` — первая после разрыва."""
     pipeline = Pipeline(profile, SMALL_RING)
@@ -441,6 +467,9 @@ def test_format_gap_печатает_обе_границы() -> None:
         "# GAP frames=1247 t_mono_from=123.456789 t_mono_to=124.080123\n"
     )
     assert "t_mono_from=nan" in format_gap(3, float("nan"), 1.0)
+    assert format_gap(None, 1.0, 2.0) == (
+        "# GAP frames=unknown t_mono_from=1.000000 t_mono_to=2.000000\n"
+    )
 
 
 # --------------------------------------------------------------------------------------

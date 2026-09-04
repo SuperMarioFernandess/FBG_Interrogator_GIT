@@ -190,6 +190,21 @@ def test_индикатор_состояния_меняет_цвет(window: Mai
     assert texts.TONE_COLORS[texts.Tone.WARN] in style(SessionState.RECONNECTING)
 
 
+def test_восстановление_можно_явно_отменить(window: MainWindow) -> None:
+    """Во время Degraded/Reconnecting та же кнопка честно называется отменой."""
+    panel = window.connection_panel
+    endpoint = window._controller.config.endpoint
+    for state in (SessionState.DEGRADED, SessionState.RECONNECTING):
+        panel.refresh(models.AppSnapshot(endpoint=endpoint, profile=DeviceProfile(), state=state))
+        assert panel.disconnect_button.isEnabled()
+        assert panel.disconnect_button.text() == texts.BUTTON_CANCEL_RECOVERY
+
+    panel.refresh(
+        models.AppSnapshot(endpoint=endpoint, profile=DeviceProfile(), state=SessionState.IDLE)
+    )
+    assert panel.disconnect_button.text() == texts.BUTTON_DISCONNECT
+
+
 def test_расхождение_профиля_показывается_и_прячется(window: MainWindow) -> None:
     """Пока расхождения нет, места оно не занимает; появилось — видно сразу."""
     panel = window.connection_panel

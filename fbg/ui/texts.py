@@ -27,6 +27,7 @@ TAB_PACKET_LOG = "Журнал пакетов"
 
 BUTTON_CONNECT = "Подключить"
 BUTTON_DISCONNECT = "Отключить"
+BUTTON_CANCEL_RECOVERY = "Отменить восстановление"
 BUTTON_START_STREAM = "Запустить поток"
 BUTTON_STOP_STREAM = "Остановить поток"
 BUTTON_EXPORT = "Экспорт…"
@@ -91,8 +92,16 @@ STATE_LABELS: dict[SessionState, tuple[str, Tone]] = {
     SessionState.RECONNECTING: ("Переподключение с задержкой", Tone.WARN),
 }
 
-STREAM_INTERRUPTED = "поток был прерван восстановлением связи и сам не возобновится"
-"""Решение Р24: пробник содержит Stop, перезапуск потока — дело оператора."""
+STREAM_CONNECTION_LOST = "связь потеряна; ждём самовозобновление потока без команд"
+STREAM_RECOVERED_RESUMED = "связь вернулась, поток идёт"
+STREAM_RECOVERED_RESTARTED = "связь вернулась, поток не пошёл и перезапущен приложением"
+STREAM_RECOVERY_BLOCKED_CONFIG = (
+    "связь вернулась, но поток не перезапущен: геометрия прибора изменилась"
+)
+RECOVERY_WAIT = "ждём кадры ещё {seconds:.1f} с"
+RECOVERY_ACTIVE = "попытка {attempt} выполняется"
+RECOVERY_RETRY = "попытка {attempt}; следующая через {seconds:.1f} с"
+RECOVERY_CANCEL = "«Отключить» — отмена восстановления"
 
 CONFIG_MISMATCH = "конфигурация прибора изменилась после восстановления связи"
 

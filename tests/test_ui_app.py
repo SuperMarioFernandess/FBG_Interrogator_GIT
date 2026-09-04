@@ -42,6 +42,7 @@ QUIET = SessionConfig(
     keepalive_period_s=30.0,
     keepalive_failures_to_degrade=2,
     stream_stall_floor_s=0.3,
+    stream_resume_wait_s=0.5,
     backoff_schedule=(0.05, 0.1, 0.2),
     retry_pause_s=0.02,
     reassembly_timeout_s=0.3,
@@ -127,6 +128,7 @@ def test_контроллер_связывает_все_компоненты(tmp
     controller = AppController(AppConfig(packet_log=PacketLogConfig(directory=None)))
     session = controller.session
     assert session._on_telemetry == controller.pipeline.on_telemetry
+    assert session._on_stream_gap == controller._on_stream_gap
     assert session._log_rx == controller.packet_log.log_rx
     assert session._log_tx == controller.packet_log.log_tx
 
@@ -472,6 +474,43 @@ def test_запись_поднимается_после_опроса(rig: Rig) -
     finally:
         rig.controller.stop_recording()
     assert not rig.controller.is_recording
+
+
+def test_запись_переживает_обрыв_и_получает_один_gap(rig: Rig) -> None:
+    """Recorder не останавливается при N11, а границы паузы попадают в файл."""
+    rig.controller.connect().unwrap()
+    assert rig.controller.start_stream().ok
+    assert wait_until(lambda: rig.controller.session.stats().telemetry_frames > 10)
+    recorder = rig.controller.start_recording()
+    assert wait_until(lambda: recorder.stats.rows > 3)
+
+    rows_before = recorder.stats.rows
+    rig.sim.go_silent(0.6)
+    assert wait_until(lambda: rig.controller.session.state is SessionState.DEGRADED)
+    assert rig.controller.is_recording
+    assert wait_until(lambda: rig.controller.session.state is SessionState.STREAMING)
+    assert rig.controller.is_recording
+    assert wait_until(lambda: recorder.stats.rows > rows_before + 3)
+
+    assert rig.controller.stop_stream().ok
+    rig.controller.stop_recording()
+    paths = sorted(recorder.config.directory.glob("data_*.csv"))
+    assert len(paths) == 1
+    lines = paths[0].read_text(encoding="ascii").splitlines()
+    gap_indexes = [index for index, line in enumerate(lines) if line.startswith("# GAP")]
+    assert len(gap_indexes) == 1
+    gap_index = gap_indexes[0]
+    gap = lines[gap_index]
+    assert "frames=unknown" in gap
+
+    before = next(line for line in reversed(lines[:gap_index]) if line[:1].isdigit())
+    after = next(line for line in lines[gap_index + 1 :] if line[:1].isdigit())
+    before_t = float(before.split(";")[1])
+    after_t = float(after.split(";")[1])
+    assert f"t_mono_from={before_t:.6f}" in gap
+    assert f"t_mono_to={after_t:.6f}" in gap
+    assert recorder.stats.gaps == 1
+    assert recorder.stats.lost_frames == 0
 
 
 def test_журнал_видит_обмен_подключения(rig: Rig) -> None:

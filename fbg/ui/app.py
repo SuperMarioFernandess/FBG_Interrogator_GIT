@@ -56,11 +56,13 @@ from fbg.core.session import (
     SessionError,
     SessionErrorKind,
     SessionState,
+    StreamRecoveryOutcome,
 )
 from fbg.io import config as config_module
 from fbg.io.config import PROFILE_DEVICE_FIELDS, AppConfig
 from fbg.io.packet_log import Direction, PacketLog, PacketRecord, filter_records
 from fbg.io.recorder import Recorder, RecorderConfig, RecorderStats
+from fbg.ui import texts
 from fbg.ui.models import AppSnapshot, ProfileDifference, SpectrumModel, spectrum_model
 
 #: Сколько сообщений держать для панели. Ограничение обязательно: колбэки
@@ -152,6 +154,7 @@ class AppController:
             on_telemetry=self._pipeline.on_telemetry,
             on_state=self._on_state,
             on_config_mismatch=self._on_config_mismatch,
+            on_stream_gap=self._on_stream_gap,
             log_rx=self._packet_log.log_rx,
             log_tx=self._packet_log.log_tx,
         )
@@ -220,6 +223,14 @@ class AppController:
 
     def _on_state(self, old: SessionState, new: SessionState) -> None:
         """Смена состояния сессии. Вызывается из watchdog — ничего дорогого."""
+        if new is SessionState.DEGRADED and old is SessionState.STREAMING:
+            self.note(texts.STREAM_CONNECTION_LOST)
+        elif new is SessionState.STREAMING:
+            outcome = self._session.stream_recovery_outcome
+            if outcome is StreamRecoveryOutcome.RESUMED:
+                self.note(texts.STREAM_RECOVERED_RESUMED)
+            elif outcome is StreamRecoveryOutcome.RESTARTED:
+                self.note(texts.STREAM_RECOVERED_RESTARTED)
         if new in (SessionState.DEGRADED, SessionState.RECONNECTING):
             self.note(f"состояние: {old.name} → {new.name}")
 
@@ -227,6 +238,17 @@ class AppController:
         """Конфигурация прибора изменилась после восстановления связи."""
         for difference in differences:
             self.note(f"конфигурация прибора изменилась: {difference}")
+
+    def _on_stream_gap(self, t_mono_from: float, t_mono_to: float) -> None:
+        """Передаёт сетевой разрыв активному Recorder без остановки записи.
+
+        Колбэк приходит из диспетчера транспорта **до** первого кадра после
+        паузы. `Recorder.mark_gap` только кладёт границы в свою очередь и не
+        делает файловый I/O, поэтому бюджет приёмного потока не нарушается.
+        """
+        recorder = self._recorder
+        if recorder is not None:
+            recorder.mark_gap(t_mono_from, t_mono_to)
 
     # --- Жизненный цикл ----------------------------------------------------------------
 
@@ -885,6 +907,7 @@ class AppController:
             firmware=self._config.firmware,
             device=session.device_config,
             stream_interrupted=session.stream_interrupted,
+            stream_recovery_outcome=session.stream_recovery_outcome,
             config_mismatch=session.config_mismatch,
             unconfirmed=session.unconfirmed,
             profile_mismatch=self._profile_mismatch,
