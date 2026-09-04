@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import re
@@ -241,10 +242,8 @@ def _recalibrate_part(
             rows_written += _flush_batch(output, raw_lines, parsed_rows, sensors, channel_columns)
         os.replace(temporary, output_path)
     except Exception:
-        try:
+        with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
-        except FileNotFoundError:
-            pass
         raise
     return rows_written, gaps
 
