@@ -95,8 +95,7 @@ def calibrated_path(path: Path) -> Path:
 def _safe_sensor_column(sensor: Sensor, index: int) -> str:
     """ASCII-имя колонки независимо от человеческого имени/ID датчика."""
     ascii_id = "".join(
-        char if char.isascii() and (char.isalnum() or char == "_") else "_"
-        for char in sensor.id
+        char if char.isascii() and (char.isalnum() or char == "_") else "_" for char in sensor.id
     ).strip("_")
     suffix = ascii_id or "sensor"
     return f"sensor{index + 1:03d}_{suffix}_value"
@@ -199,9 +198,10 @@ def _recalibrate_part(
     rows_written = 0
     gaps = 0
     try:
-        with path.open("r", encoding="ascii", errors="strict") as source, temporary.open(
-            "w", encoding="ascii", newline="\n"
-        ) as output:
+        with (
+            path.open("r", encoding="ascii", errors="strict") as source,
+            temporary.open("w", encoding="ascii", newline="\n") as output,
+        ):
             header = source.readline()
             if not header:
                 raise ValueError(f"{path}: пустой файл")
