@@ -43,6 +43,10 @@ DEFAULT_SELECTED_SLOTS = 4
 #: смысла не имеет, но 50 мс совпадает с периодом публикации pipeline.
 MIN_HISTORY_S = 0.05
 
+#: Ось Y сжимается раз в секунду, а расширяется на новом выбросе сразу.
+#: Это убирает дрожание масштаба без риска спрятать краткий выброс.
+Y_RANGE_RECALC_TICKS = 10
+
 
 class _MeasurementQtTableModel(QAbstractTableModel):
     """Qt-обёртка над неизменяемой моделью последнего кадра.
@@ -120,6 +124,8 @@ class MeasurementPanel(QWidget):
         self._record_settings_loading = False
         self._record_settings_dirty = False
         self._curves: dict[SlotRef, pg.PlotDataItem] = {}
+        self._graph_model: models.MeasurementGraphModel | None = None
+        self._graph_ticks = 0
 
         profile = controller.config.profile
         self.trace_tree = QTreeWidget()
@@ -132,6 +138,12 @@ class MeasurementPanel(QWidget):
         self.history_spin.setValue(5.0)
 
         self.plot = pg.PlotWidget()
+        # Длинная история графика измерения прореживается **только при
+        # отрисовке**. `peak` сохраняет краткие выбросы; `mean` здесь нельзя —
+        # он усреднил бы пропавший на один кадр пик. Исходные точки остаются
+        # в копии истории и в файле без изменений (Р76).
+        self.plot.setDownsampling(auto=True, mode="peak")
+        self.plot.setClipToView(True)
         self.plot.setLabel("bottom", texts.GRAPH_AXIS_TIME)
         self.plot.setLabel("left", texts.GRAPH_AXIS_DELTA_NM)
         self.plot.showGrid(x=True, y=True, alpha=0.2)
@@ -332,7 +344,15 @@ class MeasurementPanel(QWidget):
 
     def _update_graph(self, snapshot: AppSnapshot) -> None:
         selected = self.selected_slots()
-        model = models.measurement_graph_model(snapshot, selected)
+        self._graph_ticks += 1
+        model = models.measurement_graph_model(
+            snapshot,
+            selected,
+            self._graph_model,
+            recalculate_y=self._graph_ticks % Y_RANGE_RECALC_TICKS == 0,
+        )
+        unchanged = model is self._graph_model
+        self._graph_model = model
         selected_set = set(selected)
         for slot in tuple(self._curves):
             if slot not in selected_set:
@@ -348,10 +368,12 @@ class MeasurementPanel(QWidget):
                 self._curves[trace.slot] = curve
             # `connect="finite"` — принципиальная часть отображения: NaN
             # разрывает линию и никогда не соединяется через пропавший пик.
-            curve.setData(model.t_s, trace.delta_nm, connect="finite")
+            if not unchanged:
+                curve.setData(model.t_s, trace.delta_nm, connect="finite")
 
         self.plot.setXRange(-self.history_spin.value(), 0.0, padding=0.0)
-        self.plot.setYRange(model.y_min_nm, model.y_max_nm, padding=0.0)
+        if not unchanged:
+            self.plot.setYRange(model.y_min_nm, model.y_max_nm, padding=0.0)
         if not selected:
             self.graph_hint.setText(texts.GRAPH_NO_SELECTION + "\n" + texts.GRAPH_BASELINE_HINT)
         else:

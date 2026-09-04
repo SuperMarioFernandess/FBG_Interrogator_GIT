@@ -20,7 +20,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from fbg.core.endpoint import Endpoint
-from fbg.core.pipeline import RingHistory
+from fbg.core.pipeline import RingHistory, TraceHistorySnapshot
 from fbg.core.profile import DeviceProfile
 from fbg.core.session import SessionState
 from fbg.io.config import AppConfig
@@ -246,3 +246,74 @@ def test_оценка_объёма_сразу_реагирует_на_децим
 
     assert after != before
     assert panel.record_decimation.value() == 2
+
+
+@pytest.mark.slow
+def test_120_линий_инкрементальный_ui_такт_укладывается_в_budget(
+    application: QApplication, panel: MeasurementPanel
+) -> None:
+    """2 кГц × 10 с × 120 линий: штатный тик остаётся быстрее UI_PERIOD_MS.
+
+    Первый refresh намеренно не измеряется: это редкое создание 120 кривых после
+    изменения выбора. Критичен следующий штатный тик, где к истории добавилось
+    200 кадров за 100 мс. Именно этот сценарий раньше пересчитывал 20 000 точек
+    каждой линии и снова отдавал их pyqtgraph без правил Р76.
+    """
+    for channel_index in range(panel.trace_tree.topLevelItemCount()):
+        channel = panel.trace_tree.topLevelItem(channel_index)
+        assert channel is not None
+        for position in range(channel.childCount()):
+            channel.child(position).setCheckState(0, Qt.CheckState.Checked)
+
+    positions = tuple(
+        (channel, position)
+        for channel in range(PROFILE.channels)
+        for position in range(PROFILE.fbg_per_channel)
+    )
+    frames = 20_000
+    tail = 200
+    t_first = np.arange(frames, dtype=np.float64) / 2000.0
+    baselines = np.linspace(1540.0, 1555.0, len(positions), dtype=np.float64)
+    drift = 0.002 * np.sin(np.arange(frames, dtype=np.float64)[:, None] / 200.0)
+    wavelength_first = baselines[None, :] + drift
+    first_history = TraceHistorySnapshot(
+        positions=positions,
+        seq_start=0,
+        seq_stop=frames,
+        t_mono=t_first,
+        wavelength_nm=wavelength_first,
+    )
+    first = models.AppSnapshot(
+        endpoint=Endpoint(),
+        profile=PROFILE,
+        state=SessionState.STREAMING,
+        trace_history=first_history,
+    )
+    panel.refresh(first)
+    application.processEvents()
+
+    t_second = np.arange(tail, frames + tail, dtype=np.float64) / 2000.0
+    wavelength_second = np.empty_like(wavelength_first)
+    wavelength_second[:-tail] = wavelength_first[tail:]
+    new_index = np.arange(frames, frames + tail, dtype=np.float64)
+    wavelength_second[-tail:] = baselines[None, :] + 0.002 * np.sin(new_index[:, None] / 200.0)
+    second_history = TraceHistorySnapshot(
+        positions=positions,
+        seq_start=tail,
+        seq_stop=frames + tail,
+        t_mono=t_second,
+        wavelength_nm=wavelength_second,
+    )
+    second = models.AppSnapshot(
+        endpoint=Endpoint(),
+        profile=PROFILE,
+        state=SessionState.STREAMING,
+        trace_history=second_history,
+    )
+
+    started = time.perf_counter()
+    panel.refresh(second)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    print(f"\nчат 15: 120 линий, Qt UI-такт {elapsed_ms:.2f} мс")
+
+    assert elapsed_ms < UI_PERIOD_MS

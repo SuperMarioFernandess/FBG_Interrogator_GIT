@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
+from fbg.core.calibration import ReadingStatus, Sensor, SensorReading
 from fbg.core.endpoint import Endpoint
 from fbg.core.frames import AdcBlock, ChannelSetup, GainSetting
 from fbg.core.pipeline import PipelineMetrics, TraceHistorySnapshot, UiSnapshot
@@ -110,17 +111,46 @@ class AppSnapshot:
     recording_elapsed_s: float = 0.0
 
     spectrum: "SpectrumModel | None" = None
+    spectrum_version: int = 0
+    """Версия последнего **завершённого** снимка спектра.
+
+    Сравнивается именно версия, а не массив ADC: два последовательных измерения
+    устойчивой линии имеют почти одинаковое содержимое, но остаются двумя
+    разными измерениями и оба должны быть показаны оператору.
+    """
     spectrum_busy: bool = False
     spectrum_running: bool = False
     spectrum_period_s: float = 1.0
+    spectrum_actual_period_s: float | None = None
+    """Фактически достигнутый период Continuous по завершённым циклам."""
     last_spectrum_max_adc: int | None = None
     last_spectrum_saturated_points: int | None = None
     """Сводка последнего спектра; `None` означает, что спектра в приложении ещё не было."""
+
+    sensors: tuple[Sensor, ...] = ()
+    sensor_readings: tuple[SensorReading, ...] = ()
+    sensor_history: "SensorHistorySnapshot | None" = None
+    sensor_version: int = 0
+    """Версия набора датчиков; меняется при сохранённой правке конфигурации."""
 
     connected: bool = False
     recording: bool = False
     connecting: bool = False
     """Идёт фоновое подключение: команда уже в полёте, кнопки заблокированы."""
+
+
+@dataclass(frozen=True)
+class SensorHistorySnapshot:
+    """Короткая история величин, рассчитанная на частоте UI, а не 2 кГц."""
+
+    t_mono: np.ndarray
+    sensor_ids: tuple[str, ...]
+    values: np.ndarray
+    """Массив формы `(кадры UI, датчики)`. Пропавшие значения остаются NaN."""
+
+    @property
+    def frames(self) -> int:
+        return int(self.t_mono.size)
 
 
 # --------------------------------------------------------------------------------------
@@ -226,6 +256,35 @@ class MeasurementGraphModel:
     y_min_nm: float
     y_max_nm: float
     history_span_s: float
+    seq_start: int = 0
+    seq_stop: int = 0
+    t_end_mono: float = 0.0
+
+
+def _expanded_y_range(
+    previous: tuple[float, float],
+    values: Sequence[np.ndarray],
+) -> tuple[float, float]:
+    """Расширяет диапазон сразу, но никогда не сужает его на каждом такте.
+
+    Новый выброс должен оказаться видимым немедленно. Обратная операция —
+    сужение после ухода выброса из истории — делается реже явным полным
+    пересчётом. Так ось не дрожит от нескольких пикометров кадр за кадром.
+    """
+    finite_blocks = [block[np.isfinite(block)] for block in values]
+    finite_blocks = [block for block in finite_blocks if block.size]
+    if not finite_blocks:
+        return previous
+    low = min(float(block.min()) for block in finite_blocks)
+    high = max(float(block.max()) for block in finite_blocks)
+    old_low, old_high = previous
+    if low >= old_low and high <= old_high:
+        return previous
+    low = min(low, old_low)
+    high = max(high, old_high)
+    span = max(high - low, GRAPH_MIN_SPAN_NM)
+    padding = span * GRAPH_RANGE_PADDING
+    return low - padding, high + padding
 
 
 def _visible_y_range(values: Sequence[np.ndarray]) -> tuple[float, float]:
@@ -255,18 +314,118 @@ def _visible_y_range(values: Sequence[np.ndarray]) -> tuple[float, float]:
 def measurement_graph_model(
     snapshot: AppSnapshot,
     selected: Sequence[SlotRef],
+    previous: MeasurementGraphModel | None = None,
+    *,
+    recalculate_y: bool = False,
 ) -> MeasurementGraphModel:
     """Строит Δλ(t) выбранных слотов из `TraceHistorySnapshot`.
 
-    Базой каждой линии служит **первое валидное значение в видимой истории**.
-    Так абсолютный уровень около 1550 нм не съедает пикометровые изменения,
-    при этом единица оси остаётся нанометром. NaN вычитается как NaN и тем
-    самым остаётся разрывом — никакого заполнения последним значением нет.
+    Базой каждой линии служит первое валидное значение при построении текущей
+    непрерывной серии. При обычном сдвиге окна эта опора сохраняется: иначе
+    пришлось бы заново пересчитывать все 20 000 точек каждой линии на каждом
+    такте. При смене выбора или глубины истории модель строится заново.
+    NaN остаётся разрывом — никакого заполнения последним значением нет.
     """
     history = snapshot.trace_history
     if history is None or history.frames == 0:
         low, high = _visible_y_range(())
         return MeasurementGraphModel(np.empty(0), (), low, high, 0.0)
+
+    selected_tuple = tuple(selected)
+    history_slots = tuple(SlotRef(*pair) for pair in history.positions)
+
+    # Инкрементальный путь: за один такт 10 Гц при 2 кГц обычно добавилось
+    # около 200 кадров из 20 000. Старые Δλ уже посчитаны и повторно через
+    # вычитание/поиск baseline не проходят. Если окно/выбор изменились либо
+    # история перестала перекрываться с предыдущей, ниже используется полный
+    # путь — это редкое событие, а не работа каждого таймера.
+    can_extend = (
+        previous is not None
+        and tuple(trace.slot for trace in previous.traces) == selected_tuple
+        and history_slots == selected_tuple
+        and history.seq_start >= previous.seq_start
+        and history.seq_start <= previous.seq_stop <= history.seq_stop
+    )
+    if (
+        can_extend
+        and history.seq_start == previous.seq_start
+        and history.seq_stop == previous.seq_stop
+    ):
+        return previous
+
+    if can_extend and previous is not None:
+        dropped = history.seq_start - previous.seq_start
+        tail_index = previous.seq_stop - history.seq_start
+        previous_t = previous.t_s + previous.t_end_mono
+        retained_t = previous_t[dropped:]
+        new_t = history.t_mono[tail_index:]
+        absolute_t = (
+            retained_t
+            if new_t.size == 0
+            else new_t
+            if retained_t.size == 0
+            else np.concatenate((retained_t, new_t))
+        )
+
+        traces: list[GraphTrace] = []
+        new_deltas: list[np.ndarray] = []
+        all_deltas: list[np.ndarray] = []
+        for column, old_trace in enumerate(previous.traces):
+            old_delta = old_trace.delta_nm[dropped:]
+            baseline = old_trace.baseline_nm
+            new_absolute = history.wavelength_nm[tail_index:, column]
+            new_finite = np.flatnonzero(np.isfinite(new_absolute))
+            if baseline is None and new_finite.size:
+                baseline = float(new_absolute[int(new_finite[0])])
+            if baseline is None:
+                new_delta = np.full(new_absolute.shape, np.nan, dtype=np.float64)
+            else:
+                new_delta = new_absolute - baseline
+            delta = (
+                old_delta
+                if new_delta.size == 0
+                else new_delta
+                if old_delta.size == 0
+                else np.concatenate((old_delta, new_delta))
+            )
+
+            dropped_valid = int(np.count_nonzero(np.isfinite(old_trace.delta_nm[:dropped])))
+            valid_points = old_trace.valid_points - dropped_valid + int(new_finite.size)
+            latest = old_trace.latest_nm
+            if new_finite.size:
+                latest = float(new_absolute[int(new_finite[-1])])
+            elif valid_points == 0:
+                latest = None
+            elif dropped_valid and old_trace.latest_nm is not None:
+                finite_delta = np.flatnonzero(np.isfinite(delta))
+                if finite_delta.size and baseline is not None:
+                    latest = baseline + float(delta[int(finite_delta[-1])])
+
+            traces.append(GraphTrace(old_trace.slot, delta, baseline, latest, valid_points))
+            new_deltas.append(new_delta)
+            all_deltas.append(delta)
+
+        if absolute_t.size:
+            t_end = float(absolute_t[-1])
+            t_s = absolute_t - t_end
+        else:
+            t_end = previous.t_end_mono
+            t_s = np.empty(0, dtype=np.float64)
+
+        if recalculate_y:
+            low, high = _visible_y_range(all_deltas)
+        else:
+            low, high = _expanded_y_range((previous.y_min_nm, previous.y_max_nm), new_deltas)
+        return MeasurementGraphModel(
+            t_s,
+            tuple(traces),
+            low,
+            high,
+            history.span_s,
+            history.seq_start,
+            history.seq_stop,
+            t_end,
+        )
 
     columns = {SlotRef(*pair): index for index, pair in enumerate(history.positions)}
     t_s = history.t_mono - history.t_mono[-1]
@@ -291,7 +450,16 @@ def measurement_graph_model(
         deltas.append(delta)
         traces.append(GraphTrace(slot, delta, baseline, latest, valid_points))
     low, high = _visible_y_range(deltas)
-    return MeasurementGraphModel(t_s, tuple(traces), low, high, history.span_s)
+    return MeasurementGraphModel(
+        t_s,
+        tuple(traces),
+        low,
+        high,
+        history.span_s,
+        history.seq_start,
+        history.seq_stop,
+        float(history.t_mono[-1]),
+    )
 
 
 @dataclass(frozen=True)
@@ -322,6 +490,87 @@ def measurement_table_model(snapshot: AppSnapshot) -> MeasurementTableModel:
         temperature = snapshot.ui.case_temp_c.copy()
     valid = np.isfinite(wavelength)
     return MeasurementTableModel(wavelength, valid, temperature)
+
+
+# --------------------------------------------------------------------------------------
+# Панель датчиков: калибровка считается в AppController.snapshot, не в pipeline
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SensorTableRow:
+    """Одна строка таблицы датчиков без Qt-типов."""
+
+    sensor: Sensor
+    wavelength_nm: float
+    value: float
+    status: ReadingStatus
+    candidates: int
+
+    @property
+    def unit(self) -> str:
+        return self.sensor.unit
+
+
+@dataclass(frozen=True)
+class SensorPanelModel:
+    """Данные таблицы, карты пиков и графика из одного `AppSnapshot`."""
+
+    rows: tuple[SensorTableRow, ...]
+    units: tuple[str, ...]
+    peaks_by_channel: tuple[np.ndarray, ...]
+    history: SensorHistorySnapshot | None
+
+
+def sensor_panel_model(
+    snapshot: AppSnapshot,
+    *,
+    filter_text: str = "",
+) -> SensorPanelModel:
+    """Собирает рабочую модель вкладки «Датчики».
+
+    Строка не исчезает, если пик пропал: `SensorReading` остаётся в таблице со
+    своим статусом и NaN. Фильтр применяется только к имени/ID по явному
+    запросу пользователя, а не к качеству измерения.
+    """
+    readings = {reading.sensor_id: reading for reading in snapshot.sensor_readings}
+    needle = filter_text.strip().casefold()
+    rows: list[SensorTableRow] = []
+    for sensor in snapshot.sensors:
+        if needle and needle not in sensor.name.casefold() and needle not in sensor.id.casefold():
+            continue
+        reading = readings.get(sensor.id)
+        if reading is None:
+            rows.append(
+                SensorTableRow(
+                    sensor=sensor,
+                    wavelength_nm=math.nan,
+                    value=math.nan,
+                    status=ReadingStatus.PEAK_NOT_FOUND,
+                    candidates=0,
+                )
+            )
+        else:
+            rows.append(
+                SensorTableRow(
+                    sensor=sensor,
+                    wavelength_nm=reading.wavelength_nm,
+                    value=reading.value,
+                    status=reading.status,
+                    candidates=reading.candidates,
+                )
+            )
+
+    units = tuple(sorted({sensor.unit for sensor in snapshot.sensors}))
+    if snapshot.ui is None:
+        peaks = tuple(np.empty(0, dtype=np.float64) for _ in range(snapshot.profile.channels))
+    else:
+        wavelengths = snapshot.ui.wavelength_nm
+        peaks = tuple(
+            np.sort(wavelengths[channel][np.isfinite(wavelengths[channel])].copy())
+            for channel in range(snapshot.profile.channels)
+        )
+    return SensorPanelModel(tuple(rows), units, peaks, snapshot.sensor_history)
 
 
 @dataclass(frozen=True)

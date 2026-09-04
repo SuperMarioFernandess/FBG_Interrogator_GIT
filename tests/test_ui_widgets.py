@@ -77,19 +77,20 @@ def push(controller: AppController, count: int, prefix: bytes = b"\x10\x04\x04\x
 # --------------------------------------------------------------------------------------
 
 
-def test_окно_создаётся_с_шестью_вкладками(window: MainWindow) -> None:
+def test_окно_создаётся_с_семью_вкладками(window: MainWindow) -> None:
     """Вкладки на месте и подписаны по-русски."""
     titles = [window.tabs.tabText(index) for index in range(window.tabs.count())]
     assert titles == [
         texts.TAB_CONNECTION,
         texts.TAB_MEASUREMENT,
+        texts.TAB_SENSORS,
         texts.TAB_SPECTRUM,
         texts.TAB_DEVICE,
         texts.TAB_DEVICE_CONFIG,
         texts.TAB_PACKET_LOG,
     ]
     assert window.windowTitle() == texts.APP_TITLE
-    assert len(window.panels) == 6
+    assert len(window.panels) == 7
 
 
 def test_таймер_запускается_и_гаснет(window: MainWindow) -> None:
@@ -122,14 +123,63 @@ def test_такт_берёт_один_снимок_на_все_панели(
     calls = 0
     original = controller.snapshot
 
-    def counted() -> models.AppSnapshot:
+    def counted(**kwargs: object) -> models.AppSnapshot:
         nonlocal calls
         calls += 1
-        return original()
+        return original(**kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(controller, "snapshot", counted)
     window.tick()
     assert calls == 1
+
+
+def test_такт_обновляет_только_видимую_панель(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Р76: скрытые графики и таблицы не получают бесполезные refresh 10 Гц."""
+    calls = {panel: 0 for panel in window.panels}
+    for panel in window.panels:
+        original = panel.refresh
+
+        def counted(snapshot: models.AppSnapshot, *, _panel=panel, _original=original) -> None:
+            calls[_panel] += 1
+            _original(snapshot)
+
+        monkeypatch.setattr(panel, "refresh", counted)
+
+    window.tabs.setCurrentWidget(window.packet_log_panel)
+    calls = dict.fromkeys(window.panels, 0)
+    window.tick()
+
+    assert calls[window.packet_log_panel] == 1
+    assert sum(calls.values()) == 1
+
+
+def test_история_копируется_только_для_видимого_графика(
+    window: MainWindow, controller: AppController, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Скрытая вкладка измерения не копирует 20 000×120 чисел из кольца."""
+    calls: list[tuple[bool, bool]] = []
+    original = controller.snapshot
+
+    def counted(
+        *, include_trace_history: bool = True, include_sensor_data: bool = True
+    ) -> models.AppSnapshot:
+        calls.append((include_trace_history, include_sensor_data))
+        return original(
+            include_trace_history=include_trace_history, include_sensor_data=include_sensor_data
+        )
+
+    monkeypatch.setattr(controller, "snapshot", counted)
+    window.tabs.setCurrentWidget(window.packet_log_panel)
+    calls.clear()
+    window.tick()
+    assert calls == [(False, False)]
+
+    window.tabs.setCurrentWidget(window.measurement_panel)
+    calls.clear()
+    window.tick()
+    assert calls == [(True, False)]
 
 
 # --------------------------------------------------------------------------------------
