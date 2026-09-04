@@ -404,8 +404,7 @@ def fit_calibration(
     required_distinct = degree + 1
     if np.unique(wavelengths).size < required_distinct:
         raise ValueError(
-            f"для подгонки степени {degree} нужно не менее {required_distinct} "
-            "различных длин волн"
+            f"для подгонки степени {degree} нужно не менее {required_distinct} различных длин волн"
         )
     coefficients = np.polyfit(x, values, degree)
     if degree == 2:
@@ -679,9 +678,7 @@ def sensor_from_json(source: Mapping[str, object]) -> Sensor:
         wavelength_nm = _optional_number(raw_point, "wavelength_nm")
         value = _optional_number(raw_point, "value")
         if wavelength_nm is None or value is None:
-            raise ValueError(
-                f"{raw_id}: calibration_points[{index}] требует wavelength_nm и value"
-            )
+            raise ValueError(f"{raw_id}: calibration_points[{index}] требует wavelength_nm и value")
         parsed_points.append(CalibrationPoint(wavelength_nm, value))
     calibration_points = tuple(parsed_points)
 
