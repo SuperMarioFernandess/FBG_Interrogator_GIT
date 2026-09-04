@@ -170,6 +170,45 @@ def test_ось_y_разрешает_отметить_только_одну_ед
         panel.deleteLater()
 
 
+def test_обновление_динамических_ячеек_не_порождает_лишние_перерисовки(
+    application: QApplication,
+    controller: AppController,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """setText служебных ячеек не должен имитировать пользовательский itemChanged."""
+    controller.replace_sensors((sensor("T1", expected_nm=1545.0),))
+    panel = SensorsPanel(controller)
+    try:
+        panel.refresh(
+            snapshot(
+                controller,
+                sensor_readings=(reading("T1", ReadingStatus.OK),),
+            )
+        )
+        calls = 0
+        original = panel._update_graph
+
+        def counted() -> None:
+            nonlocal calls
+            calls += 1
+            original()
+
+        monkeypatch.setattr(panel, "_update_graph", counted)
+        changed = SensorReading(
+            sensor_id="T1",
+            status=ReadingStatus.OK,
+            wavelength_nm=1545.0123,
+            value=26.23,
+            position=0,
+            candidates=1,
+        )
+        panel.refresh(snapshot(controller, sensor_readings=(changed,)))
+        assert calls == 1
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
 def test_взять_текущую_лямбду_берёт_пик_из_телеметрии_а_не_слот(
     application: QApplication, controller: AppController
 ) -> None:
