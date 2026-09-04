@@ -326,20 +326,24 @@ class SensorsPanel(QWidget):
 
     def _update_tree_values(self, model: SensorPanelModel) -> None:
         rows = {row.sensor.id: row for row in model.rows}
-        for sensor_id, item in self._items.items():
-            row = rows.get(sensor_id)
-            if row is None:
-                continue
-            value = self._finite(row.value, 5)
-            if value != texts.UNKNOWN and row.unit:
-                value = f"{value}"
-            item.setText(0, row.sensor.name)
-            item.setText(1, str(row.sensor.channel + 1))
-            item.setText(2, f"{row.sensor.expected_nm:.4f}")
-            item.setText(3, self._finite(row.wavelength_nm))
-            item.setText(4, value)
-            item.setText(5, row.unit or texts.SENSOR_NO_UNIT)
-            item.setText(6, texts.SENSOR_STATUS_LABELS[row.status.value])
+        was_blocked = self.sensor_tree.blockSignals(True)
+        try:
+            for sensor_id, item in self._items.items():
+                row = rows.get(sensor_id)
+                if row is None:
+                    continue
+                value = self._finite(row.value, 5)
+                if value != texts.UNKNOWN and row.unit:
+                    value = f"{value}"
+                item.setText(0, row.sensor.name)
+                item.setText(1, str(row.sensor.channel + 1))
+                item.setText(2, f"{row.sensor.expected_nm:.4f}")
+                item.setText(3, self._finite(row.wavelength_nm))
+                item.setText(4, value)
+                item.setText(5, row.unit or texts.SENSOR_NO_UNIT)
+                item.setText(6, texts.SENSOR_STATUS_LABELS[row.status.value])
+        finally:
+            self.sensor_tree.blockSignals(was_blocked)
 
     def _update_units(self, model: SensorPanelModel) -> None:
         current = self.unit_combo.currentData()
