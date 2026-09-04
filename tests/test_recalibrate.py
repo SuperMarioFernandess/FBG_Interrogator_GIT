@@ -1,6 +1,6 @@
 """Постобработка Recorder: сырые nm остаются первичными, калибровка — производная."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +12,7 @@ from fbg.io.recalibrate import calibrated_path, recalibrate_recording, recording
 from fbg.io.recorder import RecorderConfig, build_header, column_names
 
 PROFILE = DeviceProfile()
-START = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+START = datetime(2026, 9, 4, 12, 0, tzinfo=UTC)
 
 
 def sensor(**overrides: object) -> Sensor:
