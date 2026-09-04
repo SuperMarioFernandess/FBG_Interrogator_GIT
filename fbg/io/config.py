@@ -771,6 +771,25 @@ def load_sensors(path: Path) -> tuple[tuple[Sensor, ...], tuple[ConfigIssue, ...
             ),
         )
 
+    # Файлы до чата №15 использовали абсолютный полином c0+c1·λ+c2·λ².
+    # Автоматической миграции нет: коэффициенты могли быть введены вручную,
+    # а молча принять их как новую опорную форму означало бы получить
+    # правдоподобные, но неверные величины. Такой файл считается целиком
+    # непонятым и при следующем сохранении откладывается по KB_05 №33.
+    legacy_fields = {"c0", "c1", "c2"}
+    if any(
+        isinstance(item, Mapping) and bool(legacy_fields.intersection(item))
+        for item in raw[SENSORS_KEY]
+    ):
+        return (), (
+            ConfigIssue(
+                IssueKind.FILE_UNREADABLE,
+                path.name,
+                "устаревшая абсолютная форма калибровки c0/c1/c2; "
+                "автоматическая миграция не выполняется",
+            ),
+        )
+
     sensors: list[Sensor] = []
     for index, item in enumerate(raw[SENSORS_KEY]):
         location = f"{SENSORS_KEY}[{index}]"
@@ -785,8 +804,15 @@ def load_sensors(path: Path) -> tuple[tuple[Sensor, ...], tuple[ConfigIssue, ...
 
 
 def save_sensors(sensors: Sequence[Sensor], path: Path) -> Path:
-    """Записывает набор датчиков тем же атомарным способом, что и настройки."""
+    """Записывает датчики атомарно; непонятый прежний файл сначала откладывает."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        _loaded, issues = load_sensors(path)
+        if any(issue.kind is IssueKind.FILE_UNREADABLE for issue in issues):
+            backup = path.with_name(path.name + ".bad")
+            if backup.exists():
+                backup.unlink()
+            path.replace(backup)
     payload = json.dumps(sensors_to_json(sensors), ensure_ascii=False, indent=2)
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(payload + "\n", encoding="utf-8")

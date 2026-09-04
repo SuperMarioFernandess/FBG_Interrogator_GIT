@@ -46,9 +46,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from types import TracebackType
 
+import numpy as np
+
+from fbg.core import calibration
+from fbg.core.calibration import Sensor, SensorReading
 from fbg.core.endpoint import Endpoint
 from fbg.core.frames import ChannelSetup, GainSetting, SweepConfig
-from fbg.core.pipeline import Pipeline
+from fbg.core.pipeline import Pipeline, UiSnapshot
 from fbg.core.session import (
     DeviceConfig,
     Result,
@@ -63,11 +67,21 @@ from fbg.io.config import PROFILE_DEVICE_FIELDS, AppConfig
 from fbg.io.packet_log import Direction, PacketLog, PacketRecord, filter_records
 from fbg.io.recorder import Recorder, RecorderConfig, RecorderStats
 from fbg.ui import texts
-from fbg.ui.models import AppSnapshot, ProfileDifference, SpectrumModel, spectrum_model
+from fbg.ui.models import (
+    AppSnapshot,
+    ProfileDifference,
+    SensorHistorySnapshot,
+    SpectrumModel,
+    spectrum_model,
+)
 
 #: Сколько сообщений держать для панели. Ограничение обязательно: колбэки
 #: сессии приходят из чужих потоков, и неограниченный список рос бы вечно.
 NOTICE_LIMIT = 50
+
+#: История графика физических величин считается на частоте UI. Минуты
+#: достаточно для оперативной диагностики и это всего 600×120 чисел при 10 Гц.
+SENSOR_HISTORY_POINTS = 600
 
 
 @dataclass(frozen=True)
@@ -114,6 +128,17 @@ class AppController:
         for issue in issues:
             self._notices.append(str(issue))
 
+        self._sensors, sensor_issues = config_module.load_sensors(config.calibration_path)
+        for issue in sensor_issues:
+            self._notices.append(str(issue))
+        self._sensor_version = 0
+        self._sensor_readings: dict[str, SensorReading] = {}
+        self._sensor_last_ui_seq: int | None = None
+        self._sensor_history_t: deque[float] = deque(maxlen=SENSOR_HISTORY_POINTS)
+        self._sensor_history_values: deque[tuple[float, ...]] = deque(
+            maxlen=SENSOR_HISTORY_POINTS
+        )
+
         # Привязка монотонных меток к настенным часам снимается один раз (Р45):
         # иначе колонка времени в панели журнала дёргалась бы вслед за NTP.
         self._wall_offset = time.time() - time.perf_counter()
@@ -129,10 +154,13 @@ class AppController:
         self._last_device: DeviceConfig | None = None
         self._last_error: SessionError | None = None
         self._last_spectrum: SpectrumModel | None = None
+        self._spectrum_version = 0
         self._spectrum_thread: threading.Thread | None = None
         self._spectrum_stop = threading.Event()
         self._spectrum_continuous = False
         self._spectrum_period_s = 1.0
+        self._spectrum_completed_mono: deque[float] = deque(maxlen=8)
+        self._spectrum_actual_period_s: float | None = None
         self._profile_mismatch: tuple[ProfileDifference, ...] = ()
 
         self._packet_log: PacketLog
@@ -204,6 +232,51 @@ class AppController:
     def profile_mismatch(self) -> tuple[ProfileDifference, ...]:
         """Расхождения геометрии профиля с прибором. Пусто — расхождений нет."""
         return self._profile_mismatch
+
+    @property
+    def sensors(self) -> tuple[Sensor, ...]:
+        """Текущий сохранённый набор датчиков."""
+        return self._sensors
+
+    def replace_sensors(self, sensors: Sequence[Sensor]) -> None:
+        """Проверяет и атомарно сохраняет весь набор датчиков.
+
+        Конфигурация маленькая и меняется человеком, поэтому один файл и один
+        валидируемый набор проще и надёжнее частичных операций на диске.
+        """
+        new = tuple(sensors)
+        problems = calibration.validate_sensors(new)
+        if problems:
+            raise ValueError("; ".join(problems))
+        config_module.save_sensors(new, self._config.calibration_path)
+        self._sensors = new
+        self._sensor_version += 1
+        self._sensor_readings = {}
+        self._sensor_last_ui_seq = None
+        self._sensor_history_t.clear()
+        self._sensor_history_values.clear()
+
+    def upsert_sensor(self, sensor: Sensor, *, previous_id: str | None = None) -> None:
+        """Добавляет датчик либо заменяет выбранный, затем сохраняет набор."""
+        replacement: list[Sensor] = []
+        replaced = False
+        target = previous_id or sensor.id
+        for current in self._sensors:
+            if current.id == target:
+                replacement.append(sensor)
+                replaced = True
+            else:
+                replacement.append(current)
+        if not replaced:
+            replacement.append(sensor)
+        self.replace_sensors(replacement)
+
+    def delete_sensor(self, sensor_id: str) -> None:
+        """Удаляет датчик; ссылки компенсации проверит `validate_sensors`."""
+        remaining = tuple(sensor for sensor in self._sensors if sensor.id != sensor_id)
+        if len(remaining) == len(self._sensors):
+            return
+        self.replace_sensors(remaining)
 
     @property
     def is_recording(self) -> bool:
@@ -412,6 +485,7 @@ class AppController:
         assert raw.value is not None
         model = spectrum_model(raw.value, self._config.profile, threshold_adc)
         self._last_spectrum = model
+        self._spectrum_version += 1
         return Result(value=model)
 
     def take_spectrum_async(self, channel: int, threshold_adc: int = 3000) -> bool:
@@ -495,6 +569,8 @@ class AppController:
         if self.spectrum_busy:
             return False
         self._spectrum_period_s = period_s
+        self._spectrum_completed_mono.clear()
+        self._spectrum_actual_period_s = None
         self._spectrum_stop.clear()
         self._spectrum_continuous = True
         self._spectrum_thread = threading.Thread(
@@ -514,6 +590,15 @@ class AppController:
                 result = self.take_spectrum(channel, threshold_adc)
                 if result.error is not None:
                     self.note(f"спектр: {result.error}")
+                else:
+                    completed = time.perf_counter()
+                    self._spectrum_completed_mono.append(completed)
+                    if len(self._spectrum_completed_mono) >= 2:
+                        first = self._spectrum_completed_mono[0]
+                        last = self._spectrum_completed_mono[-1]
+                        self._spectrum_actual_period_s = (last - first) / (
+                            len(self._spectrum_completed_mono) - 1
+                        )
             except Exception as exc:
                 self.note(f"спектр: {type(exc).__name__}: {exc}")
             left = self._spectrum_period_s - (time.perf_counter() - started)
@@ -887,7 +972,50 @@ class AppController:
 
     # --- Снимок для UI -----------------------------------------------------------------
 
-    def snapshot(self) -> AppSnapshot:
+    def _sensor_snapshot(
+        self,
+        ui_snapshot: UiSnapshot | None,
+    ) -> tuple[tuple[SensorReading, ...], SensorHistorySnapshot | None]:
+        """Считает калибровку только по опубликованному UI-кадру (Р75).
+
+        Метод вызывается из `snapshot()`, то есть около 10 Гц из GUI, а не из
+        `Pipeline.on_telemetry` на 2 кГц. При повторном чтении того же кадра
+        расчёт и история не дублируются.
+        """
+        if not self._sensors or ui_snapshot is None:
+            return (), None
+
+        ui = ui_snapshot
+        seq = int(ui.seq)
+        if seq != self._sensor_last_ui_seq:
+            readings = calibration.evaluate_all(
+                self._sensors,
+                ui.wavelength_nm,
+            )
+            self._sensor_readings = readings
+            self._sensor_last_ui_seq = seq
+            self._sensor_history_t.append(float(ui.t_mono))
+            self._sensor_history_values.append(
+                tuple(readings[sensor.id].value for sensor in self._sensors)
+            )
+
+        ordered = tuple(self._sensor_readings[sensor.id] for sensor in self._sensors)
+        if not self._sensor_history_t:
+            history = None
+        else:
+            history = SensorHistorySnapshot(
+                t_mono=np.fromiter(self._sensor_history_t, dtype=np.float64),
+                sensor_ids=tuple(sensor.id for sensor in self._sensors),
+                values=np.asarray(tuple(self._sensor_history_values), dtype=np.float64),
+            )
+        return ordered, history
+
+    def snapshot(
+        self,
+        *,
+        include_trace_history: bool = True,
+        include_sensor_data: bool = True,
+    ) -> AppSnapshot:
         """Всё, что панели читают за один такт таймера.
 
         Собирается целиком здесь, чтобы панель не ходила по живым объектам
@@ -897,7 +1025,16 @@ class AppController:
         session = self._session
         recorder = self._recorder
         recorder_stats = recorder.stats if recorder is not None else self._last_recorder_stats
-        trace_history = self._pipeline.trace_history(self._trace_positions, self._trace_history_s)
+        ui_snapshot = self._pipeline.snapshot()
+        trace_history = (
+            self._pipeline.trace_history(self._trace_positions, self._trace_history_s)
+            if include_trace_history
+            else None
+        )
+        if include_sensor_data:
+            sensor_readings, sensor_history = self._sensor_snapshot(ui_snapshot)
+        else:
+            sensor_readings, sensor_history = (), None
         return AppSnapshot(
             endpoint=self._config.endpoint,
             profile=self._config.profile,
@@ -916,22 +1053,28 @@ class AppController:
             session=session.stats(),
             transport=session.transport_stats,
             metrics=self._pipeline.metrics(),
-            ui=self._pipeline.snapshot(),
+            ui=ui_snapshot,
             trace_history=trace_history,
             log=self._packet_log.stats,
             recorder_config=self._config.recorder,
             recorder=recorder_stats,
             recording_elapsed_s=self._recording_elapsed_s(),
             spectrum=self._last_spectrum,
+            spectrum_version=self._spectrum_version,
             spectrum_busy=self.spectrum_busy,
             spectrum_running=self.spectrum_running,
             spectrum_period_s=self._spectrum_period_s,
+            spectrum_actual_period_s=self._spectrum_actual_period_s,
             last_spectrum_max_adc=(
                 None if self._last_spectrum is None else self._last_spectrum.max_adc
             ),
             last_spectrum_saturated_points=(
                 None if self._last_spectrum is None else self._last_spectrum.saturated_points
             ),
+            sensors=self._sensors,
+            sensor_readings=sensor_readings,
+            sensor_history=sensor_history,
+            sensor_version=self._sensor_version,
             connected=session.state is not SessionState.DISCONNECTED,
             recording=recorder is not None,
             connecting=self.is_connecting,

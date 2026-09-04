@@ -5,10 +5,13 @@
 и вот это уже проверяется отдельно, тестами с маркером `ui`.
 """
 
+import math
 import time
 
+import numpy as np
 import pytest
 
+from fbg.core.calibration import ReadingStatus, Sensor, SensorReading, SensorType
 from fbg.core.endpoint import Endpoint
 from fbg.core.frames import ChannelSetup, GainSetting, ModuleParams, SweepConfig
 from fbg.core.pipeline import PipelineMetrics
@@ -515,3 +518,75 @@ def test_адреса_компьютера_добываются_без_искл�
     addresses = diagnostics.local_ipv4_addresses()
     assert isinstance(addresses, tuple)
     assert all(isinstance(address, str) for address in addresses)
+
+
+# --------------------------------------------------------------------------------------
+# Панель датчиков
+# --------------------------------------------------------------------------------------
+
+
+def _sensor(sensor_id: str, channel: int = 0, unit_type: SensorType = SensorType.TEMPERATURE) -> Sensor:
+    return Sensor(
+        id=sensor_id,
+        name=f"Датчик {sensor_id}",
+        channel=channel,
+        type=unit_type,
+        expected_nm=1545.0 + channel,
+        window_nm=0.2,
+        value0=25.0,
+        k1=100.0,
+    )
+
+
+def _reading(sensor_id: str, status: ReadingStatus, value: float = 25.0) -> SensorReading:
+    found = status in (ReadingStatus.OK, ReadingStatus.OUT_OF_LIMITS, ReadingStatus.REFERENCE_MISSING)
+    return SensorReading(
+        sensor_id=sensor_id,
+        status=status,
+        wavelength_nm=1545.0 if found else math.nan,
+        value=value if status in (ReadingStatus.OK, ReadingStatus.OUT_OF_LIMITS) else math.nan,
+        position=0 if found else -1,
+        candidates=2 if status is ReadingStatus.AMBIGUOUS else (1 if found else 0),
+    )
+
+
+def test_датчик_без_пика_остаётся_строкой_со_статусом() -> None:
+    """Исчезающая строка скрыла бы потерю датчика так же, как last-known-value."""
+    sensor = _sensor("T1")
+    model = models.sensor_panel_model(snapshot(sensors=(sensor,), sensor_readings=()))
+    assert len(model.rows) == 1
+    assert model.rows[0].sensor.id == "T1"
+    assert model.rows[0].status is ReadingStatus.PEAK_NOT_FOUND
+    assert math.isnan(model.rows[0].value)
+
+
+def test_все_пять_статусов_доходят_до_модели_без_слияния() -> None:
+    sensors = tuple(_sensor(f"S{index}", channel=index % 4) for index in range(5))
+    statuses = tuple(ReadingStatus)
+    readings = tuple(_reading(sensor.id, status) for sensor, status in zip(sensors, statuses, strict=True))
+    model = models.sensor_panel_model(snapshot(sensors=sensors, sensor_readings=readings))
+    assert tuple(row.status for row in model.rows) == statuses
+
+
+def test_карта_пиков_строится_только_из_телеметрии() -> None:
+    """Р77: карта использует λ из UiSnapshot, не ADC и не команду 30 07."""
+    wavelength = np.full((PROFILE.channels, PROFILE.fbg_per_channel), np.nan)
+    wavelength[0, :3] = (1551.0, 1545.0, 1548.0)
+    ui = type("Ui", (), {"wavelength_nm": wavelength})()
+    model = models.sensor_panel_model(snapshot(ui=ui))
+    assert np.array_equal(model.peaks_by_channel[0], np.array([1545.0, 1548.0, 1551.0]))
+    assert all(block.size == 0 for block in model.peaks_by_channel[1:])
+
+
+def test_фильтр_датчиков_не_зависит_от_статуса() -> None:
+    alpha = Sensor(
+        id="A", name="Балка", channel=0, type=SensorType.TEMPERATURE,
+        expected_nm=1545.0, window_nm=0.2
+    )
+    beta = Sensor(
+        id="B", name="Свая", channel=1, type=SensorType.STRAIN_UE,
+        expected_nm=1550.0, window_nm=0.2
+    )
+    model = models.sensor_panel_model(snapshot(sensors=(alpha, beta)), filter_text="свая")
+    assert [row.sensor.id for row in model.rows] == ["B"]
+    assert set(model.units) == {"°C", "µε"}

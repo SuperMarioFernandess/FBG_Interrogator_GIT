@@ -128,10 +128,10 @@ LABEL_RECORD_ELAPSED = "Прошло"
 LABEL_RECORD_GAPS = "Разрывы"
 
 GRAPH_AXIS_TIME = "Время до текущего кадра, с"
-GRAPH_AXIS_DELTA_NM = "Δλ от первого валидного значения, нм"
+GRAPH_AXIS_DELTA_NM = "Δλ от опорного значения, нм"
 GRAPH_BASELINE_HINT = (
-    "Каждая выбранная линия показана как Δλ относительно своего первого валидного значения "
-    "в видимой истории. Абсолютная длина волны остаётся в таблице. NaN рисуется разрывом."
+    "Каждая линия показана как Δλ относительно первого валидного значения после выбора "
+    "линии или смены глубины истории. Абсолютная λ остаётся в таблице. NaN — разрыв."
 )
 GRAPH_NO_SELECTION = "Отметьте позиции слева, которые нужно рисовать."
 
@@ -439,7 +439,7 @@ BUTTON_START_SPECTRUM = "Запустить непрерывно"
 BUTTON_STOP_SPECTRUM = "Остановить непрерывный режим"
 LABEL_SPECTRUM_CHANNEL = "Канал"
 LABEL_SPECTRUM_PERIOD = "Период, с"
-LABEL_SPECTRUM_FREQUENCY = "Эквивалентная частота, Гц"
+LABEL_SPECTRUM_FREQUENCY = "Частота: задано / факт"
 LABEL_SPECTRUM_THRESHOLD = "Порог анализа ADC"
 LABEL_SPECTRUM_SCALE = "Ось Y"
 LABEL_SPECTRUM_MAX = "Максимум ADC"
@@ -457,3 +457,59 @@ SPECTRUM_SATURATION_WARNING = (
     "АЦП насыщен: форма и положение пиков искажены. Понизьте усиление на вкладке «Настройка». "
     "Для насыщенных областей положение вершины, центроид и FWHM не рассчитываются."
 )
+
+# --------------------------------------------------------------------------------------
+# Панель датчиков
+# --------------------------------------------------------------------------------------
+
+TAB_SENSORS = "Датчики"
+GROUP_SENSOR_LIST = "Датчики"
+GROUP_SENSOR_EDITOR = "Редактор датчика"
+GROUP_SENSOR_CALIBRATION = "Опорные точки"
+GROUP_SENSOR_GRAPH = "Величина во времени"
+GROUP_PEAK_MAP = "Карта пиков"
+GROUP_RECALIBRATION = "Пересчёт готовой записи"
+LABEL_SENSOR_FILTER = "Фильтр"
+LABEL_SENSOR_UNIT = "Единица графика"
+LABEL_SENSOR_ID = "ID"
+LABEL_SENSOR_NAME = "Имя"
+LABEL_SENSOR_CHANNEL = "Канал"
+LABEL_SENSOR_TYPE = "Тип"
+LABEL_SENSOR_EXPECTED = "Опорная λ₀ / ожидаемая λ, нм"
+LABEL_SENSOR_WINDOW = "Полуширина окна, нм"
+LABEL_SENSOR_VALUE0 = "Значение₀"
+LABEL_SENSOR_K1 = "k₁, ед./нм"
+LABEL_SENSOR_K2 = "k₂, ед./нм²"
+LABEL_SENSOR_DOWN_LIMIT = "Нижний предел"
+LABEL_SENSOR_UP_LIMIT = "Верхний предел"
+LABEL_SENSOR_CURRENT_PEAK = "Текущий пик"
+LABEL_SENSOR_KNOWN_VALUE = "Известное значение"
+LABEL_SENSOR_FIT_KIND = "Подгонка"
+LABEL_SENSOR_FIT_RESIDUAL = "Невязка"
+LABEL_PEAK_MAP_CHANNEL = "Канал карты"
+BUTTON_SENSOR_NEW = "Новый"
+BUTTON_SENSOR_SAVE = "Сохранить датчик"
+BUTTON_SENSOR_DELETE = "Удалить"
+BUTTON_SENSOR_TAKE_WAVELENGTH = "Взять текущую λ"
+BUTTON_SENSOR_ADD_POINT = "Взять точку"
+BUTTON_SENSOR_REMOVE_POINT = "Удалить точку"
+BUTTON_SENSOR_FIT = "Подогнать"
+BUTTON_RECALIBRATE = "Пересчитать CSV"
+SENSOR_FIT_LINEAR = "Прямая"
+SENSOR_FIT_QUADRATIC = "Парабола"
+SENSOR_NO_UNIT = "без единицы"
+SENSOR_PEAK_MAP_HINT = (
+    "Карта пиков использует только длины волн из телеметрии 30 02. "
+    "Это не спектр: амплитуд и формы пика в этих данных нет, команд прибору карта не отправляет."
+)
+SENSOR_RECALIBRATION_HINT = (
+    "Исходный CSV не меняется. Рядом создаётся файл с теми же сырыми нанометрами "
+    "и дополнительными колонками физических величин."
+)
+SENSOR_STATUS_LABELS = {
+    "ok": "OK",
+    "peak_not_found": "пик не найден",
+    "ambiguous": "неоднозначно",
+    "reference_missing": "нет опорного датчика",
+    "out_of_limits": "вне пределов",
+}
