@@ -810,8 +810,10 @@ def save_sensors(sensors: Sequence[Sensor], path: Path) -> Path:
         _loaded, issues = load_sensors(path)
         if any(issue.kind is IssueKind.FILE_UNREADABLE for issue in issues):
             backup = path.with_name(path.name + ".bad")
-            if backup.exists():
-                backup.unlink()
+            suffix = 2
+            while backup.exists():
+                backup = path.with_name(f"{path.name}.bad.{suffix}")
+                suffix += 1
             path.replace(backup)
     payload = json.dumps(sensors_to_json(sensors), ensure_ascii=False, indent=2)
     temporary = path.with_name(path.name + ".tmp")

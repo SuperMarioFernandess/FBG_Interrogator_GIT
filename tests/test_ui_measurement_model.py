@@ -445,7 +445,11 @@ def test_120_линий_инкрементальный_такт_укладыва
     lines = PROFILE.channels * PROFILE.fbg_per_channel
     frames = 20_000
     tail = 200
-    selected = tuple(models.SlotRef(ch, pos) for ch in range(PROFILE.channels) for pos in range(PROFILE.fbg_per_channel))
+    selected = tuple(
+        models.SlotRef(ch, pos)
+        for ch in range(PROFILE.channels)
+        for pos in range(PROFILE.fbg_per_channel)
+    )
     positions = tuple((slot.channel, slot.position) for slot in selected)
     t0 = np.arange(frames, dtype=np.float64) / 2000.0
     base = 1540.0 + np.arange(lines, dtype=np.float64) * 0.01
@@ -460,7 +464,9 @@ def test_120_линий_инкрементальный_такт_укладыва
     previous = models.measurement_graph_model(app_snapshot(trace_history=first_history), selected)
 
     t1 = np.arange(tail, frames + tail, dtype=np.float64) / 2000.0
-    wave1 = base[np.newaxis, :] + np.arange(tail, frames + tail, dtype=np.float64)[:, np.newaxis] * 1e-7
+    wave1 = (
+        base[np.newaxis, :] + np.arange(tail, frames + tail, dtype=np.float64)[:, np.newaxis] * 1e-7
+    )
     second_history = TraceHistorySnapshot(
         positions=positions,
         seq_start=tail,

@@ -525,7 +525,9 @@ def test_адреса_компьютера_добываются_без_искл�
 # --------------------------------------------------------------------------------------
 
 
-def _sensor(sensor_id: str, channel: int = 0, unit_type: SensorType = SensorType.TEMPERATURE) -> Sensor:
+def _sensor(
+    sensor_id: str, channel: int = 0, unit_type: SensorType = SensorType.TEMPERATURE
+) -> Sensor:
     return Sensor(
         id=sensor_id,
         name=f"Датчик {sensor_id}",
@@ -539,7 +541,11 @@ def _sensor(sensor_id: str, channel: int = 0, unit_type: SensorType = SensorType
 
 
 def _reading(sensor_id: str, status: ReadingStatus, value: float = 25.0) -> SensorReading:
-    found = status in (ReadingStatus.OK, ReadingStatus.OUT_OF_LIMITS, ReadingStatus.REFERENCE_MISSING)
+    found = status in (
+        ReadingStatus.OK,
+        ReadingStatus.OUT_OF_LIMITS,
+        ReadingStatus.REFERENCE_MISSING,
+    )
     return SensorReading(
         sensor_id=sensor_id,
         status=status,
@@ -563,7 +569,9 @@ def test_датчик_без_пика_остаётся_строкой_со_ст�
 def test_все_пять_статусов_доходят_до_модели_без_слияния() -> None:
     sensors = tuple(_sensor(f"S{index}", channel=index % 4) for index in range(5))
     statuses = tuple(ReadingStatus)
-    readings = tuple(_reading(sensor.id, status) for sensor, status in zip(sensors, statuses, strict=True))
+    readings = tuple(
+        _reading(sensor.id, status) for sensor, status in zip(sensors, statuses, strict=True)
+    )
     model = models.sensor_panel_model(snapshot(sensors=sensors, sensor_readings=readings))
     assert tuple(row.status for row in model.rows) == statuses
 
@@ -580,12 +588,15 @@ def test_карта_пиков_строится_только_из_телемет
 
 def test_фильтр_датчиков_не_зависит_от_статуса() -> None:
     alpha = Sensor(
-        id="A", name="Балка", channel=0, type=SensorType.TEMPERATURE,
-        expected_nm=1545.0, window_nm=0.2
+        id="A",
+        name="Балка",
+        channel=0,
+        type=SensorType.TEMPERATURE,
+        expected_nm=1545.0,
+        window_nm=0.2,
     )
     beta = Sensor(
-        id="B", name="Свая", channel=1, type=SensorType.STRAIN_UE,
-        expected_nm=1550.0, window_nm=0.2
+        id="B", name="Свая", channel=1, type=SensorType.STRAIN_UE, expected_nm=1550.0, window_nm=0.2
     )
     model = models.sensor_panel_model(snapshot(sensors=(alpha, beta)), filter_text="свая")
     assert [row.sensor.id for row in model.rows] == ["B"]

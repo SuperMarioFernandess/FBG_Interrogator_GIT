@@ -329,6 +329,7 @@ def test_форма_модели_меняется_когда_прибор_опр
 def test_таблица_журнала_наполняется(window: MainWindow, controller: AppController) -> None:
     """Записи попадают в таблицу через снимок кольца."""
     push(controller, 3)
+    window.tabs.setCurrentWidget(window.packet_log_panel)
     window.tick()
     model = window.packet_log_panel.model
     assert model.rowCount() == 3
@@ -345,6 +346,7 @@ def test_панель_журнала_не_держит_кольцо(window: Main
     менялось бы под ней прямо во время отрисовки.
     """
     push(controller, 2)
+    window.tabs.setCurrentWidget(window.packet_log_panel)
     window.tick()
     model = window.packet_log_panel.model
     assert model.rowCount() == 2
@@ -363,6 +365,7 @@ def test_фильтр_по_направлению(window: MainWindow, controller
     controller.packet_log.log_rx(b"\x10\x04\x00\x0c\x00\xca\x00\x04\x00\x1e\x00\x1e", 1.0)
     controller.packet_log.pump()
     panel = window.packet_log_panel
+    window.tabs.setCurrentWidget(panel)
     window.tick()
     assert panel.model.rowCount() == 3
     panel.direction_box.setCurrentIndex(panel.direction_box.findData(Direction.RX.value))
@@ -378,6 +381,7 @@ def test_фильтр_по_паре_не_сбрасывается_на_такт�
     push(controller, 2)
     push(controller, 1, prefix=b"\x30\x01\x06\x00\x00\x00")
     panel = window.packet_log_panel
+    window.tabs.setCurrentWidget(panel)
     window.tick()
     index = panel.pair_box.findData(models.format_id_fc_pair((0x30, 0x01)))
     assert index > 0
@@ -393,6 +397,7 @@ def test_фильтр_по_паре_не_сбрасывается_на_такт�
 def test_пауза_останавливает_обновление(window: MainWindow, controller: AppController) -> None:
     """Журнал при этом продолжает писаться — стоит только таблица."""
     push(controller, 2)
+    window.tabs.setCurrentWidget(window.packet_log_panel)
     window.tick()
     panel = window.packet_log_panel
     panel.pause_box.setChecked(True)

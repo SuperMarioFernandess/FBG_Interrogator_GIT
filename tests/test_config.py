@@ -600,8 +600,10 @@ def test_сохранение_новой_формы_откладывает_ст�
     from fbg.core.calibration import Sensor, SensorType
 
     path = tmp_path / "sensors.json"
-    old = '{"sensors":[{"id":"T1","channel":0,"type":0,"expected_nm":1544.8,' \
+    old = (
+        '{"sensors":[{"id":"T1","channel":0,"type":0,"expected_nm":1544.8,'
         '"window_nm":0.3,"c0":-154455,"c1":100,"c2":0}]}\n'
+    )
     path.write_text(old, encoding="utf-8")
     sensor = Sensor(
         id="T1",
@@ -620,3 +622,32 @@ def test_сохранение_новой_формы_откладывает_ст�
     assert backup.read_text(encoding="utf-8") == old
     sensors, issues = load_sensors(path)
     assert issues == () and sensors == (sensor,)
+
+
+def test_сохранение_старой_формы_не_затирает_предыдущий_bad(tmp_path: Path) -> None:
+    """Повторная карантинизация сохраняет уже отложенный непонятный файл."""
+    from fbg.core.calibration import Sensor, SensorType
+
+    path = tmp_path / "sensors.json"
+    old = (
+        '{"sensors":[{"id":"T1","channel":0,"type":0,"expected_nm":1544.8,'
+        '"window_nm":0.3,"c0":-154455,"c1":100,"c2":0}]}\n'
+    )
+    first_bad = tmp_path / "sensors.json.bad"
+    first_bad.write_text("previous backup\n", encoding="utf-8")
+    path.write_text(old, encoding="utf-8")
+    sensor = Sensor(
+        id="T1",
+        name="Температура",
+        channel=0,
+        type=SensorType.TEMPERATURE,
+        expected_nm=1544.8,
+        window_nm=0.3,
+        value0=25.0,
+        k1=100.0,
+    )
+
+    save_sensors((sensor,), path)
+
+    assert first_bad.read_text(encoding="utf-8") == "previous backup\n"
+    assert (tmp_path / "sensors.json.bad.2").read_text(encoding="utf-8") == old

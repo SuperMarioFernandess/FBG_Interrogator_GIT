@@ -8,9 +8,8 @@ import pytest
 pytest.importorskip("PySide6", reason="тесты интерфейса требуют Qt")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
-
 import numpy as np
+from PySide6.QtWidgets import QApplication
 
 from fbg.core.frames import AdcBlock, GainSetting
 from fbg.core.profile import DeviceProfile
@@ -18,8 +17,8 @@ from fbg.core.session import SessionState
 from fbg.io.config import AppConfig
 from fbg.io.packet_log import PacketLogConfig
 from fbg.ui import models, texts
-from fbg.ui.models import spectrum_model
 from fbg.ui.app import AppController
+from fbg.ui.models import spectrum_model
 from fbg.ui.panels.spectrum import SpectrumPanel
 
 pytestmark = pytest.mark.ui

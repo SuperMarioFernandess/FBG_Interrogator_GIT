@@ -735,8 +735,6 @@ def test_спектр_во_время_записи_запрещён(rig: Rig) ->
         rig.controller.stop_recording()
 
 
-
-
 def test_фактический_период_continuous_измеряется_по_завершённым_циклам(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
