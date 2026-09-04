@@ -539,7 +539,7 @@ def test_круговорот_датчиков(tmp_path: Path) -> None:
             type=SensorType.TEMPERATURE,
             expected_nm=1544.787,
             window_nm=0.35,
-            c1=100.0,
+            k1=100.0,
         ),
     )
     path = save_sensors(original, tmp_path / "sensors.json")
@@ -568,3 +568,86 @@ def test_битый_файл_калибровок_не_роняет_прилож
     sensors, issues = load_sensors(path)
     assert sensors == () and len(issues) == 1
     assert issues[0].kind is IssueKind.FILE_UNREADABLE
+
+
+def test_старая_форма_калибровки_не_мигрирует_молча(tmp_path: Path) -> None:
+    """Абсолютные c0/c1/c2 считаются непонятым файлом, а не новой моделью."""
+    path = write(
+        tmp_path / "sensors.json",
+        {
+            "sensors": [
+                {
+                    "id": "T1",
+                    "channel": 0,
+                    "type": 0,
+                    "expected_nm": 1544.8,
+                    "window_nm": 0.3,
+                    "c0": -154455.0,
+                    "c1": 100.0,
+                    "c2": 0.0,
+                }
+            ]
+        },
+    )
+    sensors, issues = load_sensors(path)
+    assert sensors == ()
+    assert len(issues) == 1 and issues[0].kind is IssueKind.FILE_UNREADABLE
+    assert "c0/c1/c2" in issues[0].message
+
+
+def test_сохранение_новой_формы_откладывает_старый_файл(tmp_path: Path) -> None:
+    """KB_05 №33: непонятое не затирается при первом сохранении новой модели."""
+    from fbg.core.calibration import Sensor, SensorType
+
+    path = tmp_path / "sensors.json"
+    old = (
+        '{"sensors":[{"id":"T1","channel":0,"type":0,"expected_nm":1544.8,'
+        '"window_nm":0.3,"c0":-154455,"c1":100,"c2":0}]}\n'
+    )
+    path.write_text(old, encoding="utf-8")
+    sensor = Sensor(
+        id="T1",
+        name="Температура",
+        channel=0,
+        type=SensorType.TEMPERATURE,
+        expected_nm=1544.8,
+        window_nm=0.3,
+        value0=25.0,
+        k1=100.0,
+    )
+
+    save_sensors((sensor,), path)
+
+    backup = tmp_path / "sensors.json.bad"
+    assert backup.read_text(encoding="utf-8") == old
+    sensors, issues = load_sensors(path)
+    assert issues == () and sensors == (sensor,)
+
+
+def test_сохранение_старой_формы_не_затирает_предыдущий_bad(tmp_path: Path) -> None:
+    """Повторная карантинизация сохраняет уже отложенный непонятный файл."""
+    from fbg.core.calibration import Sensor, SensorType
+
+    path = tmp_path / "sensors.json"
+    old = (
+        '{"sensors":[{"id":"T1","channel":0,"type":0,"expected_nm":1544.8,'
+        '"window_nm":0.3,"c0":-154455,"c1":100,"c2":0}]}\n'
+    )
+    first_bad = tmp_path / "sensors.json.bad"
+    first_bad.write_text("previous backup\n", encoding="utf-8")
+    path.write_text(old, encoding="utf-8")
+    sensor = Sensor(
+        id="T1",
+        name="Температура",
+        channel=0,
+        type=SensorType.TEMPERATURE,
+        expected_nm=1544.8,
+        window_nm=0.3,
+        value0=25.0,
+        k1=100.0,
+    )
+
+    save_sensors((sensor,), path)
+
+    assert first_bad.read_text(encoding="utf-8") == "previous backup\n"
+    assert (tmp_path / "sensors.json.bad.2").read_text(encoding="utf-8") == old

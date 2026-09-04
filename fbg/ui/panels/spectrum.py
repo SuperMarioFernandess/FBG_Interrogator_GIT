@@ -30,6 +30,9 @@ class SpectrumPanel(QWidget):
     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._controller = controller
+        self._shown_version = -1
+        self._shown_scale_index = -1
+        self._actual_period_s: float | None = None
         self.channel = QComboBox()
         for index in range(controller.config.profile.channels):
             self.channel.addItem(texts.channel_label(index), index)
@@ -52,6 +55,9 @@ class SpectrumPanel(QWidget):
         self.saturation_label = QLabel(texts.UNKNOWN)
         self.saturation_label.setWordWrap(True)
         self.plot = pg.PlotWidget()
+        # Спектр — 2551 реальных ADC-отсчётов, по которым смотрят форму пика.
+        # Прореживание здесь запрещено Р76: это не длинный временной ряд, и
+        # downsampling превратил бы измеренную форму в огибающую.
         self.plot.setLabel("bottom", "Длина волны, нм")
         self.plot.setLabel("left", texts.SPECTRUM_SCALE_ADC)
         self.plot.showGrid(x=True, y=True, alpha=0.2)
@@ -102,8 +108,13 @@ class SpectrumPanel(QWidget):
         layout.addWidget(regions, 1)
 
     def _update_frequency_label(self, period_s: float) -> None:
-        frequency_hz = 1.0 / period_s
-        self.frequency_label.setText(f"{frequency_hz:.3f}")
+        requested_hz = 1.0 / period_s
+        actual = self._actual_period_s
+        if actual is None or not math.isfinite(actual) or actual <= 0.0:
+            actual_text = texts.UNKNOWN
+        else:
+            actual_text = f"{1.0 / actual:.3f} Гц ({actual:.3f} с)"
+        self.frequency_label.setText(f"задано {requested_hz:.3f} Гц; факт {actual_text}")
 
     def _take_once(self) -> None:
         try:
@@ -143,7 +154,10 @@ class SpectrumPanel(QWidget):
             )
         else:
             self.saturation_label.setText("нет")
-        self.table.setRowCount(len(model.regions))
+        # Строки не пересоздаются без необходимости: иначе Qt сбрасывает
+        # выделение и прокрутку таблицы на каждом тике даже при том же снимке.
+        if self.table.rowCount() != len(model.regions):
+            self.table.setRowCount(len(model.regions))
         for row, region in enumerate(model.regions):
             values = [
                 str(row + 1),
@@ -156,12 +170,25 @@ class SpectrumPanel(QWidget):
                 str(region.saturated_points),
             ]
             for column, value in enumerate(values):
-                self.table.setItem(row, column, QTableWidgetItem(value))
+                item = self.table.item(row, column)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.table.setItem(row, column, item)
+                if item.text() != value:
+                    item.setText(value)
 
     def refresh(self, snapshot: AppSnapshot) -> None:
         """Один UI-такт: не опрашивает прибор, только показывает последний снимок."""
-        if snapshot.spectrum is not None:
+        self._actual_period_s = snapshot.spectrum_actual_period_s
+        self._update_frequency_label(self.period.value())
+        scale_index = self.scale.currentIndex()
+        if snapshot.spectrum is not None and (
+            snapshot.spectrum_version != self._shown_version
+            or scale_index != self._shown_scale_index
+        ):
             self._show_model(snapshot.spectrum)
+            self._shown_version = snapshot.spectrum_version
+            self._shown_scale_index = scale_index
         recording = snapshot.recording
         connected = snapshot.state in (SessionState.IDLE, SessionState.STREAMING)
         available = connected and not recording and not snapshot.spectrum_busy

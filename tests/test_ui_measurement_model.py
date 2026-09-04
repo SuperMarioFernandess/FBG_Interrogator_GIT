@@ -138,6 +138,90 @@ def test_масштаб_графика_строится_по_delta_видимо�
     assert abs(graph.y_max_nm) < 0.01
 
 
+def test_модель_графика_достраивается_только_новым_хвостом() -> None:
+    """Р76: 200 новых кадров не заставляют заново считать старые 20 000."""
+    slot = (models.SlotRef(0, 0),)
+    first_history = TraceHistorySnapshot(
+        positions=((0, 0),),
+        seq_start=100,
+        seq_stop=104,
+        t_mono=np.asarray([1.0, 2.0, 3.0, 4.0]),
+        wavelength_nm=np.asarray([[1550.000], [1550.001], [np.nan], [1550.003]]),
+    )
+    first = models.measurement_graph_model(app_snapshot(trace_history=first_history), slot)
+    second_history = TraceHistorySnapshot(
+        positions=((0, 0),),
+        seq_start=102,
+        seq_stop=106,
+        t_mono=np.asarray([3.0, 4.0, 5.0, 6.0]),
+        wavelength_nm=np.asarray([[np.nan], [1550.003], [1550.004], [1550.005]]),
+    )
+    second = models.measurement_graph_model(
+        app_snapshot(trace_history=second_history), slot, previous=first
+    )
+
+    assert second.seq_start == 102 and second.seq_stop == 106
+    assert second.t_s.tolist() == [-3.0, -2.0, -1.0, 0.0]
+    assert np.isnan(second.traces[0].delta_nm[0])
+    assert second.traces[0].delta_nm[1:].tolist() == pytest.approx([0.003, 0.004, 0.005])
+    assert second.traces[0].baseline_nm == pytest.approx(1550.0)
+    assert second.traces[0].valid_points == 3
+
+
+def test_ось_y_расширяется_сразу_а_сужается_только_по_редкому_пересчёту() -> None:
+    """Краткий выброс виден сразу, но исчезновение выброса не дёргает ось каждый тик."""
+    slot = (models.SlotRef(0, 0),)
+    first_history = TraceHistorySnapshot(
+        positions=((0, 0),),
+        seq_start=0,
+        seq_stop=3,
+        t_mono=np.arange(3, dtype=np.float64),
+        wavelength_nm=np.asarray([[1550.0], [1550.001], [1550.002]]),
+    )
+    first = models.measurement_graph_model(app_snapshot(trace_history=first_history), slot)
+
+    with_spike = TraceHistorySnapshot(
+        positions=((0, 0),),
+        seq_start=0,
+        seq_stop=4,
+        t_mono=np.arange(4, dtype=np.float64),
+        wavelength_nm=np.asarray([[1550.0], [1550.001], [1550.002], [1550.050]]),
+    )
+    expanded = models.measurement_graph_model(
+        app_snapshot(trace_history=with_spike), slot, previous=first
+    )
+    assert expanded.y_max_nm > 0.05
+
+    after_spike = TraceHistorySnapshot(
+        positions=((0, 0),),
+        seq_start=3,
+        seq_stop=6,
+        t_mono=np.arange(3, 6, dtype=np.float64),
+        wavelength_nm=np.asarray([[1550.050], [1550.003], [1550.004]]),
+    )
+    sticky = models.measurement_graph_model(
+        app_snapshot(trace_history=after_spike), slot, previous=expanded
+    )
+    # Пока выброс ещё в окне, диапазон точно не сужается.
+    assert sticky.y_max_nm == expanded.y_max_nm
+
+    no_spike = TraceHistorySnapshot(
+        positions=((0, 0),),
+        seq_start=4,
+        seq_stop=7,
+        t_mono=np.arange(4, 7, dtype=np.float64),
+        wavelength_nm=np.asarray([[1550.003], [1550.004], [1550.005]]),
+    )
+    still_sticky = models.measurement_graph_model(
+        app_snapshot(trace_history=no_spike), slot, previous=sticky
+    )
+    assert still_sticky.y_max_nm == expanded.y_max_nm
+    recalculated = models.measurement_graph_model(
+        app_snapshot(trace_history=no_spike), slot, previous=sticky, recalculate_y=True
+    )
+    assert recalculated.y_max_nm < expanded.y_max_nm
+
+
 def test_pipeline_отдаёт_копию_истории_только_выбранных_слотов() -> None:
     """Р36: график получает snapshot, а не `RingHistory`; real frame задаёт байты."""
     pipeline = Pipeline(PROFILE, PipelineConfig(history_frames=32))
@@ -346,6 +430,63 @@ def test_оценка_потерь_не_бывает_отрицательной_
 
     assert pipeline.frame_rate_hz() > 2000.0
     assert pipeline.metrics().loss_estimate == 0.0
+
+
+@pytest.mark.slow
+def test_120_линий_инкрементальный_такт_укладывается_в_ui_budget() -> None:
+    """Чат 15: 120 линий × 20 000 точек, новый хвост 200 кадров < 100 мс.
+
+    Тест намеренно использует чистую Qt-free модель: он измеряет ту часть такта,
+    которая до правки каждый раз пересчитывала всю историю. Отрисовочное
+    прореживание pyqtgraph проверяется отдельно UI-тестом. На базовом e13bad4
+    тест не проходит: `measurement_graph_model` не имеет инкрементального пути
+    `previous=` и модель каждого тика строится заново.
+    """
+    lines = PROFILE.channels * PROFILE.fbg_per_channel
+    frames = 20_000
+    tail = 200
+    selected = tuple(
+        models.SlotRef(ch, pos)
+        for ch in range(PROFILE.channels)
+        for pos in range(PROFILE.fbg_per_channel)
+    )
+    positions = tuple((slot.channel, slot.position) for slot in selected)
+    t0 = np.arange(frames, dtype=np.float64) / 2000.0
+    base = 1540.0 + np.arange(lines, dtype=np.float64) * 0.01
+    wave0 = base[np.newaxis, :] + np.arange(frames, dtype=np.float64)[:, np.newaxis] * 1e-7
+    first_history = TraceHistorySnapshot(
+        positions=positions,
+        seq_start=0,
+        seq_stop=frames,
+        t_mono=t0,
+        wavelength_nm=wave0,
+    )
+    previous = models.measurement_graph_model(app_snapshot(trace_history=first_history), selected)
+
+    t1 = np.arange(tail, frames + tail, dtype=np.float64) / 2000.0
+    wave1 = (
+        base[np.newaxis, :] + np.arange(tail, frames + tail, dtype=np.float64)[:, np.newaxis] * 1e-7
+    )
+    second_history = TraceHistorySnapshot(
+        positions=positions,
+        seq_start=tail,
+        seq_stop=frames + tail,
+        t_mono=t1,
+        wavelength_nm=wave1,
+    )
+
+    started = time.perf_counter()
+    current = models.measurement_graph_model(
+        app_snapshot(trace_history=second_history),
+        selected,
+        previous=previous,
+    )
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+    print(f"\nчат 15: 120 линий, инкрементальный UI-такт {elapsed_ms:.2f} мс")
+    assert len(current.traces) == 120
+    assert current.seq_start == tail and current.seq_stop == frames + tail
+    assert elapsed_ms < 100.0
 
 
 # --------------------------------------------------------------------------------------

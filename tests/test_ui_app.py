@@ -16,11 +16,12 @@ from pathlib import Path
 
 import pytest
 
+from fbg.core.calibration import Sensor, SensorType
 from fbg.core.endpoint import Endpoint
 from fbg.core.pipeline import PipelineConfig, RingHistory
 from fbg.core.profile import DeviceProfile
 from fbg.core.session import Result, SessionConfig, SessionState
-from fbg.io.config import AppConfig, load
+from fbg.io.config import AppConfig, load, save_sensors
 from fbg.io.packet_log import Direction, PacketLogConfig
 from fbg.io.recorder import RecorderConfig
 from fbg.sim.device_sim import DeviceSimulator
@@ -86,6 +87,7 @@ class Rig:
             pipeline=PipelineConfig(history_frames=512),
             recorder=RecorderConfig(directory=tmp_path / "data"),
             packet_log=PacketLogConfig(directory=None),
+            calibration_path=tmp_path / "sensors.json",
         )
         self.controller = AppController(config, config_path=config_path)
         self.controller.start()
@@ -161,6 +163,79 @@ def test_снимок_не_содержит_живых_объектов_ядра
     values = vars(snapshot).values()
     assert not any(isinstance(value, RingHistory) for value in values)
     assert not any(hasattr(value, "on_telemetry") for value in values)
+
+
+def _temperature_sensor(sensor_id: str = "T1", *, expected_nm: float = 1545.0) -> Sensor:
+    return Sensor(
+        id=sensor_id,
+        name="Температура",
+        channel=0,
+        type=SensorType.TEMPERATURE,
+        expected_nm=expected_nm,
+        window_nm=0.20,
+        value0=25.0,
+        k1=100.0,
+    )
+
+
+def test_контроллер_загружает_датчики_при_старте(tmp_path: Path) -> None:
+    """Слой калибровки действительно подключён, а не остаётся мёртвым модулем."""
+    calibration_path = tmp_path / "sensors.json"
+    saved = (_temperature_sensor(),)
+    save_sensors(saved, calibration_path)
+    controller = AppController(
+        AppConfig(
+            calibration_path=calibration_path,
+            packet_log=PacketLogConfig(directory=None),
+        )
+    )
+    try:
+        assert controller.sensors == saved
+        assert controller.snapshot(include_sensor_data=False).sensors == saved
+    finally:
+        controller.shutdown()
+
+
+def test_датчики_считаются_только_когда_их_просит_ui(tmp_path: Path) -> None:
+    """Р75: 2 кГц тракт не калибрует; расчёт делает snapshot панели датчиков."""
+    calibration_path = tmp_path / "sensors.json"
+    save_sensors((_temperature_sensor(),), calibration_path)
+    stand = Rig(tmp_path)
+    # Rig создаёт свой путь; явно заменяем набор тем же публичным методом.
+    stand.controller.replace_sensors((_temperature_sensor(),))
+    try:
+        assert stand.controller.connect().ok
+        assert stand.controller.start_stream().ok
+        assert wait_until(lambda: stand.controller.pipeline.sequence >= 5)
+        before = stand.controller._sensor_last_ui_seq
+
+        hidden = stand.controller.snapshot(include_sensor_data=False)
+        assert hidden.sensor_readings == () and hidden.sensor_history is None
+        assert stand.controller._sensor_last_ui_seq == before
+
+        visible = stand.controller.snapshot(include_sensor_data=True)
+        assert len(visible.sensor_readings) == 1
+        assert visible.sensor_readings[0].value == pytest.approx(25.0, abs=0.5)
+        assert visible.sensor_history is not None and visible.sensor_history.frames == 1
+        same = stand.controller.snapshot(include_sensor_data=True)
+        assert same.sensor_history is not None and same.sensor_history.frames == 1
+    finally:
+        stand.close()
+
+
+def test_сохранение_датчика_проверяет_пересечение_окон(rig: Rig) -> None:
+    """Невалидный набор не попадает ни в память, ни в sensors.json."""
+    first = _temperature_sensor("A", expected_nm=1545.0)
+    rig.controller.replace_sensors((first,))
+    path = rig.controller.config.calibration_path
+    before = path.read_text(encoding="utf-8")
+    overlapping = _temperature_sensor("B", expected_nm=1545.1)
+
+    with pytest.raises(ValueError, match="пересекаются"):
+        rig.controller.upsert_sensor(overlapping)
+
+    assert rig.controller.sensors == (first,)
+    assert path.read_text(encoding="utf-8") == before
 
 
 # --------------------------------------------------------------------------------------
@@ -597,8 +672,10 @@ def test_спектр_во_время_потока_полностью_перез
     assert rig.controller.start_stream().ok
     assert wait_until(lambda: rig.controller.session.stats().telemetry_frames > 3)
     before = rig.controller.session.stats().telemetry_frames
+    before_version = rig.controller.snapshot().spectrum_version
     spectrum = rig.controller.take_spectrum(0, 3000).unwrap()
     assert spectrum.adc.size == rig.controller.config.profile.adc_points
+    assert rig.controller.snapshot().spectrum_version == before_version + 1
     assert rig.controller.session.state is SessionState.STREAMING
     assert wait_until(lambda: rig.controller.session.stats().telemetry_frames > before)
     snap = rig.controller.snapshot()
@@ -656,6 +733,33 @@ def test_спектр_во_время_записи_запрещён(rig: Rig) ->
             rig.controller.take_spectrum(0, 3000)
     finally:
         rig.controller.stop_recording()
+
+
+def test_фактический_период_continuous_измеряется_по_завершённым_циклам(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """KB_05 №38: UI получает факт, а не обратную величину заданного периода."""
+    rig.controller.connect().unwrap()
+    completed = 0
+
+    def slow_take(_channel: int, _threshold_adc: int = 3000) -> Result[None]:
+        nonlocal completed
+        time.sleep(0.05)
+        completed += 1
+        return Result(value=None)
+
+    monkeypatch.setattr(rig.controller, "take_spectrum", slow_take)
+    assert rig.controller.start_spectrum_continuous(0, 0.01, 3000)
+    assert wait_until(lambda: completed >= 3, timeout=2.0)
+    assert wait_until(
+        lambda: rig.controller.snapshot().spectrum_actual_period_s is not None, timeout=1.0
+    )
+    actual = rig.controller.snapshot().spectrum_actual_period_s
+    rig.controller.stop_spectrum_continuous()
+
+    assert actual is not None
+    assert actual >= 0.045
+    assert actual > rig.controller.snapshot().spectrum_period_s * 3
 
 
 def test_непрерывный_спектр_делает_несколько_снимков_без_наложения(rig: Rig) -> None:

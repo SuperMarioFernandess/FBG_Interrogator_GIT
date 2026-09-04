@@ -1,9 +1,18 @@
 """Калибровка датчиков: длина волны → физическая величина.
 
-Модель взята из штатного ПО производителя (KB_01, раздел «Штатное ПО», таблица
-`FBGInfo` в `SensorCoef.mdb`)::
+Рабочая модель приложения записана относительно физически осмысленной
+опорной точки::
 
-    значение = Coeff0 + Coeff1·λ + Coeff2·λ²
+    значение = значение₀ + k₁·(λ − λ₀) + k₂·(λ − λ₀)²
+
+Здесь `λ₀` — `Sensor.expected_nm`: та же длина волны, вокруг которой датчик
+ищется в кадре. Для температурной решётки это даёт коэффициенты порядка
+`25 °C`, `100 °C/нм`, `0`, а не разность двух чисел порядка 150 тысяч.
+
+Это также ближе к разобранной структуре штатного ПО: в `FBGInfo` поле
+`Coeff0` оказалось длиной волны, а не свободным членом абсолютного полинома
+(N23). Точная семантика вендорских `Coeff1`/`Coeff2` всё ещё не доказана;
+новая форма — решение нашего приложения, а не утверждение о формуле вендора.
 
 плюс температурная компенсация со ссылкой на другой датчик, плюс пределы
 `UpLimit` / `DownLimit`, плюс тип датчика из десяти.
@@ -83,7 +92,8 @@
 полей `TC_Coff` и `TC_Base`, самого выражения ни в одном источнике нет
 (вопрос N22 в KB_04). Здесь принято::
 
-    значение = Coeff0 + Coeff1·λ + Coeff2·λ² + TC_Coff · (опорное − TC_Base)
+    значение = значение₀ + k₁·(λ − λ₀) + k₂·(λ − λ₀)²
+               + TC_Coff · (опорное − TC_Base)
 
 Знак выбран «плюс», и это не догадка о вендоре, а решение сделать догадку
 ненужной: `TC_Coff` — знаковое число, которое вводит пользователь, поэтому
@@ -154,6 +164,41 @@ class ReadingStatus(StrEnum):
     """Значение посчитано, но вышло за `up_limit` / `down_limit`."""
 
 
+class FitKind(StrEnum):
+    """Форма подгонки опорных точек."""
+
+    LINEAR = "linear"
+    QUADRATIC = "quadratic"
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationPoint:
+    """Одна воспроизводимая опорная точка калибровки."""
+
+    wavelength_nm: float
+    value: float
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.wavelength_nm) or self.wavelength_nm <= 0.0:
+            raise ValueError("wavelength_nm опорной точки должна быть положительной")
+        if not math.isfinite(self.value):
+            raise ValueError("value опорной точки должно быть конечным")
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationFit:
+    """Результат подгонки относительно выбранного `reference_nm`."""
+
+    kind: FitKind
+    reference_nm: float
+    value0: float
+    k1: float
+    k2: float
+    rms: float
+    max_abs_residual: float
+    points: int
+
+
 @dataclass(frozen=True)
 class TempCompensation:
     """Температурная компенсация со ссылкой на другой датчик набора.
@@ -193,14 +238,22 @@ class Sensor:
     type: SensorType
 
     expected_nm: float
-    """Центр окна поиска: длина волны решётки при калибровке."""
+    """Центр окна поиска и одновременно `λ₀` калибровочной кривой."""
 
     window_nm: float
     """Полуширина окна поиска. Рабочий диапазон датчика, не разброс решётки."""
 
-    c0: float = 0.0
-    c1: float = 0.0
-    c2: float = 0.0
+    value0: float = 0.0
+    """Физическая величина при `λ = expected_nm`."""
+
+    k1: float = 0.0
+    """Линейная чувствительность: единиц величины на нм."""
+
+    k2: float = 0.0
+    """Квадратичный член: единиц величины на нм²."""
+
+    calibration_points: tuple[CalibrationPoint, ...] = ()
+    """Сохранённые исходные точки, из которых получены коэффициенты."""
 
     up_limit: float | None = None
     down_limit: float | None = None
@@ -217,7 +270,11 @@ class Sensor:
             raise ValueError(f"{self.id}: expected_nm={self.expected_nm} должна быть положительной")
         if not math.isfinite(self.window_nm) or self.window_nm <= 0:
             raise ValueError(f"{self.id}: window_nm={self.window_nm} должно быть положительным")
-        for name, value in (("c0", self.c0), ("c1", self.c1), ("c2", self.c2)):
+        for name, value in (
+            ("value0", self.value0),
+            ("k1", self.k1),
+            ("k2", self.k2),
+        ):
             if not math.isfinite(value):
                 raise ValueError(f"{self.id}: коэффициент {name}={value} должен быть конечным")
         if (
@@ -310,13 +367,56 @@ def match_peak(
 
 
 def apply_curve(sensor: Sensor, wavelength_nm: float) -> float:
-    """Полином `c0 + c1·λ + c2·λ²` без компенсации и без проверки пределов.
+    """Кривая относительно опоры без компенсации и без проверки пределов.
 
     `NaN` на входе даёт `NaN` на выходе: правило KB_05 №7 действует и здесь.
     """
     if not math.isfinite(wavelength_nm):
         return math.nan
-    return sensor.c0 + sensor.c1 * wavelength_nm + sensor.c2 * wavelength_nm * wavelength_nm
+    delta_nm = wavelength_nm - sensor.expected_nm
+    return sensor.value0 + sensor.k1 * delta_nm + sensor.k2 * delta_nm * delta_nm
+
+
+def fit_calibration(
+    points: Sequence[CalibrationPoint],
+    reference_nm: float,
+    *,
+    kind: FitKind = FitKind.LINEAR,
+) -> CalibrationFit:
+    """Подгоняет сохранённые точки в координате `(λ − reference_nm)`.
+
+    Прямая — рабочий вариант по умолчанию и требует минимум две точки.
+    Парабола разрешена только от **четырёх** точек: три точки определяют её
+    точно и дают нулевую невязку по построению, что выглядит как проверенная
+    идеальная калибровка, хотя проверено ничего не было (KB_05 №39).
+    """
+    if not math.isfinite(reference_nm) or reference_nm <= 0.0:
+        raise ValueError("reference_nm должна быть положительной")
+    required = 4 if kind is FitKind.QUADRATIC else 2
+    if len(points) < required:
+        name = "параболы" if kind is FitKind.QUADRATIC else "прямой"
+        raise ValueError(f"для {name} нужно не менее {required} опорных точек")
+
+    wavelengths = np.fromiter((point.wavelength_nm for point in points), dtype=np.float64)
+    values = np.fromiter((point.value for point in points), dtype=np.float64)
+    x = wavelengths - reference_nm
+    degree = 2 if kind is FitKind.QUADRATIC else 1
+    required_distinct = degree + 1
+    if np.unique(wavelengths).size < required_distinct:
+        raise ValueError(
+            f"для подгонки степени {degree} нужно не менее {required_distinct} различных длин волн"
+        )
+    coefficients = np.polyfit(x, values, degree)
+    if degree == 2:
+        k2, k1, value0 = (float(value) for value in coefficients)
+    else:
+        k1, value0 = (float(value) for value in coefficients)
+        k2 = 0.0
+    predicted = value0 + k1 * x + k2 * x * x
+    residual = values - predicted
+    rms = float(np.sqrt(np.mean(residual * residual)))
+    max_abs = float(np.max(np.abs(residual)))
+    return CalibrationFit(kind, reference_nm, value0, k1, k2, rms, max_abs, len(points))
 
 
 def _classify_limits(sensor: Sensor, value: float) -> ReadingStatus:
@@ -477,9 +577,13 @@ def sensor_to_json(sensor: Sensor) -> dict[str, object]:
         "type": int(sensor.type),
         "expected_nm": sensor.expected_nm,
         "window_nm": sensor.window_nm,
-        "c0": sensor.c0,
-        "c1": sensor.c1,
-        "c2": sensor.c2,
+        "value0": sensor.value0,
+        "k1": sensor.k1,
+        "k2": sensor.k2,
+        "calibration_points": [
+            {"wavelength_nm": point.wavelength_nm, "value": point.value}
+            for point in sensor.calibration_points
+        ],
     }
     if sensor.up_limit is not None:
         data["up_limit"] = sensor.up_limit
@@ -517,6 +621,13 @@ def sensor_from_json(source: Mapping[str, object]) -> Sensor:
     калибровок правят руками, и одна испорченная запись не должна отменять
     остальные.
     """
+    legacy = sorted({"c0", "c1", "c2"}.intersection(source))
+    if legacy:
+        raise ValueError(
+            "устаревшая абсолютная форма калибровки "
+            f"({', '.join(legacy)}); автоматическая миграция не выполняется"
+        )
+
     raw_id = source.get("id")
     if not isinstance(raw_id, str) or not raw_id:
         raise ValueError(f"поле 'id': ожидалась непустая строка, получено {raw_id!r}")
@@ -556,6 +667,21 @@ def sensor_from_json(source: Mapping[str, object]) -> Sensor:
             base=_number(raw_comp, "base", 0.0),
         )
 
+    calibration_points: tuple[CalibrationPoint, ...] = ()
+    raw_points = source.get("calibration_points", [])
+    if not isinstance(raw_points, list):
+        raise ValueError(f"{raw_id}: поле 'calibration_points' должно быть массивом")
+    parsed_points: list[CalibrationPoint] = []
+    for index, raw_point in enumerate(raw_points):
+        if not isinstance(raw_point, Mapping):
+            raise ValueError(f"{raw_id}: calibration_points[{index}] должно быть объектом")
+        wavelength_nm = _optional_number(raw_point, "wavelength_nm")
+        value = _optional_number(raw_point, "value")
+        if wavelength_nm is None or value is None:
+            raise ValueError(f"{raw_id}: calibration_points[{index}] требует wavelength_nm и value")
+        parsed_points.append(CalibrationPoint(wavelength_nm, value))
+    calibration_points = tuple(parsed_points)
+
     return Sensor(
         id=raw_id,
         name=raw_name,
@@ -563,9 +689,10 @@ def sensor_from_json(source: Mapping[str, object]) -> Sensor:
         type=sensor_type,
         expected_nm=expected,
         window_nm=window,
-        c0=_number(source, "c0", 0.0),
-        c1=_number(source, "c1", 0.0),
-        c2=_number(source, "c2", 0.0),
+        value0=_number(source, "value0", 0.0),
+        k1=_number(source, "k1", 0.0),
+        k2=_number(source, "k2", 0.0),
+        calibration_points=calibration_points,
         up_limit=_optional_number(source, "up_limit"),
         down_limit=_optional_number(source, "down_limit"),
         compensation=compensation,
