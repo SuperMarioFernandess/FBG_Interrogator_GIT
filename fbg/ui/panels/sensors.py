@@ -530,7 +530,7 @@ class SensorsPanel(QWidget):
     def _add_point(self) -> None:
         try:
             point = CalibrationPoint(self._selected_peak(), self.known_value_spin.value())
-            self._set_points(self._points() + (point,))
+            self._set_points((*self._points(), point))
         except ValueError as exc:
             self._controller.note(f"опорная точка не добавлена: {exc}")
 
