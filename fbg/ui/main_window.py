@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 
 from PySide6.QtCore import QTimer
@@ -204,10 +205,8 @@ class MainWindow(QMainWindow):
                 panel.reset_layout()
             self.ui_period_spin.setValue(DEFAULT_UI_PERIOD_MS)
             self.set_layout_locked(False)
-            try:
+            with contextlib.suppress(OSError):
                 quarantine_layout(path)
-            except OSError:
-                pass
             self._controller.note(f"{texts.LAYOUT_LOAD_FAILED} {exc}")
 
     def reset_layout(self) -> None:
