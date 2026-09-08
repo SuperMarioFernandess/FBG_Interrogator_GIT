@@ -11,6 +11,7 @@ import math
 import threading
 from pathlib import Path
 
+import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -24,7 +25,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
-    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTreeWidget,
@@ -43,13 +43,16 @@ from fbg.core.calibration import (
 from fbg.io.recalibrate import RecalibrationResult, recalibrate_recording
 from fbg.ui import models, texts
 from fbg.ui.app import AppController
+from fbg.ui.docking import DockTab, scrollable
 from fbg.ui.models import AppSnapshot, SensorPanelModel
 
 _SENSOR_ID_ROLE = Qt.ItemDataRole.UserRole
 
 
-class SensorsPanel(QWidget):
+class SensorsPanel(DockTab):
     """Редактор датчиков и оперативные графики физических величин."""
+
+    layout_key = "sensors"
 
     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -88,9 +91,11 @@ class SensorsPanel(QWidget):
         self.channel_combo = QComboBox()
         for channel in range(profile.channels):
             self.channel_combo.addItem(texts.channel_label(channel), str(channel))
+        self.channel_combo.setMaximumWidth(180)
         self.type_combo = QComboBox()
         for sensor_type in SensorType:
             self.type_combo.addItem(sensor_type.name, str(int(sensor_type)))
+        self.type_combo.setMaximumWidth(180)
 
         self.expected_spin = self._nm_spin()
         self.window_spin = QDoubleSpinBox()
@@ -121,11 +126,15 @@ class SensorsPanel(QWidget):
         self.fit_residual = QLabel(texts.UNKNOWN)
 
         self.value_plot = pg.PlotWidget()
+        self.value_plot.setMinimumHeight(220)
+        self.value_plot.hide()
         self.value_plot.setLabel("bottom", "Время, с")
         self.value_plot.showGrid(x=True, y=True, alpha=0.2)
         self.value_plot.addLegend()
         self.value_plot.setDownsampling(auto=True, mode="peak")
         self.value_plot.setClipToView(True)
+        self.empty_graph_label = QLabel(texts.EMPTY_GRAPH_HINT)
+        self.empty_graph_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.map_channel = QComboBox()
         for channel in range(profile.channels):
@@ -154,6 +163,7 @@ class SensorsPanel(QWidget):
         spin.setDecimals(6)
         spin.setRange(1000.0, 2000.0)
         spin.setValue(1550.0)
+        spin.setMaximumWidth(180)
         return spin
 
     @staticmethod
@@ -161,6 +171,7 @@ class SensorsPanel(QWidget):
         spin = QDoubleSpinBox()
         spin.setDecimals(9)
         spin.setRange(-1.0e12, 1.0e12)
+        spin.setMaximumWidth(180)
         return spin
 
     def _build_layout(self) -> None:
@@ -170,11 +181,14 @@ class SensorsPanel(QWidget):
         list_buttons = QHBoxLayout()
         list_buttons.addWidget(self.new_button)
         list_buttons.addWidget(self.delete_button)
+        list_buttons.addWidget(self.recalibrate_button)
+        list_buttons.addStretch(1)
         list_layout = QVBoxLayout()
         list_layout.addLayout(list_form)
         list_layout.addWidget(self.sensor_tree, 1)
         list_layout.addLayout(list_buttons)
-        list_box = QGroupBox(texts.GROUP_SENSOR_LIST)
+        list_layout.addWidget(self.recalibrate_state)
+        list_box = QWidget()
         list_box.setLayout(list_layout)
 
         editor_form = QFormLayout()
@@ -226,15 +240,10 @@ class SensorsPanel(QWidget):
         editor_layout.addWidget(editor_box)
         editor_layout.addWidget(cal_box, 1)
 
-        top = QSplitter(Qt.Orientation.Horizontal)
-        top.addWidget(list_box)
-        top.addWidget(editor_column)
-        top.setStretchFactor(0, 1)
-        top.setStretchFactor(1, 1)
-
         graph_layout = QVBoxLayout()
+        graph_layout.addWidget(self.empty_graph_label, 1)
         graph_layout.addWidget(self.value_plot)
-        graph_box = QGroupBox(texts.GROUP_SENSOR_GRAPH)
+        graph_box = QWidget()
         graph_box.setLayout(graph_layout)
 
         map_form = QFormLayout()
@@ -243,23 +252,56 @@ class SensorsPanel(QWidget):
         map_layout.addLayout(map_form)
         map_layout.addWidget(self.peak_map)
         map_layout.addWidget(self.peak_map_hint)
-        map_box = QGroupBox(texts.GROUP_PEAK_MAP)
+        map_box = QWidget()
         map_box.setLayout(map_layout)
 
-        plots = QSplitter(Qt.Orientation.Horizontal)
-        plots.addWidget(graph_box)
-        plots.addWidget(map_box)
+        self.list_dock = self.add_panel_dock(
+            texts.GROUP_SENSOR_LIST,
+            list_box,
+            "sensors.list",
+            Qt.DockWidgetArea.LeftDockWidgetArea,
+        )
+        self.editor_dock = self.add_panel_dock(
+            texts.GROUP_SENSOR_EDITOR,
+            scrollable(editor_column),
+            "sensors.editor",
+            Qt.DockWidgetArea.RightDockWidgetArea,
+        )
+        self.graph_dock = self.add_panel_dock(
+            texts.GROUP_SENSOR_GRAPH,
+            graph_box,
+            "sensors.graph",
+            Qt.DockWidgetArea.LeftDockWidgetArea,
+        )
+        self.map_dock = self.add_panel_dock(
+            texts.GROUP_PEAK_MAP,
+            map_box,
+            "sensors.map",
+            Qt.DockWidgetArea.RightDockWidgetArea,
+        )
+        self.reset_layout()
 
-        reprocess_layout = QHBoxLayout()
-        reprocess_layout.addWidget(self.recalibrate_button)
-        reprocess_layout.addWidget(self.recalibrate_state, 1)
-        reprocess_box = QGroupBox(texts.GROUP_RECALIBRATION)
-        reprocess_box.setLayout(reprocess_layout)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(top, 3)
-        layout.addWidget(plots, 2)
-        layout.addWidget(reprocess_box)
+    def _apply_default_splits(self) -> None:
+        self.splitDockWidget(
+            self.list_dock,
+            self.graph_dock,
+            Qt.Orientation.Vertical,
+        )
+        self.splitDockWidget(
+            self.editor_dock,
+            self.map_dock,
+            Qt.Orientation.Vertical,
+        )
+        self.resizeDocks(
+            [self.list_dock, self.editor_dock],
+            [500, 550],
+            Qt.Orientation.Horizontal,
+        )
+        self.resizeDocks(
+            [self.list_dock, self.graph_dock],
+            [400, 280],
+            Qt.Orientation.Vertical,
+        )
 
     def _connect_signals(self) -> None:
         self.filter_edit.textChanged.connect(lambda _text: self._refresh_from_controller())
@@ -295,6 +337,7 @@ class SensorsPanel(QWidget):
             if item.checkState(0) == Qt.CheckState.Checked
         }
         selected = self._editing_id
+        scroll = self.sensor_tree.verticalScrollBar().value()
         self.sensor_tree.blockSignals(True)
         try:
             self.sensor_tree.clear()
@@ -320,6 +363,7 @@ class SensorsPanel(QWidget):
                     item.setSelected(True)
             for group in groups.values():
                 group.setExpanded(True)
+            self.sensor_tree.verticalScrollBar().setValue(scroll)
         finally:
             self.sensor_tree.blockSignals(False)
         self._update_tree_values(model)
@@ -573,6 +617,8 @@ class SensorsPanel(QWidget):
             if sensor_id not in selected_set:
                 self.value_plot.removeItem(self._curves.pop(sensor_id))
         if history is None or history.frames == 0:
+            self.value_plot.hide()
+            self.empty_graph_label.show()
             return
         columns = {sensor_id: index for index, sensor_id in enumerate(history.sensor_ids)}
         t_s = history.t_mono - history.t_mono[-1]
@@ -587,6 +633,13 @@ class SensorsPanel(QWidget):
                 )
                 self._curves[sensor_id] = curve
             curve.setData(t_s, history.values[:, column], connect="finite")
+        has_data = bool(selected) and any(
+            column is not None and np.any(np.isfinite(history.values[:, column]))
+            for sensor_id in selected
+            for column in (columns.get(sensor_id),)
+        )
+        self.value_plot.setVisible(has_data)
+        self.empty_graph_label.setVisible(not has_data)
 
     def _update_peak_map(self, *, force: bool = False) -> None:
         model = self._last_model

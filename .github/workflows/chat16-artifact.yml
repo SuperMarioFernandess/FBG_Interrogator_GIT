@@ -1,0 +1,19 @@
+name: Chat16 mbox artifact
+
+on:
+  push:
+    branches: [chat16-clean-export]
+  workflow_dispatch:
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: chat16-clean-export
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chat16-layout-mbox
+          path: .chat16-output/chat16_layout.mbox
+          if-no-files-found: error

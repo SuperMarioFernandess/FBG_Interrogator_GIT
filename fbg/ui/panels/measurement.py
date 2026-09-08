@@ -2,7 +2,7 @@
 
 UI получает данные только через `AppSnapshot`. Историю графика копирует сам
 pipeline по запросу выбранных позиций; `RingHistory` сюда не попадает (Р36).
-Один таймер главного окна обновляет панель 10 раз в секунду — никаких сигналов
+Один общий таймер главного окна (по умолчанию 10 Гц) обновляет панель — никаких сигналов
 на каждый кадр и никакого файлового I/O в колбэках ядра.
 """
 
@@ -16,13 +16,12 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QPushButton,
     QSpinBox,
-    QSplitter,
     QTableView,
     QTreeWidget,
     QTreeWidgetItem,
@@ -33,6 +32,7 @@ from PySide6.QtWidgets import (
 from fbg.core.session import SessionState
 from fbg.ui import models, texts
 from fbg.ui.app import AppController
+from fbg.ui.docking import DockTab
 from fbg.ui.models import AppSnapshot, MeasurementTableModel, SlotRef
 
 #: Дефолт не означает «датчики 1–4». Это четыре первых **слота** канала 1,
@@ -51,8 +51,9 @@ Y_RANGE_RECALC_TICKS = 10
 class _MeasurementQtTableModel(QAbstractTableModel):
     """Qt-обёртка над неизменяемой моделью последнего кадра.
 
-    Обновление — один `modelReset` на весь кадр, а не 240 `dataChanged` по
-    ячейкам. Это и есть требуемое обновление «целиком» 10 Гц.
+    При неизменной геометрии кадр подменяется одним ``dataChanged`` на весь
+    диапазон значений. ``modelReset`` оставлен только для реальной смены
+    числа каналов/позиций: иначе прокрутка и выделение слетали бы 10 раз/с.
     """
 
     def __init__(self, model: MeasurementTableModel, parent: QWidget | None = None) -> None:
@@ -64,10 +65,27 @@ class _MeasurementQtTableModel(QAbstractTableModel):
         return self._model
 
     def replace(self, model: MeasurementTableModel) -> None:
-        """Подменяет кадр одним сигналом модели."""
-        self.beginResetModel()
+        """Подменяет кадр без сброса таблицы при неизменной геометрии.
+
+        ``modelReset`` десять раз в секунду сбрасывает выделение и прокрутку.
+        Геометрия 4×30 меняется только при принятии другого профиля; обычный
+        кадр поэтому обновляется одним ``dataChanged``.
+        """
+        same_shape = (
+            self._model.channels == model.channels and self._model.positions == model.positions
+        )
+        if not same_shape:
+            self.beginResetModel()
+            self._model = model
+            self.endResetModel()
+            return
         self._model = model
-        self.endResetModel()
+        if self.rowCount() and self.columnCount() > 1:
+            self.dataChanged.emit(
+                self.index(0, 1),
+                self.index(self.rowCount() - 1, self.columnCount() - 1),
+                [Qt.ItemDataRole.DisplayRole],
+            )
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: B008, N802
         if parent.isValid():
@@ -77,7 +95,7 @@ class _MeasurementQtTableModel(QAbstractTableModel):
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: B008, N802
         if parent.isValid():
             return 0
-        return 1 + 2 * self._model.channels
+        return 1 + self._model.channels
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> object:
         if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
@@ -86,14 +104,7 @@ class _MeasurementQtTableModel(QAbstractTableModel):
         column = index.column()
         if column == 0:
             return str(row + 1)
-        channel = (column - 1) // 2
-        validity_column = (column - 1) % 2 == 1
-        if validity_column:
-            return (
-                texts.TABLE_VALID_YES
-                if bool(self._model.valid[channel, row])
-                else texts.TABLE_VALID_NO
-            )
+        channel = column - 1
         value = float(self._model.wavelength_nm[channel, row])
         return texts.UNKNOWN if not self._model.valid[channel, row] else f"{value:.4f}"
 
@@ -109,13 +120,14 @@ class _MeasurementQtTableModel(QAbstractTableModel):
             return str(section + 1)
         if section == 0:
             return texts.TABLE_POSITION
-        channel = (section - 1) // 2
-        suffix = texts.TABLE_VALID if (section - 1) % 2 else texts.TABLE_WAVELENGTH
-        return f"К{channel + 1} {suffix}"
+        channel = section - 1
+        return f"К{channel + 1} {texts.TABLE_WAVELENGTH}"
 
 
-class MeasurementPanel(QWidget):
+class MeasurementPanel(DockTab):
     """График выбранных слотов, таблица 4×30 и запись CSV."""
+
+    layout_key = "measurement"
 
     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -136,8 +148,10 @@ class MeasurementPanel(QWidget):
         self.history_spin.setSingleStep(0.5)
         self.history_spin.setRange(MIN_HISTORY_S, 86_400.0)
         self.history_spin.setValue(5.0)
+        self.history_spin.setMaximumWidth(140)
 
         self.plot = pg.PlotWidget()
+        self.plot.setMinimumHeight(220)
         # Длинная история графика измерения прореживается **только при
         # отрисовке**. `peak` сохраняет краткие выбросы; `mean` здесь нельзя —
         # он усреднил бы пропавший на один кадр пик. Исходные точки остаются
@@ -150,6 +164,8 @@ class MeasurementPanel(QWidget):
         self.plot.addLegend()
         self.graph_hint = QLabel(texts.GRAPH_BASELINE_HINT)
         self.graph_hint.setWordWrap(True)
+        self.empty_graph_label = QLabel(texts.EMPTY_GRAPH_HINT)
+        self.empty_graph_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.quality_label = QLabel()
 
         empty_table = models.measurement_table_model(controller.snapshot())
@@ -159,6 +175,9 @@ class MeasurementPanel(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setSortingEnabled(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.temperature_label = QLabel()
         self.temperature_label.setWordWrap(True)
 
@@ -166,9 +185,11 @@ class MeasurementPanel(QWidget):
         self.browse_button = QPushButton(texts.BUTTON_BROWSE_DIRECTORY)
         self.record_decimation = QSpinBox()
         self.record_decimation.setRange(1, 100_000)
+        self.record_decimation.setMaximumWidth(140)
         self.record_limit = QSpinBox()
         self.record_limit.setRange(0, profile.fbg_per_channel)
         self.record_limit.setSpecialValueText(texts.RECORD_LIMIT_ALL)
+        self.record_limit.setMaximumWidth(140)
         self.record_estimate = QLabel()
         self.record_estimate.setWordWrap(True)
         self.record_state = QLabel()
@@ -222,26 +243,21 @@ class MeasurementPanel(QWidget):
         selection_layout = QVBoxLayout()
         selection_layout.addLayout(selection_form)
         selection_layout.addWidget(self.trace_tree, 1)
-        selection_box = QGroupBox(texts.GROUP_TRACE_SELECTION)
+        selection_box = QWidget()
         selection_box.setLayout(selection_layout)
 
         graph_layout = QVBoxLayout()
         graph_layout.addWidget(self.quality_label)
+        graph_layout.addWidget(self.empty_graph_label, 1)
         graph_layout.addWidget(self.plot, 1)
         graph_layout.addWidget(self.graph_hint)
-        graph_box = QGroupBox(texts.GROUP_MEASUREMENT_GRAPH)
+        graph_box = QWidget()
         graph_box.setLayout(graph_layout)
-
-        graph_split = QSplitter(Qt.Orientation.Horizontal)
-        graph_split.addWidget(selection_box)
-        graph_split.addWidget(graph_box)
-        graph_split.setStretchFactor(0, 0)
-        graph_split.setStretchFactor(1, 1)
 
         table_layout = QVBoxLayout()
         table_layout.addWidget(self.temperature_label)
         table_layout.addWidget(self.table, 1)
-        table_box = QGroupBox(texts.GROUP_MEASUREMENT_TABLE)
+        table_box = QWidget()
         table_box.setLayout(table_layout)
 
         directory_row = QHBoxLayout()
@@ -263,23 +279,56 @@ class MeasurementPanel(QWidget):
         record_buttons.addWidget(self.stop_record_button)
         record_form.addRow("", record_buttons)
         record_form.addRow("", self.record_error)
-        record_box = QGroupBox(texts.GROUP_RECORDING)
+        record_box = QWidget()
         record_box.setLayout(record_form)
 
-        lower_split = QSplitter(Qt.Orientation.Horizontal)
-        lower_split.addWidget(table_box)
-        lower_split.addWidget(record_box)
-        lower_split.setStretchFactor(0, 1)
-        lower_split.setStretchFactor(1, 0)
+        self.selection_dock = self.add_panel_dock(
+            texts.GROUP_TRACE_SELECTION,
+            selection_box,
+            "measurement.selection",
+            Qt.DockWidgetArea.LeftDockWidgetArea,
+        )
+        self.graph_dock = self.add_panel_dock(
+            texts.GROUP_MEASUREMENT_GRAPH,
+            graph_box,
+            "measurement.graph",
+            Qt.DockWidgetArea.RightDockWidgetArea,
+        )
+        self.table_dock = self.add_panel_dock(
+            texts.GROUP_MEASUREMENT_TABLE,
+            table_box,
+            "measurement.table",
+            Qt.DockWidgetArea.LeftDockWidgetArea,
+        )
+        self.record_dock = self.add_panel_dock(
+            texts.GROUP_RECORDING,
+            record_box,
+            "measurement.record",
+            Qt.DockWidgetArea.RightDockWidgetArea,
+        )
+        self.reset_layout()
 
-        outer_split = QSplitter(Qt.Orientation.Vertical)
-        outer_split.addWidget(graph_split)
-        outer_split.addWidget(lower_split)
-        outer_split.setStretchFactor(0, 1)
-        outer_split.setStretchFactor(1, 1)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(outer_split)
+    def _apply_default_splits(self) -> None:
+        self.splitDockWidget(
+            self.selection_dock,
+            self.table_dock,
+            Qt.Orientation.Vertical,
+        )
+        self.splitDockWidget(
+            self.graph_dock,
+            self.record_dock,
+            Qt.Orientation.Vertical,
+        )
+        self.resizeDocks(
+            [self.selection_dock, self.graph_dock],
+            [270, 780],
+            Qt.Orientation.Horizontal,
+        )
+        self.resizeDocks(
+            [self.graph_dock, self.record_dock],
+            [430, 250],
+            Qt.Orientation.Vertical,
+        )
 
     def _connect_signals(self) -> None:
         self.trace_tree.itemChanged.connect(self._on_trace_changed)
@@ -378,6 +427,13 @@ class MeasurementPanel(QWidget):
             self.graph_hint.setText(texts.GRAPH_NO_SELECTION + "\n" + texts.GRAPH_BASELINE_HINT)
         else:
             self.graph_hint.setText(texts.GRAPH_BASELINE_HINT)
+        has_data = (
+            bool(selected)
+            and model.t_s.size > 0
+            and any(trace.valid_points > 0 for trace in model.traces)
+        )
+        self.plot.setVisible(has_data)
+        self.empty_graph_label.setVisible(not has_data)
 
     # --- Таблица ---------------------------------------------------------------------
 
@@ -530,7 +586,7 @@ class MeasurementPanel(QWidget):
     # --- Общий такт ------------------------------------------------------------------
 
     def refresh(self, snapshot: AppSnapshot) -> None:
-        """Один такт 10 Гц: график, таблица и состояние записи целиком."""
+        """Один UI-такт: график, таблица и состояние записи целиком."""
         self._update_history_limit(snapshot)
         self._update_graph(snapshot)
         self._update_table(snapshot)

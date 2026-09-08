@@ -2,12 +2,13 @@
 
 import math
 
+import numpy as np
 import pyqtgraph as pg
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -21,11 +22,14 @@ from PySide6.QtWidgets import (
 from fbg.core.session import SessionState
 from fbg.ui import texts
 from fbg.ui.app import AppController
+from fbg.ui.docking import DockTab, scrollable
 from fbg.ui.models import AppSnapshot, SpectrumModel
 
 
-class SpectrumPanel(QWidget):
+class SpectrumPanel(DockTab):
     """Один канал 30 07 с возможностью периодического повторения."""
+
+    layout_key = "spectrum"
 
     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -36,16 +40,20 @@ class SpectrumPanel(QWidget):
         self.channel = QComboBox()
         for index in range(controller.config.profile.channels):
             self.channel.addItem(texts.channel_label(index), index)
+        self.channel.setMaximumWidth(180)
         self.period = QDoubleSpinBox()
         self.period.setDecimals(2)
         self.period.setRange(0.10, 3600.0)
         self.period.setValue(1.0)
+        self.period.setMaximumWidth(140)
         self.frequency_label = QLabel()
         self.threshold = QSpinBox()
         self.threshold.setRange(0, controller.config.profile.adc_max)
         self.threshold.setValue(3000)
+        self.threshold.setMaximumWidth(140)
         self.scale = QComboBox()
         self.scale.addItems([texts.SPECTRUM_SCALE_ADC, texts.SPECTRUM_SCALE_DBM])
+        self.scale.setMaximumWidth(140)
         self.take_button = QPushButton(texts.BUTTON_TAKE_SPECTRUM)
         self.start_button = QPushButton(texts.BUTTON_START_SPECTRUM)
         self.stop_button = QPushButton(texts.BUTTON_STOP_SPECTRUM)
@@ -55,6 +63,8 @@ class SpectrumPanel(QWidget):
         self.saturation_label = QLabel(texts.UNKNOWN)
         self.saturation_label.setWordWrap(True)
         self.plot = pg.PlotWidget()
+        self.plot.setMinimumHeight(240)
+        self.plot.hide()
         # Спектр — 2551 реальных ADC-отсчётов, по которым смотрят форму пика.
         # Прореживание здесь запрещено Р76: это не длинный временной ряд, и
         # downsampling превратил бы измеренную форму в огибающую.
@@ -62,6 +72,8 @@ class SpectrumPanel(QWidget):
         self.plot.setLabel("left", texts.SPECTRUM_SCALE_ADC)
         self.plot.showGrid(x=True, y=True, alpha=0.2)
         self.curve = self.plot.plot()
+        self.empty_graph_label = QLabel(texts.EMPTY_GRAPH_HINT)
+        self.empty_graph_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
             ["№", "Вершина, нм", "Центроид, нм", "ADC", "дБм", "Ширина, нм", "FWHM, нм", "Насыщено"]
@@ -88,24 +100,57 @@ class SpectrumPanel(QWidget):
         buttons.addWidget(self.take_button)
         buttons.addWidget(self.start_button)
         buttons.addWidget(self.stop_button)
-        control = QGroupBox(texts.GROUP_SPECTRUM_CONTROL)
+        control = QWidget()
         control_layout = QVBoxLayout()
         control_layout.addLayout(form)
         control_layout.addLayout(buttons)
         control_layout.addWidget(self.warning)
         control.setLayout(control_layout)
-        graph = QGroupBox(texts.GROUP_SPECTRUM_GRAPH)
+        graph = QWidget()
         graph_layout = QVBoxLayout()
         graph_layout.addWidget(self.plot)
         graph.setLayout(graph_layout)
-        regions = QGroupBox(texts.GROUP_SPECTRUM_REGIONS)
+        regions = QWidget()
         regions_layout = QVBoxLayout()
         regions_layout.addWidget(self.table)
         regions.setLayout(regions_layout)
-        layout = QVBoxLayout(self)
-        layout.addWidget(control)
-        layout.addWidget(graph, 1)
-        layout.addWidget(regions, 1)
+        graph_layout.insertWidget(0, self.empty_graph_label)
+        self.control_dock = self.add_panel_dock(
+            texts.GROUP_SPECTRUM_CONTROL,
+            scrollable(control),
+            "spectrum.control",
+            Qt.DockWidgetArea.LeftDockWidgetArea,
+        )
+        self.graph_dock = self.add_panel_dock(
+            texts.GROUP_SPECTRUM_GRAPH,
+            graph,
+            "spectrum.graph",
+            Qt.DockWidgetArea.RightDockWidgetArea,
+        )
+        self.regions_dock = self.add_panel_dock(
+            texts.GROUP_SPECTRUM_REGIONS,
+            regions,
+            "spectrum.regions",
+            Qt.DockWidgetArea.RightDockWidgetArea,
+        )
+        self.reset_layout()
+
+    def _apply_default_splits(self) -> None:
+        self.splitDockWidget(
+            self.graph_dock,
+            self.regions_dock,
+            Qt.Orientation.Vertical,
+        )
+        self.resizeDocks(
+            [self.control_dock, self.graph_dock],
+            [320, 730],
+            Qt.Orientation.Horizontal,
+        )
+        self.resizeDocks(
+            [self.graph_dock, self.regions_dock],
+            [430, 250],
+            Qt.Orientation.Vertical,
+        )
 
     def _update_frequency_label(self, period_s: float) -> None:
         requested_hz = 1.0 / period_s
@@ -146,6 +191,9 @@ class SpectrumPanel(QWidget):
         dbm = self.scale.currentText() == texts.SPECTRUM_SCALE_DBM
         y = model.power_dbm if dbm else model.adc
         self.curve.setData(model.wavelength_nm, y, connect="finite")
+        has_data = model.wavelength_nm.size > 0 and bool(np.any(np.isfinite(y)))
+        self.plot.setVisible(has_data)
+        self.empty_graph_label.setVisible(not has_data)
         self.plot.setLabel("left", texts.SPECTRUM_SCALE_DBM if dbm else texts.SPECTRUM_SCALE_ADC)
         self.max_label.setText(str(model.max_adc))
         if model.saturated:
@@ -156,6 +204,8 @@ class SpectrumPanel(QWidget):
             self.saturation_label.setText("нет")
         # Строки не пересоздаются без необходимости: иначе Qt сбрасывает
         # выделение и прокрутку таблицы на каждом тике даже при том же снимке.
+        selected_row = self.table.currentRow()
+        scroll = self.table.verticalScrollBar().value()
         if self.table.rowCount() != len(model.regions):
             self.table.setRowCount(len(model.regions))
         for row, region in enumerate(model.regions):
@@ -176,6 +226,9 @@ class SpectrumPanel(QWidget):
                     self.table.setItem(row, column, item)
                 if item.text() != value:
                     item.setText(value)
+        if 0 <= selected_row < self.table.rowCount():
+            self.table.selectRow(selected_row)
+        self.table.verticalScrollBar().setValue(scroll)
 
     def refresh(self, snapshot: AppSnapshot) -> None:
         """Один UI-такт: не опрашивает прибор, только показывает последний снимок."""

@@ -39,13 +39,18 @@ class DeviceConfigPanel(QWidget):
         self._gap_dirty = False
         self._sweep_dirty = False
 
+        self.write_warning = QLabel(texts.CONFIG_WRITE_WARNING)
+        self.write_warning.setWordWrap(True)
+        self.write_warning.setStyleSheet("font-weight: bold;")
         self.availability_label = QLabel()
         self.availability_label.setWordWrap(True)
 
         self.channel_box = QComboBox()
+        self.channel_box.setMaximumWidth(160)
         self.threshold_auto = QCheckBox(texts.LABEL_THRESHOLD_AUTO)
         self.threshold_spin = QSpinBox()
         self.threshold_spin.setRange(0, self._model.adc_max)
+        self.threshold_spin.setMaximumWidth(130)
         self.threshold_status = QLabel()
         self.threshold_hint = QLabel()
         self.threshold_hint.setWordWrap(True)
@@ -53,8 +58,10 @@ class DeviceConfigPanel(QWidget):
 
         self.gain_mode = QComboBox()
         self.gain_mode.addItems([texts.LABEL_GAIN_AUTO, texts.LABEL_GAIN_MANUAL])
+        self.gain_mode.setMaximumWidth(160)
         self.gain_level = QSpinBox()
         self.gain_level.setRange(0, self._model.gain_max_level)
+        self.gain_level.setMaximumWidth(130)
         self.gain_status = QLabel()
         self.gain_hint = QLabel()
         self.gain_hint.setWordWrap(True)
@@ -62,6 +69,7 @@ class DeviceConfigPanel(QWidget):
 
         self.peak_gap = QSpinBox()
         self.peak_gap.setRange(1, 0xFF)
+        self.peak_gap.setMaximumWidth(130)
         self.peak_gap_status = QLabel()
         self.apply_peak_gap_button = QPushButton(texts.BUTTON_APPLY_PEAK_GAP)
 
@@ -89,6 +97,7 @@ class DeviceConfigPanel(QWidget):
     def _u16_spin(*, minimum: int = 0) -> QSpinBox:
         spin = QSpinBox()
         spin.setRange(minimum, 0xFFFF)
+        spin.setMaximumWidth(130)
         return spin
 
     def _build_layout(self) -> None:
@@ -99,6 +108,7 @@ class DeviceConfigPanel(QWidget):
         threshold_row.addWidget(self.threshold_spin)
         threshold_row.addWidget(self.threshold_auto)
         threshold_row.addWidget(self.apply_threshold_button)
+        threshold_row.addStretch(1)
         channel_form.addRow(texts.LABEL_THRESHOLD, threshold_row)
         channel_form.addRow("", self.threshold_status)
         channel_form.addRow("", self.threshold_hint)
@@ -107,6 +117,7 @@ class DeviceConfigPanel(QWidget):
         gain_row = QHBoxLayout()
         gain_row.addWidget(self.gain_level)
         gain_row.addWidget(self.apply_gain_button)
+        gain_row.addStretch(1)
         channel_form.addRow(texts.LABEL_GAIN_LEVEL, gain_row)
         channel_form.addRow("", self.gain_status)
         channel_form.addRow("", self.gain_hint)
@@ -117,6 +128,7 @@ class DeviceConfigPanel(QWidget):
         gap_row = QHBoxLayout()
         gap_row.addWidget(self.peak_gap)
         gap_row.addWidget(self.apply_peak_gap_button)
+        gap_row.addStretch(1)
         gap_form.addRow(texts.LABEL_PEAK_GAP, gap_row)
         gap_form.addRow("", self.peak_gap_status)
         self.gap_group = QGroupBox(texts.GROUP_PEAK_GAP_CONFIG)
@@ -130,18 +142,25 @@ class DeviceConfigPanel(QWidget):
         sweep_form.addRow("", self.sweep_preview)
         sweep_form.addRow("", self.sweep_hint)
         sweep_form.addRow("", self.sweep_status)
-        sweep_form.addRow("", self.apply_sweep_button)
+        sweep_button_row = QHBoxLayout()
+        sweep_button_row.addWidget(self.apply_sweep_button)
+        sweep_button_row.addStretch(1)
+        sweep_form.addRow("", sweep_button_row)
         self.sweep_group = QGroupBox(texts.GROUP_SWEEP_CONFIG)
         self.sweep_group.setLayout(sweep_form)
 
         save_layout = QVBoxLayout()
-        save_layout.addWidget(self.save_button)
+        save_button_row = QHBoxLayout()
+        save_button_row.addWidget(self.save_button)
+        save_button_row.addStretch(1)
+        save_layout.addLayout(save_button_row)
         save_layout.addWidget(self.save_status)
         save_layout.addWidget(self.save_hint)
         self.save_group = QGroupBox(texts.GROUP_SAVE_THRESHOLDS)
         self.save_group.setLayout(save_layout)
 
         layout = QVBoxLayout(self)
+        layout.addWidget(self.write_warning)
         layout.addWidget(self.availability_label)
         layout.addWidget(self.channel_group)
         layout.addWidget(self.gap_group)
