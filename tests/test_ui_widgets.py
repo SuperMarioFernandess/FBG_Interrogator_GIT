@@ -149,9 +149,7 @@ def test_раскладка_сохраняется_и_восстанавлива
         controller.shutdown()
 
 
-def test_нечитаемая_раскладка_карантинится(
-    application: QApplication, tmp_path: Path
-) -> None:
+def test_нечитаемая_раскладка_карантинится(application: QApplication, tmp_path: Path) -> None:
     config_path = tmp_path / "fbg_config.json"
     layout_path = tmp_path / UI_LAYOUT_FILENAME
     layout_path.write_text("{broken", encoding="ascii")
