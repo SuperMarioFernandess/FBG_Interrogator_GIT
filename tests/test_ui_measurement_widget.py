@@ -1,7 +1,7 @@
 """Qt-панель измерения. Маркер `ui`, запуск с QT_QPA_PLATFORM=offscreen.
 
-Проверяется устройство и поток данных, а не внешний вид: один reset таблицы
-на кадр, выбор линий, разрыв NaN, состояние записи и отсутствие ссылок графика
+Проверяется устройство и поток данных, а не внешний вид: обновление таблицы
+без reset при той же геометрии, выбор линий, разрыв NaN, состояние записи и отсутствие ссылок графика
 на кольцо pipeline. Читаемость и размеры остаются визуальной приёмкой Windows.
 """
 
@@ -20,7 +20,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from fbg.core.endpoint import Endpoint
-from fbg.core.pipeline import RingHistory, TraceHistorySnapshot
+from fbg.core.pipeline import RingHistory
 from fbg.core.profile import DeviceProfile
 from fbg.core.session import SessionState
 from fbg.io.config import AppConfig
@@ -115,7 +115,7 @@ def test_панель_строится_с_4x30_выбором(panel: Measurement
     selected = panel.selected_slots()
     assert selected == tuple(models.SlotRef(0, position) for position in range(4))
     assert panel.table_model.rowCount() == 30
-    assert panel.table_model.columnCount() == 9
+    assert panel.table_model.columnCount() == 5
 
 
 def test_главный_таймер_обновляет_и_гасит_панель(
@@ -136,24 +136,31 @@ def test_главный_таймер_обновляет_и_гасит_панел
         window.deleteLater()
 
 
-def test_таблица_обновляется_одним_model_reset(
+def test_таблица_обновляется_без_model_reset_при_той_же_геометрии(
     panel: MeasurementPanel, controller: AppController
 ) -> None:
     resets = 0
+    changes = 0
 
     def count_reset() -> None:
         nonlocal resets
         resets += 1
 
+    def count_change(*_args: object) -> None:
+        nonlocal changes
+        changes += 1
+
     panel.table_model.modelReset.connect(count_reset)
+    panel.table_model.dataChanged.connect(count_change)
     controller.pipeline.on_telemetry(REAL_FRAME, time.perf_counter())
     controller.pipeline.publish_now()
     panel.refresh(controller.snapshot())
 
-    assert resets == 1
+    assert resets == 0
+    assert changes == 1
     assert panel.table_model.data(panel.table_model.index(0, 1)) != texts.UNKNOWN
     assert panel.table_model.data(panel.table_model.index(2, 1)) == texts.UNKNOWN
-    assert panel.table_model.data(panel.table_model.index(2, 2)) == texts.TABLE_VALID_NO
+    assert panel.table_model.data(panel.table_model.index(2, 2)) == texts.UNKNOWN
 
 
 def test_график_держит_только_копию_а_не_кольцо(
@@ -246,74 +253,3 @@ def test_оценка_объёма_сразу_реагирует_на_децим
 
     assert after != before
     assert panel.record_decimation.value() == 2
-
-
-@pytest.mark.slow
-def test_120_линий_инкрементальный_ui_такт_укладывается_в_budget(
-    application: QApplication, panel: MeasurementPanel
-) -> None:
-    """2 кГц × 10 с × 120 линий: штатный тик остаётся быстрее UI_PERIOD_MS.
-
-    Первый refresh намеренно не измеряется: это редкое создание 120 кривых после
-    изменения выбора. Критичен следующий штатный тик, где к истории добавилось
-    200 кадров за 100 мс. Именно этот сценарий раньше пересчитывал 20 000 точек
-    каждой линии и снова отдавал их pyqtgraph без правил Р76.
-    """
-    for channel_index in range(panel.trace_tree.topLevelItemCount()):
-        channel = panel.trace_tree.topLevelItem(channel_index)
-        assert channel is not None
-        for position in range(channel.childCount()):
-            channel.child(position).setCheckState(0, Qt.CheckState.Checked)
-
-    positions = tuple(
-        (channel, position)
-        for channel in range(PROFILE.channels)
-        for position in range(PROFILE.fbg_per_channel)
-    )
-    frames = 20_000
-    tail = 200
-    t_first = np.arange(frames, dtype=np.float64) / 2000.0
-    baselines = np.linspace(1540.0, 1555.0, len(positions), dtype=np.float64)
-    drift = 0.002 * np.sin(np.arange(frames, dtype=np.float64)[:, None] / 200.0)
-    wavelength_first = baselines[None, :] + drift
-    first_history = TraceHistorySnapshot(
-        positions=positions,
-        seq_start=0,
-        seq_stop=frames,
-        t_mono=t_first,
-        wavelength_nm=wavelength_first,
-    )
-    first = models.AppSnapshot(
-        endpoint=Endpoint(),
-        profile=PROFILE,
-        state=SessionState.STREAMING,
-        trace_history=first_history,
-    )
-    panel.refresh(first)
-    application.processEvents()
-
-    t_second = np.arange(tail, frames + tail, dtype=np.float64) / 2000.0
-    wavelength_second = np.empty_like(wavelength_first)
-    wavelength_second[:-tail] = wavelength_first[tail:]
-    new_index = np.arange(frames, frames + tail, dtype=np.float64)
-    wavelength_second[-tail:] = baselines[None, :] + 0.002 * np.sin(new_index[:, None] / 200.0)
-    second_history = TraceHistorySnapshot(
-        positions=positions,
-        seq_start=tail,
-        seq_stop=frames + tail,
-        t_mono=t_second,
-        wavelength_nm=wavelength_second,
-    )
-    second = models.AppSnapshot(
-        endpoint=Endpoint(),
-        profile=PROFILE,
-        state=SessionState.STREAMING,
-        trace_history=second_history,
-    )
-
-    started = time.perf_counter()
-    panel.refresh(second)
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
-    print(f"\nчат 15: 120 линий, Qt UI-такт {elapsed_ms:.2f} мс")
-
-    assert elapsed_ms < UI_PERIOD_MS

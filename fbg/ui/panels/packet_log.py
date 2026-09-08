@@ -8,7 +8,7 @@
 
 Обновление по таймеру, а не по событию. При 2000 Гц событийная перерисовка
 утопила бы UI: журнал видит все датаграммы, включая телеметрию, если она
-включена. Такт — 10 Гц, как у остальных панелей.
+включена. По умолчанию такт — 10 Гц, как у остальных панелей.
 
 Таблица форматирует **ячейки**, а не строки: `QTableView` спрашивает только
 видимые, и hex ответа `30 03` (20430 байт) не превращается в 61 КБ текста,
@@ -18,7 +18,7 @@
 
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt
+from PySide6.QtCore import QAbstractTableModel, QItemSelectionModel, QModelIndex, QObject, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -29,13 +29,13 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QTableView,
-    QVBoxLayout,
     QWidget,
 )
 
 from fbg.io.packet_log import Direction, PacketRecord
 from fbg.ui import models, texts
 from fbg.ui.app import AppController
+from fbg.ui.docking import DockTab
 from fbg.ui.models import AppSnapshot
 
 
@@ -91,8 +91,10 @@ class PacketTableModel(QAbstractTableModel):
         return texts.LOG_COLUMNS[section]
 
 
-class PacketLogPanel(QWidget):
+class PacketLogPanel(DockTab):
     """Журнал обмена: таблица, фильтры и выгрузка."""
+
+    layout_key = "packet_log"
 
     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -107,7 +109,9 @@ class PacketLogPanel(QWidget):
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setStretchLastSection(True)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(6, 320)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
 
         self.direction_box = QComboBox()
         self.direction_box.addItem(texts.FILTER_ANY, None)
@@ -133,11 +137,29 @@ class PacketLogPanel(QWidget):
         controls.addWidget(self.status_label)
         controls.addWidget(self.export_button)
 
-        layout = QVBoxLayout(self)
-        layout.addLayout(controls)
-        layout.addWidget(self.table, 1)
-
+        controls_widget = QWidget()
+        controls_widget.setLayout(controls)
+        self.controls_dock = self.add_panel_dock(
+            "Фильтры и экспорт",
+            controls_widget,
+            "packet_log.controls",
+            Qt.DockWidgetArea.TopDockWidgetArea,
+        )
+        self.table_dock = self.add_panel_dock(
+            texts.TAB_PACKET_LOG,
+            self.table,
+            "packet_log.table",
+            Qt.DockWidgetArea.BottomDockWidgetArea,
+        )
+        self.reset_layout()
         self.refresh(controller.snapshot())
+
+    def _apply_default_splits(self) -> None:
+        self.resizeDocks(
+            [self.controls_dock, self.table_dock],
+            [90, 590],
+            Qt.Orientation.Vertical,
+        )
 
     # --- Фильтры -----------------------------------------------------------------------
 
@@ -183,7 +205,7 @@ class PacketLogPanel(QWidget):
     # --- Обновление --------------------------------------------------------------------
 
     def refresh(self, snapshot: AppSnapshot) -> None:
-        """Читает снимок кольца и обновляет таблицу. Таймер окна, 10 Гц."""
+        """Читает снимок кольца и обновляет таблицу по общему UI-таймеру."""
         if self.pause_box.isChecked():
             return
         everything = self._controller.packet_records()
@@ -192,9 +214,27 @@ class PacketLogPanel(QWidget):
             direction=self.selected_direction(), id_fc=self.selected_pair()
         )
         at_bottom = self._at_bottom()
+        scroll_value = self.table.verticalScrollBar().value()
+        selected_seqs = {
+            self.model.records[index.row()].seq
+            for index in self.table.selectionModel().selectedRows()
+            if 0 <= index.row() < len(self.model.records)
+        }
         self.model.set_records(records)
         if at_bottom:
             self.table.scrollToBottom()
+        else:
+            self.table.verticalScrollBar().setValue(scroll_value)
+        if selected_seqs:
+            selection = self.table.selectionModel()
+            selection.clearSelection()
+            for row, record in enumerate(self.model.records):
+                if record.seq in selected_seqs:
+                    selection.select(
+                        self.model.index(row, 0),
+                        QItemSelectionModel.SelectionFlag.Select
+                        | QItemSelectionModel.SelectionFlag.Rows,
+                    )
         if snapshot.log is not None:
             self.status_label.setText(
                 f"{len(records)} из {len(everything)} · принято "
