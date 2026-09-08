@@ -8,15 +8,15 @@
 Подключение уходит в фоновый поток (`AppController.connect_async`): `Probing`
 на молчащем приборе — это Stop плюс пять чтений с повторами, то есть секунды
 замороженного окна, за которые человек за стендом успеет решить, что
-приложение зависло. Результат забирает `refresh`, то есть тот же таймер 10 Гц,
+приложение зависло. Результат забирает `refresh`, то есть тот же общий UI-таймер (по умолчанию 10 Гц),
 которым панель и так читает снимки. Пока поток жив, обе кнопки связи выключены:
 повторное нажатие дало бы `WRONG_STATE`, а отключение посреди опроса — гонку
 с командой, которая уже в полёте.
 """
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -31,11 +31,14 @@ from fbg.core.endpoint import MAX_PORT, Endpoint
 from fbg.core.session import SessionState
 from fbg.ui import diagnostics, models, texts
 from fbg.ui.app import AppController
+from fbg.ui.docking import DockTab
 from fbg.ui.models import AppSnapshot
 
 
-class ConnectionPanel(QWidget):
+class ConnectionPanel(DockTab):
     """Подключение, поток и диагностика отказа."""
+
+    layout_key = "connection"
 
     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -67,6 +70,7 @@ class ConnectionPanel(QWidget):
         self.notices_view = QPlainTextEdit()
         self.notices_view.setReadOnly(True)
         self.notices_view.setMaximumHeight(110)
+        self.notices_view.setVisible(False)
 
         self._build_layout()
         self.connect_button.clicked.connect(self._on_connect)
@@ -79,41 +83,74 @@ class ConnectionPanel(QWidget):
         self.refresh(controller.snapshot())
 
     def _build_layout(self) -> None:
-        """Расстановка виджетов. Ничего, кроме компоновки."""
+        """Три дока: адреса/состояние, поток и диагностика."""
         addresses = QFormLayout()
         addresses.addRow(texts.LABEL_DEVICE_IP, self.device_ip)
         addresses.addRow(texts.LABEL_DEVICE_PORT, self.device_port)
         addresses.addRow(texts.LABEL_LOCAL_IP, self.local_ip)
         addresses.addRow(texts.LABEL_LOCAL_PORT, self.local_port)
-        address_box = QGroupBox(texts.GROUP_ENDPOINT)
-        address_box.setLayout(addresses)
+        address_widget = QWidget()
+        address_widget.setLayout(addresses)
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.connect_button)
         buttons.addWidget(self.disconnect_button)
         buttons.addStretch(1)
 
+        connection_widget = QWidget()
+        connection_layout = QVBoxLayout(connection_widget)
+        connection_layout.addWidget(address_widget)
+        connection_layout.addLayout(buttons)
+        connection_layout.addWidget(self.state_label)
+        connection_layout.addWidget(self.mismatch_label)
+        connection_layout.addWidget(self.apply_profile_button)
+        connection_layout.addStretch(1)
+
         stream = QHBoxLayout()
         stream.addWidget(self.start_button)
         stream.addWidget(self.stop_button)
         stream.addStretch(1)
-        stream_box = QGroupBox(texts.GROUP_STREAM)
-        stream_box.setLayout(stream)
+        stream_widget = QWidget()
+        stream_layout = QVBoxLayout(stream_widget)
+        stream_layout.addLayout(stream)
+        stream_layout.addStretch(1)
 
-        diagnostics_layout = QVBoxLayout()
+        diagnostics_widget = QWidget()
+        diagnostics_layout = QVBoxLayout(diagnostics_widget)
         diagnostics_layout.addWidget(self.diagnostics_view)
-        diagnostics_box = QGroupBox(texts.GROUP_DIAGNOSTICS)
-        diagnostics_box.setLayout(diagnostics_layout)
+        diagnostics_layout.addWidget(self.notices_view)
 
-        layout = QVBoxLayout(self)
-        layout.addWidget(address_box)
-        layout.addLayout(buttons)
-        layout.addWidget(self.state_label)
-        layout.addWidget(self.mismatch_label)
-        layout.addWidget(self.apply_profile_button)
-        layout.addWidget(stream_box)
-        layout.addWidget(diagnostics_box, 1)
-        layout.addWidget(self.notices_view)
+        self.connection_dock = self.add_panel_dock(
+            texts.GROUP_ENDPOINT,
+            connection_widget,
+            "connection.endpoint",
+            Qt.DockWidgetArea.LeftDockWidgetArea,
+        )
+        self.stream_dock = self.add_panel_dock(
+            texts.GROUP_STREAM,
+            stream_widget,
+            "connection.stream",
+            Qt.DockWidgetArea.LeftDockWidgetArea,
+        )
+        self.diagnostics_dock = self.add_panel_dock(
+            texts.GROUP_DIAGNOSTICS,
+            diagnostics_widget,
+            "connection.diagnostics",
+            Qt.DockWidgetArea.RightDockWidgetArea,
+        )
+        self.reset_layout()
+
+    def _apply_default_splits(self) -> None:
+        self.splitDockWidget(
+            self.connection_dock,
+            self.stream_dock,
+            Qt.Orientation.Vertical,
+        )
+        self.resizeDocks(
+            [self.connection_dock, self.diagnostics_dock],
+            [390, 670],
+            Qt.Orientation.Horizontal,
+        )
 
     # --- Данные ------------------------------------------------------------------------
 
@@ -193,7 +230,7 @@ class ConnectionPanel(QWidget):
     # --- Обновление --------------------------------------------------------------------
 
     def refresh(self, snapshot: AppSnapshot) -> None:
-        """Читает снимок и обновляет виджеты. Зовётся таймером окна, 10 Гц."""
+        """Читает снимок и обновляет виджеты по общему UI-таймеру."""
         # Результат фонового подключения забирается здесь и ровно один раз:
         # иначе один и тот же отказ повторялся бы в сообщениях десять раз
         # в секунду.
@@ -247,3 +284,4 @@ class ConnectionPanel(QWidget):
         if notices != self._notices_text:
             self._notices_text = notices
             self.notices_view.setPlainText(notices)
+        self.notices_view.setVisible(bool(notices))

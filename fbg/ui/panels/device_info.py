@@ -1,67 +1,50 @@
-"""Панель информации о приборе: что он о себе сообщил и как идёт связь.
+"""Вкладка прибора: наблюдение и настройка в трёх независимых доках."""
 
-Всё только чтение. Настройка прибора — чат №11; здесь ни одного поля ввода
-нет намеренно, чтобы панель нельзя было перепутать с диалогом настроек.
+from __future__ import annotations
 
-Модель строит `fbg.ui.models.device_sections` — без Qt и с тестами. Виджет
-раскладывает её по дереву и старается не перестраивать его без нужды: дерево,
-пересобираемое десять раз в секунду, теряет прокрутку и раскрытые группы,
-то есть смотреть на него невозможно ровно тогда, когда это нужно.
-"""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem, QWidget
 
-from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
-
-from fbg.ui import models
+from fbg.ui import models, texts
 from fbg.ui.app import AppController
+from fbg.ui.docking import DockTab, scrollable
 from fbg.ui.models import AppSnapshot, InfoSection
+from fbg.ui.panels.device_config import DeviceConfigPanel
 
-#: Заголовки колонок дерева.
 COLUMNS: tuple[str, ...] = ("Параметр", "Значение", "Примечание")
 
 
 def sections_shape(sections: tuple[InfoSection, ...]) -> tuple[tuple[str, int], ...]:
-    """Форма модели: заголовки групп и число строк в каждой.
+    """Форма модели: заголовки групп и число строк в каждой."""
 
-    По ней решается, перестраивать дерево или обновить текст на месте.
-    Форма меняется редко — когда прибор опрошен и появились строки каналов, —
-    а значения меняются каждый такт.
-    """
     return tuple((section.title, len(section.rows)) for section in sections)
 
 
-class DeviceInfoPanel(QWidget):
-    """Прошивка, серийный номер, развёртка, каналы и качество связи."""
+class _SectionTree(QTreeWidget):
+    """Дерево секций с обновлением значений на месте и бережным rebuild."""
 
-    def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._controller = controller
+    def __init__(self) -> None:
+        super().__init__()
         self._shape: tuple[tuple[str, int], ...] = ()
-
-        self.tree = QTreeWidget()
-        self.tree.setColumnCount(len(COLUMNS))
-        self.tree.setHeaderLabels(list(COLUMNS))
-        self.tree.setRootIsDecorated(True)
-        self.tree.setAlternatingRowColors(True)
-        header = self.tree.header()
+        self.setColumnCount(len(COLUMNS))
+        self.setHeaderLabels(list(COLUMNS))
+        self.setRootIsDecorated(True)
+        self.setAlternatingRowColors(True)
+        header = self.header()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
 
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.tree)
+    def update_sections(self, sections: tuple[InfoSection, ...]) -> None:
+        """Меняет только текст, если состав строк прежний."""
 
-        self.refresh(controller.snapshot())
-
-    def refresh(self, snapshot: AppSnapshot) -> None:
-        """Обновляет дерево по снимку. Зовётся таймером окна, 10 Гц."""
-        sections = models.device_sections(snapshot)
         shape = sections_shape(sections)
         if shape != self._shape:
             self._rebuild(sections)
             self._shape = shape
             return
         for group_index, section in enumerate(sections):
-            group = self.tree.topLevelItem(group_index)
+            group = self.topLevelItem(group_index)
             if group is None:
                 continue
             for row_index, row in enumerate(section.rows):
@@ -73,18 +56,130 @@ class DeviceInfoPanel(QWidget):
                 if item.text(2) != row.note:
                     item.setText(2, row.note)
 
+    def _selection_key(self) -> tuple[str, str] | None:
+        items = self.selectedItems()
+        if not items:
+            return None
+        item = items[0]
+        parent = item.parent()
+        if parent is None:
+            return item.text(0), ""
+        return parent.text(0), item.text(0)
+
+    def _restore_selection(self, key: tuple[str, str] | None) -> None:
+        if key is None:
+            return
+        for group_index in range(self.topLevelItemCount()):
+            group = self.topLevelItem(group_index)
+            if group is None or group.text(0) != key[0]:
+                continue
+            if not key[1]:
+                group.setSelected(True)
+                return
+            for row_index in range(group.childCount()):
+                child = group.child(row_index)
+                if child.text(0) == key[1]:
+                    child.setSelected(True)
+                    return
+
     def _rebuild(self, sections: tuple[InfoSection, ...]) -> None:
-        """Пересобирает дерево целиком — только когда изменилась форма модели."""
+        """Редкий rebuild сохраняет раскрытие, прокрутку и выделенную строку."""
+
         expanded = {
-            self.tree.topLevelItem(index).text(0)  # type: ignore[union-attr]
-            for index in range(self.tree.topLevelItemCount())
-            if self.tree.topLevelItem(index) is not None
-            and self.tree.topLevelItem(index).isExpanded()  # type: ignore[union-attr]
+            item.text(0)
+            for index in range(self.topLevelItemCount())
+            if (item := self.topLevelItem(index)) is not None and item.isExpanded()
         }
-        self.tree.clear()
-        for section in sections:
-            group = QTreeWidgetItem([section.title, "", ""])
-            for row in section.rows:
-                QTreeWidgetItem(group, [row.label, row.value, row.note])
-            self.tree.addTopLevelItem(group)
-            group.setExpanded(not expanded or section.title in expanded)
+        scroll = self.verticalScrollBar().value()
+        selected = self._selection_key()
+        self.blockSignals(True)
+        try:
+            self.clear()
+            for section in sections:
+                group = QTreeWidgetItem([section.title, "", ""])
+                for row in section.rows:
+                    QTreeWidgetItem(group, [row.label, row.value, row.note])
+                self.addTopLevelItem(group)
+                group.setExpanded(not expanded or section.title in expanded)
+            self._restore_selection(selected)
+            self.verticalScrollBar().setValue(scroll)
+        finally:
+            self.blockSignals(False)
+
+
+class DeviceInfoPanel(DockTab):
+    """Паспорт/развёртка, качество связи и единственное место записи в прибор."""
+
+    layout_key = "device"
+
+    def __init__(
+        self,
+        controller: AppController,
+        config_panel: DeviceConfigPanel,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._controller = controller
+        self.config_panel = config_panel
+
+        self.summary_tree = _SectionTree()
+        self.quality_tree = _SectionTree()
+        # Совместимость с прежними тестами/ручными скриптами: ``tree`` теперь
+        # означает наблюдательное дерево паспорта, а динамика вынесена отдельно.
+        self.tree = self.summary_tree
+
+        self.summary_dock = self.add_panel_dock(
+            "Паспорт и развёртка",
+            self.summary_tree,
+            "device.summary",
+            Qt.DockWidgetArea.LeftDockWidgetArea,
+        )
+        self.quality_dock = self.add_panel_dock(
+            texts.SECTION_QUALITY,
+            self.quality_tree,
+            "device.quality",
+            Qt.DockWidgetArea.RightDockWidgetArea,
+        )
+        self.config_dock = self.add_panel_dock(
+            texts.TAB_DEVICE_CONFIG,
+            scrollable(config_panel),
+            "device.config",
+            Qt.DockWidgetArea.RightDockWidgetArea,
+        )
+        self.config_dock.setStyleSheet("QDockWidget::title { font-weight: bold; }")
+        self.reset_layout()
+        self.refresh(controller.snapshot())
+
+    def _apply_default_splits(self) -> None:
+        self.splitDockWidget(
+            self.quality_dock,
+            self.config_dock,
+            Qt.Orientation.Vertical,
+        )
+        self.resizeDocks(
+            [self.summary_dock, self.quality_dock],
+            [620, 430],
+            Qt.Orientation.Horizontal,
+        )
+        self.resizeDocks(
+            [self.quality_dock, self.config_dock],
+            [330, 330],
+            Qt.Orientation.Vertical,
+        )
+
+    @staticmethod
+    def _partition(
+        sections: tuple[InfoSection, ...],
+    ) -> tuple[tuple[InfoSection, ...], tuple[InfoSection, ...]]:
+        dynamic_titles = {texts.SECTION_QUALITY, texts.SECTION_LOG}
+        summary = tuple(section for section in sections if section.title not in dynamic_titles)
+        quality = tuple(section for section in sections if section.title in dynamic_titles)
+        return summary, quality
+
+    def refresh(self, snapshot: AppSnapshot) -> None:
+        """Статика и счётчики обновляются независимо; настройка не пересоздаётся."""
+
+        summary, quality = self._partition(models.device_sections(snapshot))
+        self.summary_tree.update_sections(summary)
+        self.quality_tree.update_sections(quality)
+        self.config_panel.refresh(snapshot)
