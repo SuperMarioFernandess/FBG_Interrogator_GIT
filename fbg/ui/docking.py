@@ -191,10 +191,10 @@ class DockTab(QMainWindow):
 
         for dock in self._docks:
             dock.setFloating(False)
-            dock.show()
             self.removeDockWidget(dock)
         for dock in self._docks:
             self.addDockWidget(self._dock_defaults[dock], dock)
+            dock.show()
         self._apply_default_splits()
         self.set_layout_locked(self._layout_locked)
 
