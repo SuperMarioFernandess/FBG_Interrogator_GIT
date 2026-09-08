@@ -231,11 +231,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_targets(self) -> tuple[DockTab, ...]:
         active = self.tabs.currentWidget()
-        return tuple(
-            panel
-            for panel in self.panels
-            if panel.needs_refresh(active=panel is active)
-        )
+        return tuple(panel for panel in self.panels if panel.needs_refresh(active=panel is active))
 
     def tick(self) -> None:
         """Один такт: один снимок на активную вкладку и floating-доки."""
