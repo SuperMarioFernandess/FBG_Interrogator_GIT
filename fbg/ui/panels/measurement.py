@@ -427,8 +427,10 @@ class MeasurementPanel(DockTab):
             self.graph_hint.setText(texts.GRAPH_NO_SELECTION + "\n" + texts.GRAPH_BASELINE_HINT)
         else:
             self.graph_hint.setText(texts.GRAPH_BASELINE_HINT)
-        has_data = bool(selected) and model.t_s.size > 0 and any(
-            trace.valid_points > 0 for trace in model.traces
+        has_data = (
+            bool(selected)
+            and model.t_s.size > 0
+            and any(trace.valid_points > 0 for trace in model.traces)
         )
         self.plot.setVisible(has_data)
         self.empty_graph_label.setVisible(not has_data)
