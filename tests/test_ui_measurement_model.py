@@ -432,15 +432,16 @@ def test_оценка_потерь_не_бывает_отрицательной_
     assert pipeline.metrics().loss_estimate == 0.0
 
 
-@pytest.mark.slow
-def test_120_линий_инкрементальный_такт_укладывается_в_ui_budget() -> None:
-    """Чат 15: 120 линий × 20 000 точек, новый хвост 200 кадров < 100 мс.
+def test_120_линий_инкрементальный_такт_обрабатывает_только_новый_хвост(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Регресс Р76 без wall-clock: тяжёлая часть видит 200, а не 20 000 кадров.
 
-    Тест намеренно использует чистую Qt-free модель: он измеряет ту часть такта,
-    которая до правки каждый раз пересчитывала всю историю. Отрисовочное
-    прореживание pyqtgraph проверяется отдельно UI-тестом. На базовом e13bad4
-    тест не проходит: `measurement_graph_model` не имеет инкрементального пути
-    `previous=` и модель каждого тика строится заново.
+    Абсолютный бюджет времени оказался невоспроизводимым между headless Qt,
+    CI и рабочим Windows. Решение охраняется по объёму работы: после первого
+    полного построения ``flatnonzero`` на штатном следующем такте должен
+    получать только новый хвост окна. Полный пересчёт 20 000 точек здесь
+    структурно виден и роняет тест независимо от скорости машины.
     """
     lines = PROFILE.channels * PROFILE.fbg_per_channel
     frames = 20_000
@@ -475,18 +476,23 @@ def test_120_линий_инкрементальный_такт_укладыва
         wavelength_nm=wave1,
     )
 
-    started = time.perf_counter()
+    inspected_sizes: list[int] = []
+    original_flatnonzero = np.flatnonzero
+
+    def measured_flatnonzero(values: np.ndarray) -> np.ndarray:
+        inspected_sizes.append(values.size)
+        return original_flatnonzero(values)
+
+    monkeypatch.setattr(models.np, "flatnonzero", measured_flatnonzero)
     current = models.measurement_graph_model(
         app_snapshot(trace_history=second_history),
         selected,
         previous=previous,
     )
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
-
-    print(f"\nчат 15: 120 линий, инкрементальный UI-такт {elapsed_ms:.2f} мс")
     assert len(current.traces) == 120
     assert current.seq_start == tail and current.seq_stop == frames + tail
-    assert elapsed_ms < 100.0
+    assert inspected_sizes
+    assert max(inspected_sizes) <= tail
 
 
 # --------------------------------------------------------------------------------------
