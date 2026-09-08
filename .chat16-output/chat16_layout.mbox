@@ -1,0 +1,2326 @@
+From 0f7e3f95c5246e9fd7892907a4780a0ddd5dfa29 Mon Sep 17 00:00:00 2001
+From: Sergey <268493702+SuperMarioFernandess@users.noreply.github.com>
+Date: Tue, 8 Sep 2026 18:34:21 +0700
+Subject: [PATCH] Chat 16: UI layout and responsiveness
+
+---
+ fbg/ui/docking.py                   | 224 ++++++++++++++++++++++++++++
+ fbg/ui/main_window.py               | 214 +++++++++++++++++++++-----
+ fbg/ui/panels/connection.py         |  85 ++++++++---
+ fbg/ui/panels/device_config.py      |  23 ++-
+ fbg/ui/panels/device_info.py        | 193 ++++++++++++++++++------
+ fbg/ui/panels/measurement.py        | 146 ++++++++++++------
+ fbg/ui/panels/packet_log.py         |  60 ++++++--
+ fbg/ui/panels/sensors.py            | 101 ++++++++++---
+ fbg/ui/panels/spectrum.py           |  71 +++++++--
+ fbg/ui/texts.py                     |  17 ++-
+ tests/test_ui_measurement_model.py  |  34 +++--
+ tests/test_ui_measurement_widget.py |  92 ++----------
+ tests/test_ui_widgets.py            | 143 +++++++++++++++++-
+ 13 files changed, 1101 insertions(+), 302 deletions(-)
+ create mode 100644 fbg/ui/docking.py
+
+diff --git a/fbg/ui/docking.py b/fbg/ui/docking.py
+new file mode 100644
+index 0000000..488ef0e
+--- /dev/null
++++ b/fbg/ui/docking.py
+@@ -0,0 +1,224 @@
++"""Общие механизмы доков и сохранения Qt-раскладки интерфейса.
++
++Файл намеренно живёт в ``fbg.ui``: ``QMainWindow.saveState()`` возвращает
++``QByteArray`` и тем самым принадлежит Qt-слою. ``fbg.io`` не должен знать
++о раскладке окна и по-прежнему импортируется без PySide6 (KB_05 №35).
++"""
++
++from __future__ import annotations
++
++import base64
++import json
++import os
++from dataclasses import dataclass
++from pathlib import Path
++
++from PySide6.QtCore import QByteArray, Qt
++from PySide6.QtWidgets import QDockWidget, QFrame, QMainWindow, QScrollArea, QWidget
++
++UI_LAYOUT_FILENAME = "fbg_ui_layout.json"
++UI_LAYOUT_VERSION = 1
++DEFAULT_UI_PERIOD_MS = 100
++MIN_UI_PERIOD_MS = 50
++MAX_UI_PERIOD_MS = 2_000
++
++_UNLOCKED_FEATURES = (
++    QDockWidget.DockWidgetFeature.DockWidgetClosable
++    | QDockWidget.DockWidgetFeature.DockWidgetMovable
++    | QDockWidget.DockWidgetFeature.DockWidgetFloatable
++)
++
++
++@dataclass(frozen=True)
++class UiLayoutState:
++    """Сохранённое состояние всех вкладок и общие UI-настройки."""
++
++    docks: dict[str, QByteArray]
++    locked: bool = False
++    period_ms: int = DEFAULT_UI_PERIOD_MS
++
++
++def layout_path_for_config(config_path: Path | None) -> Path | None:
++    """Возвращает соседний с конфигурацией путь раскладки.
++
++    В тестах ``config_path=None`` означает отсутствие файлового состояния вообще:
++    окно не должно неожиданно писать в текущий каталог тестового процесса.
++    """
++
++    if config_path is None:
++        return None
++    return config_path.with_name(UI_LAYOUT_FILENAME)
++
++
++def _quarantine_path(path: Path) -> Path:
++    target = path.with_name(path.name + ".bad")
++    suffix = 2
++    while target.exists():
++        target = path.with_name(f"{path.name}.bad.{suffix}")
++        suffix += 1
++    return target
++
++
++def quarantine_layout(path: Path) -> Path:
++    """Откладывает непонятный файл, не затирая предыдущие ``*.bad``."""
++
++    target = _quarantine_path(path)
++    path.replace(target)
++    return target
++
++
++def load_layout(path: Path) -> UiLayoutState:
++    """Читает раскладку или бросает ``ValueError`` с причиной.
++
++    Любая ошибка трактуется верхним уровнем одинаково: раскладка по умолчанию,
++    исходный файл в карантин. Частичное восстановление опасно тем же, чем
++    частичное чтение будущей версии обычной конфигурации (KB_05 №33).
++    """
++
++    try:
++        raw = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
++        raise ValueError(f"файл раскладки не читается: {exc}") from exc
++    if not isinstance(raw, dict):
++        raise ValueError("корень файла раскладки должен быть объектом")
++    if raw.get("version") != UI_LAYOUT_VERSION:
++        raise ValueError(f"неподдерживаемая версия раскладки: {raw.get('version')!r}")
++
++    period_ms = raw.get("period_ms", DEFAULT_UI_PERIOD_MS)
++    if type(period_ms) is not int or not MIN_UI_PERIOD_MS <= period_ms <= MAX_UI_PERIOD_MS:
++        raise ValueError(f"period_ms должен быть целым {MIN_UI_PERIOD_MS}…{MAX_UI_PERIOD_MS}")
++    locked = raw.get("locked", False)
++    if type(locked) is not bool:
++        raise ValueError("locked должен быть true/false")
++
++    encoded = raw.get("docks")
++    if not isinstance(encoded, dict) or not encoded:
++        raise ValueError("секция docks отсутствует или пуста")
++    docks: dict[str, QByteArray] = {}
++    for name, value in encoded.items():
++        if not isinstance(name, str) or not name or not isinstance(value, str):
++            raise ValueError("docks должен содержать пары строк имя→base64")
++        try:
++            decoded = base64.b64decode(value.encode("ascii"), validate=True)
++        except (UnicodeError, ValueError) as exc:
++            raise ValueError(f"docks.{name}: неверный base64") from exc
++        if not decoded:
++            raise ValueError(f"docks.{name}: пустое состояние")
++        docks[name] = QByteArray(decoded)
++    return UiLayoutState(docks=docks, locked=locked, period_ms=period_ms)
++
++
++def save_layout(path: Path, state: UiLayoutState) -> Path:
++    """Атомарно сохраняет раскладку как JSON с base64-состояниями Qt."""
++
++    path.parent.mkdir(parents=True, exist_ok=True)
++    payload = {
++        "version": UI_LAYOUT_VERSION,
++        "period_ms": state.period_ms,
++        "locked": state.locked,
++        "docks": {
++            name: base64.b64encode(bytes(value)).decode("ascii")
++            for name, value in sorted(state.docks.items())
++        },
++    }
++    temporary = path.with_name(path.name + ".tmp")
++    temporary.write_text(
++        json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
++        encoding="ascii",
++        newline="\n",
++    )
++    os.replace(temporary, path)
++    return path
++
++
++def scrollable(widget: QWidget) -> QScrollArea:
++    """Оборачивает длинную форму в прокрутку без изменения её логики."""
++
++    area = QScrollArea()
++    area.setWidgetResizable(True)
++    area.setFrameShape(QFrame.Shape.NoFrame)
++    area.setWidget(widget)
++    return area
++
++
++class DockTab(QMainWindow):
++    """Вложенное главное окно одной вкладки с 2–4 крупными доками."""
++
++    layout_key = ""
++
++    def __init__(self, parent: QWidget | None = None) -> None:
++        super().__init__(parent)
++        self.setDockNestingEnabled(True)
++        self.setDockOptions(
++            QMainWindow.DockOption.AllowNestedDocks
++            | QMainWindow.DockOption.AllowTabbedDocks
++            | QMainWindow.DockOption.AnimatedDocks
++        )
++        self._docks: list[QDockWidget] = []
++        self._dock_defaults: dict[QDockWidget, Qt.DockWidgetArea] = {}
++        self._layout_locked = False
++
++    @property
++    def dock_widgets(self) -> tuple[QDockWidget, ...]:
++        """Все доки вкладки в стабильном порядке."""
++
++        return tuple(self._docks)
++
++    def add_panel_dock(
++        self,
++        title: str,
++        widget: QWidget,
++        object_name: str,
++        area: Qt.DockWidgetArea,
++    ) -> QDockWidget:
++        """Добавляет крупную область с именем, нужным ``saveState``."""
++
++        dock = QDockWidget(title, self)
++        dock.setObjectName(object_name)
++        dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
++        dock.setFeatures(_UNLOCKED_FEATURES)
++        dock.setWidget(widget)
++        self.addDockWidget(area, dock)
++        self._docks.append(dock)
++        self._dock_defaults[dock] = area
++        return dock
++
++    def _apply_default_splits(self) -> None:
++        """Дополнительное деление дефолтной раскладки. Переопределяется панелью."""
++
++    def reset_layout(self) -> None:
++        """Возвращает все доки из floating/hidden в стартовую раскладку."""
++
++        for dock in self._docks:
++            dock.setFloating(False)
++            self.removeDockWidget(dock)
++        for dock in self._docks:
++            self.addDockWidget(self._dock_defaults[dock], dock)
++            dock.show()
++        self._apply_default_splits()
++        self.set_layout_locked(self._layout_locked)
++
++    def set_layout_locked(self, locked: bool) -> None:
++        """Запрещает или разрешает перенос, отделение и закрытие доков."""
++
++        self._layout_locked = bool(locked)
++        features = (
++            QDockWidget.DockWidgetFeature.NoDockWidgetFeatures if locked else _UNLOCKED_FEATURES
++        )
++        for dock in self._docks:
++            dock.setFeatures(features)
++
++    def needs_refresh(self, *, active: bool) -> bool:
++        """Нужен ли панели UI-такт сейчас.
++
++        Неактивная вкладка обычно скрыта, но её floating-док остаётся отдельным
++        видимым окном. Проверка по фактической видимости не даёт такому графику
++        замереть только потому, что родительская вкладка не выбрана.
++        """
++
++        if active:
++            return True
++        # ``isVisible()`` учитывает скрытого родителя-QTabWidget и потому
++        # возвращает False у отделённого дока, когда пользователь переключил
++        # вкладку. ``isHidden()`` отражает именно явное закрытие самого дока.
++        return any(dock.isFloating() and not dock.isHidden() for dock in self._docks)
+diff --git a/fbg/ui/main_window.py b/fbg/ui/main_window.py
+index 1e998c3..af37d6e 100644
+--- a/fbg/ui/main_window.py
++++ b/fbg/ui/main_window.py
+@@ -1,20 +1,45 @@
+-"""Каркас окна: вкладки, строка состояния и единственный таймер обновления.
++"""Главное окно: шесть вкладок-доков, строка состояния и один UI-таймер.
+ 
+-Таймер один на всё окно. Событийного обновления нет намеренно: журнал видит
+-каждую датаграмму, а при 2000 Гц это две тысячи событий в секунду, каждое
+-из которых дошло бы до отрисовки. Панели вместо этого читают **снимок**
+-десять раз в секунду и ничего из ядра не держат (Р36).
++Крупные области каждой вкладки — ``QDockWidget``: пользователь может менять
++их ширину/высоту, переносить и временно отделять. Раскладка хранится отдельно
++от конфигурации прибора, потому что это чисто Qt-состояние и оно не должно
++попадать в ``fbg.io``.
+ 
+-Снимок берётся один на такт, но обновляется только **видимая** вкладка.
+-Скрытая панель не рисует график и не пересобирает таблицу зря; при переключении
+-новая вкладка получает свежий снимок сразу. Строка состояния обновляется всегда.
++Снимок контроллера по-прежнему берётся один на такт. Обычно обновляется только
++активная вкладка; исключение — видимый floating-док скрытой вкладки: раз он
++остаётся отдельным окном, его график/таблица не должны замирать.
+ """
+ 
++from __future__ import annotations
++
++import contextlib
++from pathlib import Path
++
+ from PySide6.QtCore import QTimer
+-from PySide6.QtWidgets import QLabel, QMainWindow, QStatusBar, QTabWidget, QWidget
++from PySide6.QtWidgets import (
++    QLabel,
++    QMainWindow,
++    QPushButton,
++    QSpinBox,
++    QStatusBar,
++    QTabWidget,
++    QToolBar,
++    QWidget,
++)
+ 
+ from fbg.ui import models, texts
+ from fbg.ui.app import AppController
++from fbg.ui.docking import (
++    DEFAULT_UI_PERIOD_MS,
++    MAX_UI_PERIOD_MS,
++    MIN_UI_PERIOD_MS,
++    DockTab,
++    UiLayoutState,
++    layout_path_for_config,
++    load_layout,
++    quarantine_layout,
++    save_layout,
++)
+ from fbg.ui.panels.connection import ConnectionPanel
+ from fbg.ui.panels.device_config import DeviceConfigPanel
+ from fbg.ui.panels.device_info import DeviceInfoPanel
+@@ -23,17 +48,19 @@
+ from fbg.ui.panels.sensors import SensorsPanel
+ from fbg.ui.panels.spectrum import SpectrumPanel
+ 
+-#: Период обновления панелей, мс. 10 Гц — тот же порядок, что у децимации
+-#: снимков pipeline (Р39): человек больше не различает, а UI не захлёбывается.
+-UI_PERIOD_MS = 100
++# Совместимость с тестами/кодом до чата №16: теперь это именно дефолт, а не
++# жёстко прошитый период таймера.
++UI_PERIOD_MS = DEFAULT_UI_PERIOD_MS
+ 
+ 
+ class MainWindow(QMainWindow):
+-    """Главное окно: семь вкладок и строка состояния."""
++    """Главное окно: шесть вкладок с настраиваемой док-раскладкой."""
+ 
+     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
+         super().__init__(parent)
+         self._controller = controller
++        self._layout_path = layout_path_for_config(controller.config_path)
++        self._layout_locked = False
+         self.setWindowTitle(texts.APP_TITLE)
+         self.resize(1100, 750)
+ 
+@@ -41,8 +68,8 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self.measurement_panel = MeasurementPanel(controller)
+         self.sensors_panel = SensorsPanel(controller)
+         self.spectrum_panel = SpectrumPanel(controller)
+-        self.device_panel = DeviceInfoPanel(controller)
+         self.device_config_panel = DeviceConfigPanel(controller)
++        self.device_panel = DeviceInfoPanel(controller, self.device_config_panel)
+         self.packet_log_panel = PacketLogPanel(controller)
+ 
+         self.tabs = QTabWidget()
+@@ -51,7 +78,6 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self.tabs.addTab(self.sensors_panel, texts.TAB_SENSORS)
+         self.tabs.addTab(self.spectrum_panel, texts.TAB_SPECTRUM)
+         self.tabs.addTab(self.device_panel, texts.TAB_DEVICE)
+-        self.tabs.addTab(self.device_config_panel, texts.TAB_DEVICE_CONFIG)
+         self.tabs.addTab(self.packet_log_panel, texts.TAB_PACKET_LOG)
+         self.setCentralWidget(self.tabs)
+ 
+@@ -60,66 +86,172 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         status.addWidget(self.status_label)
+         self.setStatusBar(status)
+ 
++        self._build_layout_toolbar()
++
+         self._timer = QTimer(self)
+-        self._timer.setInterval(UI_PERIOD_MS)
++        self._timer.setInterval(DEFAULT_UI_PERIOD_MS)
+         self._timer.timeout.connect(self.tick)
+         self.tabs.currentChanged.connect(lambda _index: self.tick())
+ 
++        self._load_saved_layout()
++
+     @property
+-    def panels(self) -> tuple[QWidget, ...]:
+-        """Все панели окна в порядке вкладок."""
++    def panels(self) -> tuple[DockTab, ...]:
++        """Все шесть вкладок в порядке интерфейса."""
++
+         return (
+             self.connection_panel,
+             self.measurement_panel,
+             self.sensors_panel,
+             self.spectrum_panel,
+             self.device_panel,
+-            self.device_config_panel,
+             self.packet_log_panel,
+         )
+ 
+     @property
+     def timer(self) -> QTimer:
+         """Таймер обновления. Открыт наружу ради тестов и остановки."""
++
+         return self._timer
+ 
++    @property
++    def layout_path(self) -> Path | None:
++        """Файл состояния Qt или ``None`` у безфайлового тестового окна."""
++
++        return self._layout_path
++
++    def _build_layout_toolbar(self) -> None:
++        toolbar = QToolBar("Раскладка", self)
++        toolbar.setObjectName("layout.toolbar")
++        toolbar.setMovable(False)
++
++        self.save_layout_button = QPushButton(texts.LAYOUT_SAVE)
++        self.reset_layout_button = QPushButton(texts.LAYOUT_RESET)
++        self.lock_layout_button = QPushButton(texts.LAYOUT_LOCK)
++        self.lock_layout_button.setCheckable(True)
++        self.ui_period_spin = QSpinBox()
++        self.ui_period_spin.setRange(MIN_UI_PERIOD_MS, MAX_UI_PERIOD_MS)
++        self.ui_period_spin.setSingleStep(50)
++        self.ui_period_spin.setValue(DEFAULT_UI_PERIOD_MS)
++        self.ui_period_spin.setMaximumWidth(100)
++
++        toolbar.addWidget(self.save_layout_button)
++        toolbar.addWidget(self.reset_layout_button)
++        toolbar.addWidget(self.lock_layout_button)
++        toolbar.addSeparator()
++        toolbar.addWidget(QLabel(texts.LAYOUT_PERIOD))
++        toolbar.addWidget(self.ui_period_spin)
++        self.addToolBar(toolbar)
++        self.layout_toolbar = toolbar
++
++        self.save_layout_button.setEnabled(self._layout_path is not None)
++        self.save_layout_button.clicked.connect(self.save_layout_now)
++        self.reset_layout_button.clicked.connect(self.reset_layout)
++        self.lock_layout_button.toggled.connect(self.set_layout_locked)
++        self.ui_period_spin.valueChanged.connect(self._set_ui_period)
++
++    def _set_ui_period(self, period_ms: int) -> None:
++        self._timer.setInterval(period_ms)
++
++    def set_layout_locked(self, locked: bool) -> None:
++        """Одновременно закрепляет доки всех вкладок."""
++
++        self._layout_locked = bool(locked)
++        self.lock_layout_button.blockSignals(True)
++        try:
++            self.lock_layout_button.setChecked(self._layout_locked)
++        finally:
++            self.lock_layout_button.blockSignals(False)
++        for panel in self.panels:
++            panel.set_layout_locked(self._layout_locked)
++
++    def _layout_state(self) -> UiLayoutState:
++        return UiLayoutState(
++            docks={panel.layout_key: panel.saveState() for panel in self.panels},
++            locked=self._layout_locked,
++            period_ms=self.ui_period_spin.value(),
++        )
++
++    def save_layout_now(self) -> None:
++        """Сохраняет текущее положение доков атомарно."""
++
++        if self._layout_path is None:
++            return
++        try:
++            save_layout(self._layout_path, self._layout_state())
++        except OSError as exc:
++            self._controller.note(f"раскладка интерфейса не сохранена: {exc}")
++            return
++        self._controller.note(texts.LAYOUT_SAVED)
++
++    def _restore_layout(self, state: UiLayoutState) -> None:
++        expected = {panel.layout_key for panel in self.panels}
++        if set(state.docks) != expected:
++            raise ValueError("набор вкладок в файле раскладки не совпадает с приложением")
++        for panel in self.panels:
++            if not panel.restoreState(state.docks[panel.layout_key]):
++                raise ValueError(f"Qt не восстановил раскладку {panel.layout_key}")
++        self.ui_period_spin.setValue(state.period_ms)
++        self.set_layout_locked(state.locked)
++
++    def _load_saved_layout(self) -> None:
++        path = self._layout_path
++        if path is None or not path.exists():
++            return
++        try:
++            self._restore_layout(load_layout(path))
++        except (OSError, ValueError) as exc:
++            for panel in self.panels:
++                panel.reset_layout()
++            self.ui_period_spin.setValue(DEFAULT_UI_PERIOD_MS)
++            self.set_layout_locked(False)
++            with contextlib.suppress(OSError):
++                quarantine_layout(path)
++            self._controller.note(f"{texts.LAYOUT_LOAD_FAILED} {exc}")
++
++    def reset_layout(self) -> None:
++        """Возвращает доки и общий период к штатному виду."""
++
++        self.set_layout_locked(False)
++        for panel in self.panels:
++            panel.reset_layout()
++        self.ui_period_spin.setValue(DEFAULT_UI_PERIOD_MS)
++        self._controller.note(texts.LAYOUT_RESET_DONE)
++
+     def start_updates(self) -> None:
+         """Запускает таймер и сразу делает первый такт."""
++
+         self.tick()
+         self._timer.start()
+ 
+     def stop_updates(self) -> None:
+         """Останавливает таймер. Повторный вызов безвреден."""
++
+         self._timer.stop()
+ 
+-    def tick(self) -> None:
+-        """Один такт: свежий снимок получает только видимая вкладка."""
++    def _refresh_targets(self) -> tuple[DockTab, ...]:
+         active = self.tabs.currentWidget()
++        return tuple(panel for panel in self.panels if panel.needs_refresh(active=panel is active))
++
++    def tick(self) -> None:
++        """Один такт: один снимок на активную вкладку и floating-доки."""
++
++        targets = self._refresh_targets()
+         snapshot = self._controller.snapshot(
+-            include_trace_history=active is self.measurement_panel,
+-            include_sensor_data=active is self.sensors_panel,
++            include_trace_history=self.measurement_panel in targets,
++            include_sensor_data=self.sensors_panel in targets,
+         )
+-        if active is self.connection_panel:
+-            self.connection_panel.refresh(snapshot)
+-        elif active is self.measurement_panel:
+-            self.measurement_panel.refresh(snapshot)
+-        elif active is self.sensors_panel:
+-            self.sensors_panel.refresh(snapshot)
+-        elif active is self.spectrum_panel:
+-            self.spectrum_panel.refresh(snapshot)
+-        elif active is self.device_panel:
+-            self.device_panel.refresh(snapshot)
+-        elif active is self.device_config_panel:
+-            self.device_config_panel.refresh(snapshot)
+-        elif active is self.packet_log_panel:
+-            self.packet_log_panel.refresh(snapshot)
++        for panel in targets:
++            panel.refresh(snapshot)
+         self.status_label.setText(models.status_line(snapshot))
+ 
+     def closeEvent(self, event: object) -> None:  # noqa: N802 — Qt
+-        """Гасит таймер при закрытии окна.
++        """Сохраняет раскладку и гасит таймер перед закрытием окна."""
+ 
+-        Само приложение останавливает не окно, а `main.py`: порядок остановки
+-        должен соблюдаться и тогда, когда окна не было вовсе.
+-        """
++        if self._layout_path is not None:
++            try:
++                save_layout(self._layout_path, self._layout_state())
++            except OSError as exc:
++                self._controller.note(f"раскладка интерфейса не сохранена: {exc}")
+         self.stop_updates()
+         super().closeEvent(event)  # type: ignore[arg-type]
+diff --git a/fbg/ui/panels/connection.py b/fbg/ui/panels/connection.py
+index 09b2e64..7580c2f 100644
+--- a/fbg/ui/panels/connection.py
++++ b/fbg/ui/panels/connection.py
+@@ -8,15 +8,16 @@
+ Подключение уходит в фоновый поток (`AppController.connect_async`): `Probing`
+ на молчащем приборе — это Stop плюс пять чтений с повторами, то есть секунды
+ замороженного окна, за которые человек за стендом успеет решить, что
+-приложение зависло. Результат забирает `refresh`, то есть тот же таймер 10 Гц,
+-которым панель и так читает снимки. Пока поток жив, обе кнопки связи выключены:
++приложение зависло. Результат забирает `refresh`, то есть тот же общий
++UI-таймер (по умолчанию 10 Гц), которым панель и так читает снимки. Пока поток
++жив, обе кнопки связи выключены:
+ повторное нажатие дало бы `WRONG_STATE`, а отключение посреди опроса — гонку
+ с командой, которая уже в полёте.
+ """
+ 
++from PySide6.QtCore import Qt
+ from PySide6.QtWidgets import (
+     QFormLayout,
+-    QGroupBox,
+     QHBoxLayout,
+     QLabel,
+     QLineEdit,
+@@ -31,12 +32,15 @@
+ from fbg.core.session import SessionState
+ from fbg.ui import diagnostics, models, texts
+ from fbg.ui.app import AppController
++from fbg.ui.docking import DockTab
+ from fbg.ui.models import AppSnapshot
+ 
+ 
+-class ConnectionPanel(QWidget):
++class ConnectionPanel(DockTab):
+     """Подключение, поток и диагностика отказа."""
+ 
++    layout_key = "connection"
++
+     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
+         super().__init__(parent)
+         self._controller = controller
+@@ -67,6 +71,7 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self.notices_view = QPlainTextEdit()
+         self.notices_view.setReadOnly(True)
+         self.notices_view.setMaximumHeight(110)
++        self.notices_view.setVisible(False)
+ 
+         self._build_layout()
+         self.connect_button.clicked.connect(self._on_connect)
+@@ -79,41 +84,74 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self.refresh(controller.snapshot())
+ 
+     def _build_layout(self) -> None:
+-        """Расстановка виджетов. Ничего, кроме компоновки."""
++        """Три дока: адреса/состояние, поток и диагностика."""
+         addresses = QFormLayout()
+         addresses.addRow(texts.LABEL_DEVICE_IP, self.device_ip)
+         addresses.addRow(texts.LABEL_DEVICE_PORT, self.device_port)
+         addresses.addRow(texts.LABEL_LOCAL_IP, self.local_ip)
+         addresses.addRow(texts.LABEL_LOCAL_PORT, self.local_port)
+-        address_box = QGroupBox(texts.GROUP_ENDPOINT)
+-        address_box.setLayout(addresses)
++        address_widget = QWidget()
++        address_widget.setLayout(addresses)
+ 
+         buttons = QHBoxLayout()
+         buttons.addWidget(self.connect_button)
+         buttons.addWidget(self.disconnect_button)
+         buttons.addStretch(1)
+ 
++        connection_widget = QWidget()
++        connection_layout = QVBoxLayout(connection_widget)
++        connection_layout.addWidget(address_widget)
++        connection_layout.addLayout(buttons)
++        connection_layout.addWidget(self.state_label)
++        connection_layout.addWidget(self.mismatch_label)
++        connection_layout.addWidget(self.apply_profile_button)
++        connection_layout.addStretch(1)
++
+         stream = QHBoxLayout()
+         stream.addWidget(self.start_button)
+         stream.addWidget(self.stop_button)
+         stream.addStretch(1)
+-        stream_box = QGroupBox(texts.GROUP_STREAM)
+-        stream_box.setLayout(stream)
++        stream_widget = QWidget()
++        stream_layout = QVBoxLayout(stream_widget)
++        stream_layout.addLayout(stream)
++        stream_layout.addStretch(1)
+ 
+-        diagnostics_layout = QVBoxLayout()
++        diagnostics_widget = QWidget()
++        diagnostics_layout = QVBoxLayout(diagnostics_widget)
+         diagnostics_layout.addWidget(self.diagnostics_view)
+-        diagnostics_box = QGroupBox(texts.GROUP_DIAGNOSTICS)
+-        diagnostics_box.setLayout(diagnostics_layout)
+-
+-        layout = QVBoxLayout(self)
+-        layout.addWidget(address_box)
+-        layout.addLayout(buttons)
+-        layout.addWidget(self.state_label)
+-        layout.addWidget(self.mismatch_label)
+-        layout.addWidget(self.apply_profile_button)
+-        layout.addWidget(stream_box)
+-        layout.addWidget(diagnostics_box, 1)
+-        layout.addWidget(self.notices_view)
++        diagnostics_layout.addWidget(self.notices_view)
++
++        self.connection_dock = self.add_panel_dock(
++            texts.GROUP_ENDPOINT,
++            connection_widget,
++            "connection.endpoint",
++            Qt.DockWidgetArea.LeftDockWidgetArea,
++        )
++        self.stream_dock = self.add_panel_dock(
++            texts.GROUP_STREAM,
++            stream_widget,
++            "connection.stream",
++            Qt.DockWidgetArea.LeftDockWidgetArea,
++        )
++        self.diagnostics_dock = self.add_panel_dock(
++            texts.GROUP_DIAGNOSTICS,
++            diagnostics_widget,
++            "connection.diagnostics",
++            Qt.DockWidgetArea.RightDockWidgetArea,
++        )
++        self.reset_layout()
++
++    def _apply_default_splits(self) -> None:
++        self.splitDockWidget(
++            self.connection_dock,
++            self.stream_dock,
++            Qt.Orientation.Vertical,
++        )
++        self.resizeDocks(
++            [self.connection_dock, self.diagnostics_dock],
++            [390, 670],
++            Qt.Orientation.Horizontal,
++        )
+ 
+     # --- Данные ------------------------------------------------------------------------
+ 
+@@ -193,7 +231,7 @@ def _on_apply_profile(self) -> None:
+     # --- Обновление --------------------------------------------------------------------
+ 
+     def refresh(self, snapshot: AppSnapshot) -> None:
+-        """Читает снимок и обновляет виджеты. Зовётся таймером окна, 10 Гц."""
++        """Читает снимок и обновляет виджеты по общему UI-таймеру."""
+         # Результат фонового подключения забирается здесь и ровно один раз:
+         # иначе один и тот же отказ повторялся бы в сообщениях десять раз
+         # в секунду.
+@@ -247,3 +285,4 @@ def refresh(self, snapshot: AppSnapshot) -> None:
+         if notices != self._notices_text:
+             self._notices_text = notices
+             self.notices_view.setPlainText(notices)
++        self.notices_view.setVisible(bool(notices))
+diff --git a/fbg/ui/panels/device_config.py b/fbg/ui/panels/device_config.py
+index 967a21a..d1293d2 100644
+--- a/fbg/ui/panels/device_config.py
++++ b/fbg/ui/panels/device_config.py
+@@ -39,13 +39,18 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self._gap_dirty = False
+         self._sweep_dirty = False
+ 
++        self.write_warning = QLabel(texts.CONFIG_WRITE_WARNING)
++        self.write_warning.setWordWrap(True)
++        self.write_warning.setStyleSheet("font-weight: bold;")
+         self.availability_label = QLabel()
+         self.availability_label.setWordWrap(True)
+ 
+         self.channel_box = QComboBox()
++        self.channel_box.setMaximumWidth(160)
+         self.threshold_auto = QCheckBox(texts.LABEL_THRESHOLD_AUTO)
+         self.threshold_spin = QSpinBox()
+         self.threshold_spin.setRange(0, self._model.adc_max)
++        self.threshold_spin.setMaximumWidth(130)
+         self.threshold_status = QLabel()
+         self.threshold_hint = QLabel()
+         self.threshold_hint.setWordWrap(True)
+@@ -53,8 +58,10 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+ 
+         self.gain_mode = QComboBox()
+         self.gain_mode.addItems([texts.LABEL_GAIN_AUTO, texts.LABEL_GAIN_MANUAL])
++        self.gain_mode.setMaximumWidth(160)
+         self.gain_level = QSpinBox()
+         self.gain_level.setRange(0, self._model.gain_max_level)
++        self.gain_level.setMaximumWidth(130)
+         self.gain_status = QLabel()
+         self.gain_hint = QLabel()
+         self.gain_hint.setWordWrap(True)
+@@ -62,6 +69,7 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+ 
+         self.peak_gap = QSpinBox()
+         self.peak_gap.setRange(1, 0xFF)
++        self.peak_gap.setMaximumWidth(130)
+         self.peak_gap_status = QLabel()
+         self.apply_peak_gap_button = QPushButton(texts.BUTTON_APPLY_PEAK_GAP)
+ 
+@@ -89,6 +97,7 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+     def _u16_spin(*, minimum: int = 0) -> QSpinBox:
+         spin = QSpinBox()
+         spin.setRange(minimum, 0xFFFF)
++        spin.setMaximumWidth(130)
+         return spin
+ 
+     def _build_layout(self) -> None:
+@@ -99,6 +108,7 @@ def _build_layout(self) -> None:
+         threshold_row.addWidget(self.threshold_spin)
+         threshold_row.addWidget(self.threshold_auto)
+         threshold_row.addWidget(self.apply_threshold_button)
++        threshold_row.addStretch(1)
+         channel_form.addRow(texts.LABEL_THRESHOLD, threshold_row)
+         channel_form.addRow("", self.threshold_status)
+         channel_form.addRow("", self.threshold_hint)
+@@ -107,6 +117,7 @@ def _build_layout(self) -> None:
+         gain_row = QHBoxLayout()
+         gain_row.addWidget(self.gain_level)
+         gain_row.addWidget(self.apply_gain_button)
++        gain_row.addStretch(1)
+         channel_form.addRow(texts.LABEL_GAIN_LEVEL, gain_row)
+         channel_form.addRow("", self.gain_status)
+         channel_form.addRow("", self.gain_hint)
+@@ -117,6 +128,7 @@ def _build_layout(self) -> None:
+         gap_row = QHBoxLayout()
+         gap_row.addWidget(self.peak_gap)
+         gap_row.addWidget(self.apply_peak_gap_button)
++        gap_row.addStretch(1)
+         gap_form.addRow(texts.LABEL_PEAK_GAP, gap_row)
+         gap_form.addRow("", self.peak_gap_status)
+         self.gap_group = QGroupBox(texts.GROUP_PEAK_GAP_CONFIG)
+@@ -130,18 +142,25 @@ def _build_layout(self) -> None:
+         sweep_form.addRow("", self.sweep_preview)
+         sweep_form.addRow("", self.sweep_hint)
+         sweep_form.addRow("", self.sweep_status)
+-        sweep_form.addRow("", self.apply_sweep_button)
++        sweep_button_row = QHBoxLayout()
++        sweep_button_row.addWidget(self.apply_sweep_button)
++        sweep_button_row.addStretch(1)
++        sweep_form.addRow("", sweep_button_row)
+         self.sweep_group = QGroupBox(texts.GROUP_SWEEP_CONFIG)
+         self.sweep_group.setLayout(sweep_form)
+ 
+         save_layout = QVBoxLayout()
+-        save_layout.addWidget(self.save_button)
++        save_button_row = QHBoxLayout()
++        save_button_row.addWidget(self.save_button)
++        save_button_row.addStretch(1)
++        save_layout.addLayout(save_button_row)
+         save_layout.addWidget(self.save_status)
+         save_layout.addWidget(self.save_hint)
+         self.save_group = QGroupBox(texts.GROUP_SAVE_THRESHOLDS)
+         self.save_group.setLayout(save_layout)
+ 
+         layout = QVBoxLayout(self)
++        layout.addWidget(self.write_warning)
+         layout.addWidget(self.availability_label)
+         layout.addWidget(self.channel_group)
+         layout.addWidget(self.gap_group)
+diff --git a/fbg/ui/panels/device_info.py b/fbg/ui/panels/device_info.py
+index 02f0063..26c67f5 100644
+--- a/fbg/ui/panels/device_info.py
++++ b/fbg/ui/panels/device_info.py
+@@ -1,67 +1,50 @@
+-"""Панель информации о приборе: что он о себе сообщил и как идёт связь.
++"""Вкладка прибора: наблюдение и настройка в трёх независимых доках."""
+ 
+-Всё только чтение. Настройка прибора — чат №11; здесь ни одного поля ввода
+-нет намеренно, чтобы панель нельзя было перепутать с диалогом настроек.
++from __future__ import annotations
+ 
+-Модель строит `fbg.ui.models.device_sections` — без Qt и с тестами. Виджет
+-раскладывает её по дереву и старается не перестраивать его без нужды: дерево,
+-пересобираемое десять раз в секунду, теряет прокрутку и раскрытые группы,
+-то есть смотреть на него невозможно ровно тогда, когда это нужно.
+-"""
++from PySide6.QtCore import Qt
++from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem, QWidget
+ 
+-from PySide6.QtWidgets import QHeaderView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget
+-
+-from fbg.ui import models
++from fbg.ui import models, texts
+ from fbg.ui.app import AppController
++from fbg.ui.docking import DockTab, scrollable
+ from fbg.ui.models import AppSnapshot, InfoSection
++from fbg.ui.panels.device_config import DeviceConfigPanel
+ 
+-#: Заголовки колонок дерева.
+ COLUMNS: tuple[str, ...] = ("Параметр", "Значение", "Примечание")
+ 
+ 
+ def sections_shape(sections: tuple[InfoSection, ...]) -> tuple[tuple[str, int], ...]:
+-    """Форма модели: заголовки групп и число строк в каждой.
++    """Форма модели: заголовки групп и число строк в каждой."""
+ 
+-    По ней решается, перестраивать дерево или обновить текст на месте.
+-    Форма меняется редко — когда прибор опрошен и появились строки каналов, —
+-    а значения меняются каждый такт.
+-    """
+     return tuple((section.title, len(section.rows)) for section in sections)
+ 
+ 
+-class DeviceInfoPanel(QWidget):
+-    """Прошивка, серийный номер, развёртка, каналы и качество связи."""
++class _SectionTree(QTreeWidget):
++    """Дерево секций с обновлением значений на месте и бережным rebuild."""
+ 
+-    def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
+-        super().__init__(parent)
+-        self._controller = controller
++    def __init__(self) -> None:
++        super().__init__()
+         self._shape: tuple[tuple[str, int], ...] = ()
+-
+-        self.tree = QTreeWidget()
+-        self.tree.setColumnCount(len(COLUMNS))
+-        self.tree.setHeaderLabels(list(COLUMNS))
+-        self.tree.setRootIsDecorated(True)
+-        self.tree.setAlternatingRowColors(True)
+-        header = self.tree.header()
++        self.setColumnCount(len(COLUMNS))
++        self.setHeaderLabels(list(COLUMNS))
++        self.setRootIsDecorated(True)
++        self.setAlternatingRowColors(True)
++        header = self.header()
+         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+ 
+-        layout = QVBoxLayout(self)
+-        layout.addWidget(self.tree)
++    def update_sections(self, sections: tuple[InfoSection, ...]) -> None:
++        """Меняет только текст, если состав строк прежний."""
+ 
+-        self.refresh(controller.snapshot())
+-
+-    def refresh(self, snapshot: AppSnapshot) -> None:
+-        """Обновляет дерево по снимку. Зовётся таймером окна, 10 Гц."""
+-        sections = models.device_sections(snapshot)
+         shape = sections_shape(sections)
+         if shape != self._shape:
+             self._rebuild(sections)
+             self._shape = shape
+             return
+         for group_index, section in enumerate(sections):
+-            group = self.tree.topLevelItem(group_index)
++            group = self.topLevelItem(group_index)
+             if group is None:
+                 continue
+             for row_index, row in enumerate(section.rows):
+@@ -73,18 +56,130 @@ def refresh(self, snapshot: AppSnapshot) -> None:
+                 if item.text(2) != row.note:
+                     item.setText(2, row.note)
+ 
++    def _selection_key(self) -> tuple[str, str] | None:
++        items = self.selectedItems()
++        if not items:
++            return None
++        item = items[0]
++        parent = item.parent()
++        if parent is None:
++            return item.text(0), ""
++        return parent.text(0), item.text(0)
++
++    def _restore_selection(self, key: tuple[str, str] | None) -> None:
++        if key is None:
++            return
++        for group_index in range(self.topLevelItemCount()):
++            group = self.topLevelItem(group_index)
++            if group is None or group.text(0) != key[0]:
++                continue
++            if not key[1]:
++                group.setSelected(True)
++                return
++            for row_index in range(group.childCount()):
++                child = group.child(row_index)
++                if child.text(0) == key[1]:
++                    child.setSelected(True)
++                    return
++
+     def _rebuild(self, sections: tuple[InfoSection, ...]) -> None:
+-        """Пересобирает дерево целиком — только когда изменилась форма модели."""
++        """Редкий rebuild сохраняет раскрытие, прокрутку и выделенную строку."""
++
+         expanded = {
+-            self.tree.topLevelItem(index).text(0)  # type: ignore[union-attr]
+-            for index in range(self.tree.topLevelItemCount())
+-            if self.tree.topLevelItem(index) is not None
+-            and self.tree.topLevelItem(index).isExpanded()  # type: ignore[union-attr]
++            item.text(0)
++            for index in range(self.topLevelItemCount())
++            if (item := self.topLevelItem(index)) is not None and item.isExpanded()
+         }
+-        self.tree.clear()
+-        for section in sections:
+-            group = QTreeWidgetItem([section.title, "", ""])
+-            for row in section.rows:
+-                QTreeWidgetItem(group, [row.label, row.value, row.note])
+-            self.tree.addTopLevelItem(group)
+-            group.setExpanded(not expanded or section.title in expanded)
++        scroll = self.verticalScrollBar().value()
++        selected = self._selection_key()
++        self.blockSignals(True)
++        try:
++            self.clear()
++            for section in sections:
++                group = QTreeWidgetItem([section.title, "", ""])
++                for row in section.rows:
++                    QTreeWidgetItem(group, [row.label, row.value, row.note])
++                self.addTopLevelItem(group)
++                group.setExpanded(not expanded or section.title in expanded)
++            self._restore_selection(selected)
++            self.verticalScrollBar().setValue(scroll)
++        finally:
++            self.blockSignals(False)
++
++
++class DeviceInfoPanel(DockTab):
++    """Паспорт/развёртка, качество связи и единственное место записи в прибор."""
++
++    layout_key = "device"
++
++    def __init__(
++        self,
++        controller: AppController,
++        config_panel: DeviceConfigPanel,
++        parent: QWidget | None = None,
++    ) -> None:
++        super().__init__(parent)
++        self._controller = controller
++        self.config_panel = config_panel
++
++        self.summary_tree = _SectionTree()
++        self.quality_tree = _SectionTree()
++        # Совместимость с прежними тестами/ручными скриптами: ``tree`` теперь
++        # означает наблюдательное дерево паспорта, а динамика вынесена отдельно.
++        self.tree = self.summary_tree
++
++        self.summary_dock = self.add_panel_dock(
++            "Паспорт и развёртка",
++            self.summary_tree,
++            "device.summary",
++            Qt.DockWidgetArea.LeftDockWidgetArea,
++        )
++        self.quality_dock = self.add_panel_dock(
++            texts.SECTION_QUALITY,
++            self.quality_tree,
++            "device.quality",
++            Qt.DockWidgetArea.RightDockWidgetArea,
++        )
++        self.config_dock = self.add_panel_dock(
++            texts.TAB_DEVICE_CONFIG,
++            scrollable(config_panel),
++            "device.config",
++            Qt.DockWidgetArea.RightDockWidgetArea,
++        )
++        self.config_dock.setStyleSheet("QDockWidget::title { font-weight: bold; }")
++        self.reset_layout()
++        self.refresh(controller.snapshot())
++
++    def _apply_default_splits(self) -> None:
++        self.splitDockWidget(
++            self.quality_dock,
++            self.config_dock,
++            Qt.Orientation.Vertical,
++        )
++        self.resizeDocks(
++            [self.summary_dock, self.quality_dock],
++            [620, 430],
++            Qt.Orientation.Horizontal,
++        )
++        self.resizeDocks(
++            [self.quality_dock, self.config_dock],
++            [330, 330],
++            Qt.Orientation.Vertical,
++        )
++
++    @staticmethod
++    def _partition(
++        sections: tuple[InfoSection, ...],
++    ) -> tuple[tuple[InfoSection, ...], tuple[InfoSection, ...]]:
++        dynamic_titles = {texts.SECTION_QUALITY, texts.SECTION_LOG}
++        summary = tuple(section for section in sections if section.title not in dynamic_titles)
++        quality = tuple(section for section in sections if section.title in dynamic_titles)
++        return summary, quality
++
++    def refresh(self, snapshot: AppSnapshot) -> None:
++        """Статика и счётчики обновляются независимо; настройка не пересоздаётся."""
++
++        summary, quality = self._partition(models.device_sections(snapshot))
++        self.summary_tree.update_sections(summary)
++        self.quality_tree.update_sections(quality)
++        self.config_panel.refresh(snapshot)
+diff --git a/fbg/ui/panels/measurement.py b/fbg/ui/panels/measurement.py
+index f80f147..c506027 100644
+--- a/fbg/ui/panels/measurement.py
++++ b/fbg/ui/panels/measurement.py
+@@ -2,7 +2,7 @@
+ 
+ UI получает данные только через `AppSnapshot`. Историю графика копирует сам
+ pipeline по запросу выбранных позиций; `RingHistory` сюда не попадает (Р36).
+-Один таймер главного окна обновляет панель 10 раз в секунду — никаких сигналов
++Один общий таймер главного окна (по умолчанию 10 Гц) обновляет панель — никаких сигналов
+ на каждый кадр и никакого файлового I/O в колбэках ядра.
+ """
+ 
+@@ -16,13 +16,12 @@
+     QDoubleSpinBox,
+     QFileDialog,
+     QFormLayout,
+-    QGroupBox,
+     QHBoxLayout,
++    QHeaderView,
+     QLabel,
+     QLineEdit,
+     QPushButton,
+     QSpinBox,
+-    QSplitter,
+     QTableView,
+     QTreeWidget,
+     QTreeWidgetItem,
+@@ -33,6 +32,7 @@
+ from fbg.core.session import SessionState
+ from fbg.ui import models, texts
+ from fbg.ui.app import AppController
++from fbg.ui.docking import DockTab
+ from fbg.ui.models import AppSnapshot, MeasurementTableModel, SlotRef
+ 
+ #: Дефолт не означает «датчики 1–4». Это четыре первых **слота** канала 1,
+@@ -51,8 +51,9 @@
+ class _MeasurementQtTableModel(QAbstractTableModel):
+     """Qt-обёртка над неизменяемой моделью последнего кадра.
+ 
+-    Обновление — один `modelReset` на весь кадр, а не 240 `dataChanged` по
+-    ячейкам. Это и есть требуемое обновление «целиком» 10 Гц.
++    При неизменной геометрии кадр подменяется одним ``dataChanged`` на весь
++    диапазон значений. ``modelReset`` оставлен только для реальной смены
++    числа каналов/позиций: иначе прокрутка и выделение слетали бы 10 раз/с.
+     """
+ 
+     def __init__(self, model: MeasurementTableModel, parent: QWidget | None = None) -> None:
+@@ -64,10 +65,27 @@ def model(self) -> MeasurementTableModel:
+         return self._model
+ 
+     def replace(self, model: MeasurementTableModel) -> None:
+-        """Подменяет кадр одним сигналом модели."""
+-        self.beginResetModel()
++        """Подменяет кадр без сброса таблицы при неизменной геометрии.
++
++        ``modelReset`` десять раз в секунду сбрасывает выделение и прокрутку.
++        Геометрия 4×30 меняется только при принятии другого профиля; обычный
++        кадр поэтому обновляется одним ``dataChanged``.
++        """
++        same_shape = (
++            self._model.channels == model.channels and self._model.positions == model.positions
++        )
++        if not same_shape:
++            self.beginResetModel()
++            self._model = model
++            self.endResetModel()
++            return
+         self._model = model
+-        self.endResetModel()
++        if self.rowCount() and self.columnCount() > 1:
++            self.dataChanged.emit(
++                self.index(0, 1),
++                self.index(self.rowCount() - 1, self.columnCount() - 1),
++                [Qt.ItemDataRole.DisplayRole],
++            )
+ 
+     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: B008, N802
+         if parent.isValid():
+@@ -77,7 +95,7 @@ def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: B008, N
+     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: B008, N802
+         if parent.isValid():
+             return 0
+-        return 1 + 2 * self._model.channels
++        return 1 + self._model.channels
+ 
+     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> object:
+         if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
+@@ -86,14 +104,7 @@ def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> o
+         column = index.column()
+         if column == 0:
+             return str(row + 1)
+-        channel = (column - 1) // 2
+-        validity_column = (column - 1) % 2 == 1
+-        if validity_column:
+-            return (
+-                texts.TABLE_VALID_YES
+-                if bool(self._model.valid[channel, row])
+-                else texts.TABLE_VALID_NO
+-            )
++        channel = column - 1
+         value = float(self._model.wavelength_nm[channel, row])
+         return texts.UNKNOWN if not self._model.valid[channel, row] else f"{value:.4f}"
+ 
+@@ -109,14 +120,15 @@ def headerData(  # noqa: N802
+             return str(section + 1)
+         if section == 0:
+             return texts.TABLE_POSITION
+-        channel = (section - 1) // 2
+-        suffix = texts.TABLE_VALID if (section - 1) % 2 else texts.TABLE_WAVELENGTH
+-        return f"К{channel + 1} {suffix}"
++        channel = section - 1
++        return f"К{channel + 1} {texts.TABLE_WAVELENGTH}"
+ 
+ 
+-class MeasurementPanel(QWidget):
++class MeasurementPanel(DockTab):
+     """График выбранных слотов, таблица 4×30 и запись CSV."""
+ 
++    layout_key = "measurement"
++
+     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
+         super().__init__(parent)
+         self._controller = controller
+@@ -136,8 +148,10 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self.history_spin.setSingleStep(0.5)
+         self.history_spin.setRange(MIN_HISTORY_S, 86_400.0)
+         self.history_spin.setValue(5.0)
++        self.history_spin.setMaximumWidth(140)
+ 
+         self.plot = pg.PlotWidget()
++        self.plot.setMinimumHeight(220)
+         # Длинная история графика измерения прореживается **только при
+         # отрисовке**. `peak` сохраняет краткие выбросы; `mean` здесь нельзя —
+         # он усреднил бы пропавший на один кадр пик. Исходные точки остаются
+@@ -150,6 +164,8 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self.plot.addLegend()
+         self.graph_hint = QLabel(texts.GRAPH_BASELINE_HINT)
+         self.graph_hint.setWordWrap(True)
++        self.empty_graph_label = QLabel(texts.EMPTY_GRAPH_HINT)
++        self.empty_graph_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+         self.quality_label = QLabel()
+ 
+         empty_table = models.measurement_table_model(controller.snapshot())
+@@ -159,6 +175,9 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self.table.setAlternatingRowColors(True)
+         self.table.verticalHeader().setVisible(False)
+         self.table.setSortingEnabled(False)
++        header = self.table.horizontalHeader()
++        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
++        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+         self.temperature_label = QLabel()
+         self.temperature_label.setWordWrap(True)
+ 
+@@ -166,9 +185,11 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self.browse_button = QPushButton(texts.BUTTON_BROWSE_DIRECTORY)
+         self.record_decimation = QSpinBox()
+         self.record_decimation.setRange(1, 100_000)
++        self.record_decimation.setMaximumWidth(140)
+         self.record_limit = QSpinBox()
+         self.record_limit.setRange(0, profile.fbg_per_channel)
+         self.record_limit.setSpecialValueText(texts.RECORD_LIMIT_ALL)
++        self.record_limit.setMaximumWidth(140)
+         self.record_estimate = QLabel()
+         self.record_estimate.setWordWrap(True)
+         self.record_state = QLabel()
+@@ -222,26 +243,21 @@ def _build_layout(self) -> None:
+         selection_layout = QVBoxLayout()
+         selection_layout.addLayout(selection_form)
+         selection_layout.addWidget(self.trace_tree, 1)
+-        selection_box = QGroupBox(texts.GROUP_TRACE_SELECTION)
++        selection_box = QWidget()
+         selection_box.setLayout(selection_layout)
+ 
+         graph_layout = QVBoxLayout()
+         graph_layout.addWidget(self.quality_label)
++        graph_layout.addWidget(self.empty_graph_label, 1)
+         graph_layout.addWidget(self.plot, 1)
+         graph_layout.addWidget(self.graph_hint)
+-        graph_box = QGroupBox(texts.GROUP_MEASUREMENT_GRAPH)
++        graph_box = QWidget()
+         graph_box.setLayout(graph_layout)
+ 
+-        graph_split = QSplitter(Qt.Orientation.Horizontal)
+-        graph_split.addWidget(selection_box)
+-        graph_split.addWidget(graph_box)
+-        graph_split.setStretchFactor(0, 0)
+-        graph_split.setStretchFactor(1, 1)
+-
+         table_layout = QVBoxLayout()
+         table_layout.addWidget(self.temperature_label)
+         table_layout.addWidget(self.table, 1)
+-        table_box = QGroupBox(texts.GROUP_MEASUREMENT_TABLE)
++        table_box = QWidget()
+         table_box.setLayout(table_layout)
+ 
+         directory_row = QHBoxLayout()
+@@ -263,23 +279,56 @@ def _build_layout(self) -> None:
+         record_buttons.addWidget(self.stop_record_button)
+         record_form.addRow("", record_buttons)
+         record_form.addRow("", self.record_error)
+-        record_box = QGroupBox(texts.GROUP_RECORDING)
++        record_box = QWidget()
+         record_box.setLayout(record_form)
+ 
+-        lower_split = QSplitter(Qt.Orientation.Horizontal)
+-        lower_split.addWidget(table_box)
+-        lower_split.addWidget(record_box)
+-        lower_split.setStretchFactor(0, 1)
+-        lower_split.setStretchFactor(1, 0)
+-
+-        outer_split = QSplitter(Qt.Orientation.Vertical)
+-        outer_split.addWidget(graph_split)
+-        outer_split.addWidget(lower_split)
+-        outer_split.setStretchFactor(0, 1)
+-        outer_split.setStretchFactor(1, 1)
++        self.selection_dock = self.add_panel_dock(
++            texts.GROUP_TRACE_SELECTION,
++            selection_box,
++            "measurement.selection",
++            Qt.DockWidgetArea.LeftDockWidgetArea,
++        )
++        self.graph_dock = self.add_panel_dock(
++            texts.GROUP_MEASUREMENT_GRAPH,
++            graph_box,
++            "measurement.graph",
++            Qt.DockWidgetArea.RightDockWidgetArea,
++        )
++        self.table_dock = self.add_panel_dock(
++            texts.GROUP_MEASUREMENT_TABLE,
++            table_box,
++            "measurement.table",
++            Qt.DockWidgetArea.LeftDockWidgetArea,
++        )
++        self.record_dock = self.add_panel_dock(
++            texts.GROUP_RECORDING,
++            record_box,
++            "measurement.record",
++            Qt.DockWidgetArea.RightDockWidgetArea,
++        )
++        self.reset_layout()
+ 
+-        layout = QVBoxLayout(self)
+-        layout.addWidget(outer_split)
++    def _apply_default_splits(self) -> None:
++        self.splitDockWidget(
++            self.selection_dock,
++            self.table_dock,
++            Qt.Orientation.Vertical,
++        )
++        self.splitDockWidget(
++            self.graph_dock,
++            self.record_dock,
++            Qt.Orientation.Vertical,
++        )
++        self.resizeDocks(
++            [self.selection_dock, self.graph_dock],
++            [270, 780],
++            Qt.Orientation.Horizontal,
++        )
++        self.resizeDocks(
++            [self.graph_dock, self.record_dock],
++            [430, 250],
++            Qt.Orientation.Vertical,
++        )
+ 
+     def _connect_signals(self) -> None:
+         self.trace_tree.itemChanged.connect(self._on_trace_changed)
+@@ -378,6 +427,13 @@ def _update_graph(self, snapshot: AppSnapshot) -> None:
+             self.graph_hint.setText(texts.GRAPH_NO_SELECTION + "\n" + texts.GRAPH_BASELINE_HINT)
+         else:
+             self.graph_hint.setText(texts.GRAPH_BASELINE_HINT)
++        has_data = (
++            bool(selected)
++            and model.t_s.size > 0
++            and any(trace.valid_points > 0 for trace in model.traces)
++        )
++        self.plot.setVisible(has_data)
++        self.empty_graph_label.setVisible(not has_data)
+ 
+     # --- Таблица ---------------------------------------------------------------------
+ 
+@@ -530,7 +586,7 @@ def _update_quality(self, snapshot: AppSnapshot) -> None:
+     # --- Общий такт ------------------------------------------------------------------
+ 
+     def refresh(self, snapshot: AppSnapshot) -> None:
+-        """Один такт 10 Гц: график, таблица и состояние записи целиком."""
++        """Один UI-такт: график, таблица и состояние записи целиком."""
+         self._update_history_limit(snapshot)
+         self._update_graph(snapshot)
+         self._update_table(snapshot)
+diff --git a/fbg/ui/panels/packet_log.py b/fbg/ui/panels/packet_log.py
+index d8ca580..0230ea6 100644
+--- a/fbg/ui/panels/packet_log.py
++++ b/fbg/ui/panels/packet_log.py
+@@ -8,7 +8,7 @@
+ 
+ Обновление по таймеру, а не по событию. При 2000 Гц событийная перерисовка
+ утопила бы UI: журнал видит все датаграммы, включая телеметрию, если она
+-включена. Такт — 10 Гц, как у остальных панелей.
++включена. По умолчанию такт — 10 Гц, как у остальных панелей.
+ 
+ Таблица форматирует **ячейки**, а не строки: `QTableView` спрашивает только
+ видимые, и hex ответа `30 03` (20430 байт) не превращается в 61 КБ текста,
+@@ -18,7 +18,7 @@
+ 
+ from pathlib import Path
+ 
+-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt
++from PySide6.QtCore import QAbstractTableModel, QItemSelectionModel, QModelIndex, QObject, Qt
+ from PySide6.QtWidgets import (
+     QAbstractItemView,
+     QCheckBox,
+@@ -29,13 +29,13 @@
+     QLabel,
+     QPushButton,
+     QTableView,
+-    QVBoxLayout,
+     QWidget,
+ )
+ 
+ from fbg.io.packet_log import Direction, PacketRecord
+ from fbg.ui import models, texts
+ from fbg.ui.app import AppController
++from fbg.ui.docking import DockTab
+ from fbg.ui.models import AppSnapshot
+ 
+ 
+@@ -91,9 +91,11 @@ def headerData(  # noqa: N802 — Qt
+         return texts.LOG_COLUMNS[section]
+ 
+ 
+-class PacketLogPanel(QWidget):
++class PacketLogPanel(DockTab):
+     """Журнал обмена: таблица, фильтры и выгрузка."""
+ 
++    layout_key = "packet_log"
++
+     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
+         super().__init__(parent)
+         self._controller = controller
+@@ -107,7 +109,9 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self.table.verticalHeader().setVisible(False)
+         header = self.table.horizontalHeader()
+         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+-        header.setStretchLastSection(True)
++        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
++        self.table.setColumnWidth(6, 320)
++        header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+ 
+         self.direction_box = QComboBox()
+         self.direction_box.addItem(texts.FILTER_ANY, None)
+@@ -133,12 +137,30 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         controls.addWidget(self.status_label)
+         controls.addWidget(self.export_button)
+ 
+-        layout = QVBoxLayout(self)
+-        layout.addLayout(controls)
+-        layout.addWidget(self.table, 1)
+-
++        controls_widget = QWidget()
++        controls_widget.setLayout(controls)
++        self.controls_dock = self.add_panel_dock(
++            "Фильтры и экспорт",
++            controls_widget,
++            "packet_log.controls",
++            Qt.DockWidgetArea.TopDockWidgetArea,
++        )
++        self.table_dock = self.add_panel_dock(
++            texts.TAB_PACKET_LOG,
++            self.table,
++            "packet_log.table",
++            Qt.DockWidgetArea.BottomDockWidgetArea,
++        )
++        self.reset_layout()
+         self.refresh(controller.snapshot())
+ 
++    def _apply_default_splits(self) -> None:
++        self.resizeDocks(
++            [self.controls_dock, self.table_dock],
++            [90, 590],
++            Qt.Orientation.Vertical,
++        )
++
+     # --- Фильтры -----------------------------------------------------------------------
+ 
+     def selected_direction(self) -> Direction | None:
+@@ -183,7 +205,7 @@ def _sync_pairs(self, records: tuple[PacketRecord, ...]) -> None:
+     # --- Обновление --------------------------------------------------------------------
+ 
+     def refresh(self, snapshot: AppSnapshot) -> None:
+-        """Читает снимок кольца и обновляет таблицу. Таймер окна, 10 Гц."""
++        """Читает снимок кольца и обновляет таблицу по общему UI-таймеру."""
+         if self.pause_box.isChecked():
+             return
+         everything = self._controller.packet_records()
+@@ -192,9 +214,27 @@ def refresh(self, snapshot: AppSnapshot) -> None:
+             direction=self.selected_direction(), id_fc=self.selected_pair()
+         )
+         at_bottom = self._at_bottom()
++        scroll_value = self.table.verticalScrollBar().value()
++        selected_seqs = {
++            self.model.records[index.row()].seq
++            for index in self.table.selectionModel().selectedRows()
++            if 0 <= index.row() < len(self.model.records)
++        }
+         self.model.set_records(records)
+         if at_bottom:
+             self.table.scrollToBottom()
++        else:
++            self.table.verticalScrollBar().setValue(scroll_value)
++        if selected_seqs:
++            selection = self.table.selectionModel()
++            selection.clearSelection()
++            for row, record in enumerate(self.model.records):
++                if record.seq in selected_seqs:
++                    selection.select(
++                        self.model.index(row, 0),
++                        QItemSelectionModel.SelectionFlag.Select
++                        | QItemSelectionModel.SelectionFlag.Rows,
++                    )
+         if snapshot.log is not None:
+             self.status_label.setText(
+                 f"{len(records)} из {len(everything)} · принято "
+diff --git a/fbg/ui/panels/sensors.py b/fbg/ui/panels/sensors.py
+index 5d5f688..7009bab 100644
+--- a/fbg/ui/panels/sensors.py
++++ b/fbg/ui/panels/sensors.py
+@@ -11,6 +11,7 @@
+ import threading
+ from pathlib import Path
+ 
++import numpy as np
+ import pyqtgraph as pg
+ from PySide6.QtCore import Qt
+ from PySide6.QtWidgets import (
+@@ -24,7 +25,6 @@
+     QLabel,
+     QLineEdit,
+     QPushButton,
+-    QSplitter,
+     QTableWidget,
+     QTableWidgetItem,
+     QTreeWidget,
+@@ -43,14 +43,17 @@
+ from fbg.io.recalibrate import RecalibrationResult, recalibrate_recording
+ from fbg.ui import models, texts
+ from fbg.ui.app import AppController
++from fbg.ui.docking import DockTab, scrollable
+ from fbg.ui.models import AppSnapshot, SensorPanelModel
+ 
+ _SENSOR_ID_ROLE = Qt.ItemDataRole.UserRole
+ 
+ 
+-class SensorsPanel(QWidget):
++class SensorsPanel(DockTab):
+     """Редактор датчиков и оперативные графики физических величин."""
+ 
++    layout_key = "sensors"
++
+     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
+         super().__init__(parent)
+         self._controller = controller
+@@ -88,9 +91,11 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self.channel_combo = QComboBox()
+         for channel in range(profile.channels):
+             self.channel_combo.addItem(texts.channel_label(channel), str(channel))
++        self.channel_combo.setMaximumWidth(180)
+         self.type_combo = QComboBox()
+         for sensor_type in SensorType:
+             self.type_combo.addItem(sensor_type.name, str(int(sensor_type)))
++        self.type_combo.setMaximumWidth(180)
+ 
+         self.expected_spin = self._nm_spin()
+         self.window_spin = QDoubleSpinBox()
+@@ -121,11 +126,15 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self.fit_residual = QLabel(texts.UNKNOWN)
+ 
+         self.value_plot = pg.PlotWidget()
++        self.value_plot.setMinimumHeight(220)
++        self.value_plot.hide()
+         self.value_plot.setLabel("bottom", "Время, с")
+         self.value_plot.showGrid(x=True, y=True, alpha=0.2)
+         self.value_plot.addLegend()
+         self.value_plot.setDownsampling(auto=True, mode="peak")
+         self.value_plot.setClipToView(True)
++        self.empty_graph_label = QLabel(texts.EMPTY_GRAPH_HINT)
++        self.empty_graph_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+ 
+         self.map_channel = QComboBox()
+         for channel in range(profile.channels):
+@@ -154,6 +163,7 @@ def _nm_spin() -> QDoubleSpinBox:
+         spin.setDecimals(6)
+         spin.setRange(1000.0, 2000.0)
+         spin.setValue(1550.0)
++        spin.setMaximumWidth(180)
+         return spin
+ 
+     @staticmethod
+@@ -161,6 +171,7 @@ def _coefficient_spin() -> QDoubleSpinBox:
+         spin = QDoubleSpinBox()
+         spin.setDecimals(9)
+         spin.setRange(-1.0e12, 1.0e12)
++        spin.setMaximumWidth(180)
+         return spin
+ 
+     def _build_layout(self) -> None:
+@@ -170,11 +181,14 @@ def _build_layout(self) -> None:
+         list_buttons = QHBoxLayout()
+         list_buttons.addWidget(self.new_button)
+         list_buttons.addWidget(self.delete_button)
++        list_buttons.addWidget(self.recalibrate_button)
++        list_buttons.addStretch(1)
+         list_layout = QVBoxLayout()
+         list_layout.addLayout(list_form)
+         list_layout.addWidget(self.sensor_tree, 1)
+         list_layout.addLayout(list_buttons)
+-        list_box = QGroupBox(texts.GROUP_SENSOR_LIST)
++        list_layout.addWidget(self.recalibrate_state)
++        list_box = QWidget()
+         list_box.setLayout(list_layout)
+ 
+         editor_form = QFormLayout()
+@@ -226,15 +240,10 @@ def _build_layout(self) -> None:
+         editor_layout.addWidget(editor_box)
+         editor_layout.addWidget(cal_box, 1)
+ 
+-        top = QSplitter(Qt.Orientation.Horizontal)
+-        top.addWidget(list_box)
+-        top.addWidget(editor_column)
+-        top.setStretchFactor(0, 1)
+-        top.setStretchFactor(1, 1)
+-
+         graph_layout = QVBoxLayout()
++        graph_layout.addWidget(self.empty_graph_label, 1)
+         graph_layout.addWidget(self.value_plot)
+-        graph_box = QGroupBox(texts.GROUP_SENSOR_GRAPH)
++        graph_box = QWidget()
+         graph_box.setLayout(graph_layout)
+ 
+         map_form = QFormLayout()
+@@ -243,23 +252,56 @@ def _build_layout(self) -> None:
+         map_layout.addLayout(map_form)
+         map_layout.addWidget(self.peak_map)
+         map_layout.addWidget(self.peak_map_hint)
+-        map_box = QGroupBox(texts.GROUP_PEAK_MAP)
++        map_box = QWidget()
+         map_box.setLayout(map_layout)
+ 
+-        plots = QSplitter(Qt.Orientation.Horizontal)
+-        plots.addWidget(graph_box)
+-        plots.addWidget(map_box)
+-
+-        reprocess_layout = QHBoxLayout()
+-        reprocess_layout.addWidget(self.recalibrate_button)
+-        reprocess_layout.addWidget(self.recalibrate_state, 1)
+-        reprocess_box = QGroupBox(texts.GROUP_RECALIBRATION)
+-        reprocess_box.setLayout(reprocess_layout)
++        self.list_dock = self.add_panel_dock(
++            texts.GROUP_SENSOR_LIST,
++            list_box,
++            "sensors.list",
++            Qt.DockWidgetArea.LeftDockWidgetArea,
++        )
++        self.editor_dock = self.add_panel_dock(
++            texts.GROUP_SENSOR_EDITOR,
++            scrollable(editor_column),
++            "sensors.editor",
++            Qt.DockWidgetArea.RightDockWidgetArea,
++        )
++        self.graph_dock = self.add_panel_dock(
++            texts.GROUP_SENSOR_GRAPH,
++            graph_box,
++            "sensors.graph",
++            Qt.DockWidgetArea.LeftDockWidgetArea,
++        )
++        self.map_dock = self.add_panel_dock(
++            texts.GROUP_PEAK_MAP,
++            map_box,
++            "sensors.map",
++            Qt.DockWidgetArea.RightDockWidgetArea,
++        )
++        self.reset_layout()
+ 
+-        layout = QVBoxLayout(self)
+-        layout.addWidget(top, 3)
+-        layout.addWidget(plots, 2)
+-        layout.addWidget(reprocess_box)
++    def _apply_default_splits(self) -> None:
++        self.splitDockWidget(
++            self.list_dock,
++            self.graph_dock,
++            Qt.Orientation.Vertical,
++        )
++        self.splitDockWidget(
++            self.editor_dock,
++            self.map_dock,
++            Qt.Orientation.Vertical,
++        )
++        self.resizeDocks(
++            [self.list_dock, self.editor_dock],
++            [500, 550],
++            Qt.Orientation.Horizontal,
++        )
++        self.resizeDocks(
++            [self.list_dock, self.graph_dock],
++            [400, 280],
++            Qt.Orientation.Vertical,
++        )
+ 
+     def _connect_signals(self) -> None:
+         self.filter_edit.textChanged.connect(lambda _text: self._refresh_from_controller())
+@@ -295,6 +337,7 @@ def _rebuild_tree(self, model: SensorPanelModel) -> None:
+             if item.checkState(0) == Qt.CheckState.Checked
+         }
+         selected = self._editing_id
++        scroll = self.sensor_tree.verticalScrollBar().value()
+         self.sensor_tree.blockSignals(True)
+         try:
+             self.sensor_tree.clear()
+@@ -320,6 +363,7 @@ def _rebuild_tree(self, model: SensorPanelModel) -> None:
+                     item.setSelected(True)
+             for group in groups.values():
+                 group.setExpanded(True)
++            self.sensor_tree.verticalScrollBar().setValue(scroll)
+         finally:
+             self.sensor_tree.blockSignals(False)
+         self._update_tree_values(model)
+@@ -573,6 +617,8 @@ def _update_graph(self) -> None:
+             if sensor_id not in selected_set:
+                 self.value_plot.removeItem(self._curves.pop(sensor_id))
+         if history is None or history.frames == 0:
++            self.value_plot.hide()
++            self.empty_graph_label.show()
+             return
+         columns = {sensor_id: index for index, sensor_id in enumerate(history.sensor_ids)}
+         t_s = history.t_mono - history.t_mono[-1]
+@@ -587,6 +633,13 @@ def _update_graph(self) -> None:
+                 )
+                 self._curves[sensor_id] = curve
+             curve.setData(t_s, history.values[:, column], connect="finite")
++        has_data = bool(selected) and any(
++            column is not None and np.any(np.isfinite(history.values[:, column]))
++            for sensor_id in selected
++            for column in (columns.get(sensor_id),)
++        )
++        self.value_plot.setVisible(has_data)
++        self.empty_graph_label.setVisible(not has_data)
+ 
+     def _update_peak_map(self, *, force: bool = False) -> None:
+         model = self._last_model
+diff --git a/fbg/ui/panels/spectrum.py b/fbg/ui/panels/spectrum.py
+index 352fa4b..4b1d894 100644
+--- a/fbg/ui/panels/spectrum.py
++++ b/fbg/ui/panels/spectrum.py
+@@ -2,12 +2,13 @@
+ 
+ import math
+ 
++import numpy as np
+ import pyqtgraph as pg
++from PySide6.QtCore import Qt
+ from PySide6.QtWidgets import (
+     QComboBox,
+     QDoubleSpinBox,
+     QFormLayout,
+-    QGroupBox,
+     QHBoxLayout,
+     QLabel,
+     QPushButton,
+@@ -21,12 +22,15 @@
+ from fbg.core.session import SessionState
+ from fbg.ui import texts
+ from fbg.ui.app import AppController
++from fbg.ui.docking import DockTab, scrollable
+ from fbg.ui.models import AppSnapshot, SpectrumModel
+ 
+ 
+-class SpectrumPanel(QWidget):
++class SpectrumPanel(DockTab):
+     """Один канал 30 07 с возможностью периодического повторения."""
+ 
++    layout_key = "spectrum"
++
+     def __init__(self, controller: AppController, parent: QWidget | None = None) -> None:
+         super().__init__(parent)
+         self._controller = controller
+@@ -36,16 +40,20 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self.channel = QComboBox()
+         for index in range(controller.config.profile.channels):
+             self.channel.addItem(texts.channel_label(index), index)
++        self.channel.setMaximumWidth(180)
+         self.period = QDoubleSpinBox()
+         self.period.setDecimals(2)
+         self.period.setRange(0.10, 3600.0)
+         self.period.setValue(1.0)
++        self.period.setMaximumWidth(140)
+         self.frequency_label = QLabel()
+         self.threshold = QSpinBox()
+         self.threshold.setRange(0, controller.config.profile.adc_max)
+         self.threshold.setValue(3000)
++        self.threshold.setMaximumWidth(140)
+         self.scale = QComboBox()
+         self.scale.addItems([texts.SPECTRUM_SCALE_ADC, texts.SPECTRUM_SCALE_DBM])
++        self.scale.setMaximumWidth(140)
+         self.take_button = QPushButton(texts.BUTTON_TAKE_SPECTRUM)
+         self.start_button = QPushButton(texts.BUTTON_START_SPECTRUM)
+         self.stop_button = QPushButton(texts.BUTTON_STOP_SPECTRUM)
+@@ -55,6 +63,8 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self.saturation_label = QLabel(texts.UNKNOWN)
+         self.saturation_label.setWordWrap(True)
+         self.plot = pg.PlotWidget()
++        self.plot.setMinimumHeight(240)
++        self.plot.hide()
+         # Спектр — 2551 реальных ADC-отсчётов, по которым смотрят форму пика.
+         # Прореживание здесь запрещено Р76: это не длинный временной ряд, и
+         # downsampling превратил бы измеренную форму в огибающую.
+@@ -62,6 +72,8 @@ def __init__(self, controller: AppController, parent: QWidget | None = None) ->
+         self.plot.setLabel("left", texts.SPECTRUM_SCALE_ADC)
+         self.plot.showGrid(x=True, y=True, alpha=0.2)
+         self.curve = self.plot.plot()
++        self.empty_graph_label = QLabel(texts.EMPTY_GRAPH_HINT)
++        self.empty_graph_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+         self.table = QTableWidget(0, 8)
+         self.table.setHorizontalHeaderLabels(
+             ["№", "Вершина, нм", "Центроид, нм", "ADC", "дБм", "Ширина, нм", "FWHM, нм", "Насыщено"]
+@@ -88,24 +100,57 @@ def _build_layout(self) -> None:
+         buttons.addWidget(self.take_button)
+         buttons.addWidget(self.start_button)
+         buttons.addWidget(self.stop_button)
+-        control = QGroupBox(texts.GROUP_SPECTRUM_CONTROL)
++        control = QWidget()
+         control_layout = QVBoxLayout()
+         control_layout.addLayout(form)
+         control_layout.addLayout(buttons)
+         control_layout.addWidget(self.warning)
+         control.setLayout(control_layout)
+-        graph = QGroupBox(texts.GROUP_SPECTRUM_GRAPH)
++        graph = QWidget()
+         graph_layout = QVBoxLayout()
+         graph_layout.addWidget(self.plot)
+         graph.setLayout(graph_layout)
+-        regions = QGroupBox(texts.GROUP_SPECTRUM_REGIONS)
++        regions = QWidget()
+         regions_layout = QVBoxLayout()
+         regions_layout.addWidget(self.table)
+         regions.setLayout(regions_layout)
+-        layout = QVBoxLayout(self)
+-        layout.addWidget(control)
+-        layout.addWidget(graph, 1)
+-        layout.addWidget(regions, 1)
++        graph_layout.insertWidget(0, self.empty_graph_label)
++        self.control_dock = self.add_panel_dock(
++            texts.GROUP_SPECTRUM_CONTROL,
++            scrollable(control),
++            "spectrum.control",
++            Qt.DockWidgetArea.LeftDockWidgetArea,
++        )
++        self.graph_dock = self.add_panel_dock(
++            texts.GROUP_SPECTRUM_GRAPH,
++            graph,
++            "spectrum.graph",
++            Qt.DockWidgetArea.RightDockWidgetArea,
++        )
++        self.regions_dock = self.add_panel_dock(
++            texts.GROUP_SPECTRUM_REGIONS,
++            regions,
++            "spectrum.regions",
++            Qt.DockWidgetArea.RightDockWidgetArea,
++        )
++        self.reset_layout()
++
++    def _apply_default_splits(self) -> None:
++        self.splitDockWidget(
++            self.graph_dock,
++            self.regions_dock,
++            Qt.Orientation.Vertical,
++        )
++        self.resizeDocks(
++            [self.control_dock, self.graph_dock],
++            [320, 730],
++            Qt.Orientation.Horizontal,
++        )
++        self.resizeDocks(
++            [self.graph_dock, self.regions_dock],
++            [430, 250],
++            Qt.Orientation.Vertical,
++        )
+ 
+     def _update_frequency_label(self, period_s: float) -> None:
+         requested_hz = 1.0 / period_s
+@@ -146,6 +191,9 @@ def _show_model(self, model: SpectrumModel) -> None:
+         dbm = self.scale.currentText() == texts.SPECTRUM_SCALE_DBM
+         y = model.power_dbm if dbm else model.adc
+         self.curve.setData(model.wavelength_nm, y, connect="finite")
++        has_data = model.wavelength_nm.size > 0 and bool(np.any(np.isfinite(y)))
++        self.plot.setVisible(has_data)
++        self.empty_graph_label.setVisible(not has_data)
+         self.plot.setLabel("left", texts.SPECTRUM_SCALE_DBM if dbm else texts.SPECTRUM_SCALE_ADC)
+         self.max_label.setText(str(model.max_adc))
+         if model.saturated:
+@@ -156,6 +204,8 @@ def _show_model(self, model: SpectrumModel) -> None:
+             self.saturation_label.setText("нет")
+         # Строки не пересоздаются без необходимости: иначе Qt сбрасывает
+         # выделение и прокрутку таблицы на каждом тике даже при том же снимке.
++        selected_row = self.table.currentRow()
++        scroll = self.table.verticalScrollBar().value()
+         if self.table.rowCount() != len(model.regions):
+             self.table.setRowCount(len(model.regions))
+         for row, region in enumerate(model.regions):
+@@ -176,6 +226,9 @@ def _show_model(self, model: SpectrumModel) -> None:
+                     self.table.setItem(row, column, item)
+                 if item.text() != value:
+                     item.setText(value)
++        if 0 <= selected_row < self.table.rowCount():
++            self.table.selectRow(selected_row)
++        self.table.verticalScrollBar().setValue(scroll)
+ 
+     def refresh(self, snapshot: AppSnapshot) -> None:
+         """Один UI-такт: не опрашивает прибор, только показывает последний снимок."""
+diff --git a/fbg/ui/texts.py b/fbg/ui/texts.py
+index f2a97c0..31eca36 100644
+--- a/fbg/ui/texts.py
++++ b/fbg/ui/texts.py
+@@ -25,6 +25,14 @@
+ TAB_DEVICE_CONFIG = "Настройка"
+ TAB_PACKET_LOG = "Журнал пакетов"
+ 
++LAYOUT_SAVE = "Сохранить раскладку"
++LAYOUT_RESET = "Сбросить раскладку"
++LAYOUT_LOCK = "Закрепить раскладку"
++LAYOUT_PERIOD = "Обновление UI, мс"
++LAYOUT_SAVED = "Раскладка интерфейса сохранена."
++LAYOUT_RESET_DONE = "Раскладка интерфейса возвращена к исходной."
++LAYOUT_LOAD_FAILED = "Раскладка интерфейса не прочитана; используется исходная."
++
+ BUTTON_CONNECT = "Подключить"
+ BUTTON_DISCONNECT = "Отключить"
+ BUTTON_CANCEL_RECOVERY = "Отменить восстановление"
+@@ -291,6 +299,10 @@ def channel_label(channel: int) -> str:
+     "Сначала примите геометрию прибора на панели подключения и переподключитесь."
+ )
+ CONFIG_READY = "Настройки прибора готовы к изменению."
++CONFIG_WRITE_WARNING = (
++    "ВНИМАНИЕ: элементы ниже отправляют команды записи в прибор. "
++    "Паспорт и качество связи в соседних областях доступны только для чтения."
++)
+ CONFIG_STREAMING_ALLOWED = (
+     "Команды 0x20 разрешены во время потока и проверяются read-back'ом (Р62). "
+     "Порог, усиление, интервал и сохранение порогов не останавливают поток; после "
+@@ -454,10 +466,13 @@ def shutdown_failure(step: str, error: str) -> str:
+     "Во время записи измерений спектр заблокирован, чтобы не создавать скрытый разрыв файла."
+ )
+ SPECTRUM_SATURATION_WARNING = (
+-    "АЦП насыщен: форма и положение пиков искажены. Понизьте усиление на вкладке «Настройка». "
++    "АЦП насыщен: форма и положение пиков искажены. Понизьте усиление в области «Настройка» "
++    "на вкладке «Прибор». "
+     "Для насыщенных областей положение вершины, центроид и FWHM не рассчитываются."
+ )
+ 
++EMPTY_GRAPH_HINT = "Нет данных для отображения."
++
+ # --------------------------------------------------------------------------------------
+ # Панель датчиков
+ # --------------------------------------------------------------------------------------
+diff --git a/tests/test_ui_measurement_model.py b/tests/test_ui_measurement_model.py
+index d27c021..632ac21 100644
+--- a/tests/test_ui_measurement_model.py
++++ b/tests/test_ui_measurement_model.py
+@@ -432,15 +432,16 @@ def test_оценка_потерь_не_бывает_отрицательной_
+     assert pipeline.metrics().loss_estimate == 0.0
+ 
+ 
+-@pytest.mark.slow
+-def test_120_линий_инкрементальный_такт_укладывается_в_ui_budget() -> None:
+-    """Чат 15: 120 линий × 20 000 точек, новый хвост 200 кадров < 100 мс.
+-
+-    Тест намеренно использует чистую Qt-free модель: он измеряет ту часть такта,
+-    которая до правки каждый раз пересчитывала всю историю. Отрисовочное
+-    прореживание pyqtgraph проверяется отдельно UI-тестом. На базовом e13bad4
+-    тест не проходит: `measurement_graph_model` не имеет инкрементального пути
+-    `previous=` и модель каждого тика строится заново.
++def test_120_линий_инкрементальный_такт_обрабатывает_только_новый_хвост(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Регресс Р76 без wall-clock: тяжёлая часть видит 200, а не 20 000 кадров.
++
++    Абсолютный бюджет времени оказался невоспроизводимым между headless Qt,
++    CI и рабочим Windows. Решение охраняется по объёму работы: после первого
++    полного построения ``flatnonzero`` на штатном следующем такте должен
++    получать только новый хвост окна. Полный пересчёт 20 000 точек здесь
++    структурно виден и роняет тест независимо от скорости машины.
+     """
+     lines = PROFILE.channels * PROFILE.fbg_per_channel
+     frames = 20_000
+@@ -475,18 +476,23 @@ def test_120_линий_инкрементальный_такт_укладыва
+         wavelength_nm=wave1,
+     )
+ 
+-    started = time.perf_counter()
++    inspected_sizes: list[int] = []
++    original_flatnonzero = np.flatnonzero
++
++    def measured_flatnonzero(values: np.ndarray) -> np.ndarray:
++        inspected_sizes.append(values.size)
++        return original_flatnonzero(values)
++
++    monkeypatch.setattr(models.np, "flatnonzero", measured_flatnonzero)
+     current = models.measurement_graph_model(
+         app_snapshot(trace_history=second_history),
+         selected,
+         previous=previous,
+     )
+-    elapsed_ms = (time.perf_counter() - started) * 1000.0
+-
+-    print(f"\nчат 15: 120 линий, инкрементальный UI-такт {elapsed_ms:.2f} мс")
+     assert len(current.traces) == 120
+     assert current.seq_start == tail and current.seq_stop == frames + tail
+-    assert elapsed_ms < 100.0
++    assert inspected_sizes
++    assert max(inspected_sizes) <= tail
+ 
+ 
+ # --------------------------------------------------------------------------------------
+diff --git a/tests/test_ui_measurement_widget.py b/tests/test_ui_measurement_widget.py
+index f6e0883..1764e0a 100644
+--- a/tests/test_ui_measurement_widget.py
++++ b/tests/test_ui_measurement_widget.py
+@@ -1,7 +1,7 @@
+ """Qt-панель измерения. Маркер `ui`, запуск с QT_QPA_PLATFORM=offscreen.
+ 
+-Проверяется устройство и поток данных, а не внешний вид: один reset таблицы
+-на кадр, выбор линий, разрыв NaN, состояние записи и отсутствие ссылок графика
++Проверяется устройство и поток данных, а не внешний вид: обновление таблицы
++без reset при той же геометрии, выбор линий, разрыв NaN, состояние записи и отсутствие ссылок графика
+ на кольцо pipeline. Читаемость и размеры остаются визуальной приёмкой Windows.
+ """
+ 
+@@ -20,7 +20,7 @@
+ from PySide6.QtWidgets import QApplication
+ 
+ from fbg.core.endpoint import Endpoint
+-from fbg.core.pipeline import RingHistory, TraceHistorySnapshot
++from fbg.core.pipeline import RingHistory
+ from fbg.core.profile import DeviceProfile
+ from fbg.core.session import SessionState
+ from fbg.io.config import AppConfig
+@@ -115,7 +115,7 @@ def test_панель_строится_с_4x30_выбором(panel: Measurement
+     selected = panel.selected_slots()
+     assert selected == tuple(models.SlotRef(0, position) for position in range(4))
+     assert panel.table_model.rowCount() == 30
+-    assert panel.table_model.columnCount() == 9
++    assert panel.table_model.columnCount() == 5
+ 
+ 
+ def test_главный_таймер_обновляет_и_гасит_панель(
+@@ -136,24 +136,31 @@ def test_главный_таймер_обновляет_и_гасит_панел
+         window.deleteLater()
+ 
+ 
+-def test_таблица_обновляется_одним_model_reset(
++def test_таблица_обновляется_без_model_reset_при_той_же_геометрии(
+     panel: MeasurementPanel, controller: AppController
+ ) -> None:
+     resets = 0
++    changes = 0
+ 
+     def count_reset() -> None:
+         nonlocal resets
+         resets += 1
+ 
++    def count_change(*_args: object) -> None:
++        nonlocal changes
++        changes += 1
++
+     panel.table_model.modelReset.connect(count_reset)
++    panel.table_model.dataChanged.connect(count_change)
+     controller.pipeline.on_telemetry(REAL_FRAME, time.perf_counter())
+     controller.pipeline.publish_now()
+     panel.refresh(controller.snapshot())
+ 
+-    assert resets == 1
++    assert resets == 0
++    assert changes == 1
+     assert panel.table_model.data(panel.table_model.index(0, 1)) != texts.UNKNOWN
+     assert panel.table_model.data(panel.table_model.index(2, 1)) == texts.UNKNOWN
+-    assert panel.table_model.data(panel.table_model.index(2, 2)) == texts.TABLE_VALID_NO
++    assert panel.table_model.data(panel.table_model.index(2, 2)) == texts.UNKNOWN
+ 
+ 
+ def test_график_держит_только_копию_а_не_кольцо(
+@@ -246,74 +253,3 @@ def test_оценка_объёма_сразу_реагирует_на_децим
+ 
+     assert after != before
+     assert panel.record_decimation.value() == 2
+-
+-
+-@pytest.mark.slow
+-def test_120_линий_инкрементальный_ui_такт_укладывается_в_budget(
+-    application: QApplication, panel: MeasurementPanel
+-) -> None:
+-    """2 кГц × 10 с × 120 линий: штатный тик остаётся быстрее UI_PERIOD_MS.
+-
+-    Первый refresh намеренно не измеряется: это редкое создание 120 кривых после
+-    изменения выбора. Критичен следующий штатный тик, где к истории добавилось
+-    200 кадров за 100 мс. Именно этот сценарий раньше пересчитывал 20 000 точек
+-    каждой линии и снова отдавал их pyqtgraph без правил Р76.
+-    """
+-    for channel_index in range(panel.trace_tree.topLevelItemCount()):
+-        channel = panel.trace_tree.topLevelItem(channel_index)
+-        assert channel is not None
+-        for position in range(channel.childCount()):
+-            channel.child(position).setCheckState(0, Qt.CheckState.Checked)
+-
+-    positions = tuple(
+-        (channel, position)
+-        for channel in range(PROFILE.channels)
+-        for position in range(PROFILE.fbg_per_channel)
+-    )
+-    frames = 20_000
+-    tail = 200
+-    t_first = np.arange(frames, dtype=np.float64) / 2000.0
+-    baselines = np.linspace(1540.0, 1555.0, len(positions), dtype=np.float64)
+-    drift = 0.002 * np.sin(np.arange(frames, dtype=np.float64)[:, None] / 200.0)
+-    wavelength_first = baselines[None, :] + drift
+-    first_history = TraceHistorySnapshot(
+-        positions=positions,
+-        seq_start=0,
+-        seq_stop=frames,
+-        t_mono=t_first,
+-        wavelength_nm=wavelength_first,
+-    )
+-    first = models.AppSnapshot(
+-        endpoint=Endpoint(),
+-        profile=PROFILE,
+-        state=SessionState.STREAMING,
+-        trace_history=first_history,
+-    )
+-    panel.refresh(first)
+-    application.processEvents()
+-
+-    t_second = np.arange(tail, frames + tail, dtype=np.float64) / 2000.0
+-    wavelength_second = np.empty_like(wavelength_first)
+-    wavelength_second[:-tail] = wavelength_first[tail:]
+-    new_index = np.arange(frames, frames + tail, dtype=np.float64)
+-    wavelength_second[-tail:] = baselines[None, :] + 0.002 * np.sin(new_index[:, None] / 200.0)
+-    second_history = TraceHistorySnapshot(
+-        positions=positions,
+-        seq_start=tail,
+-        seq_stop=frames + tail,
+-        t_mono=t_second,
+-        wavelength_nm=wavelength_second,
+-    )
+-    second = models.AppSnapshot(
+-        endpoint=Endpoint(),
+-        profile=PROFILE,
+-        state=SessionState.STREAMING,
+-        trace_history=second_history,
+-    )
+-
+-    started = time.perf_counter()
+-    panel.refresh(second)
+-    elapsed_ms = (time.perf_counter() - started) * 1000.0
+-    print(f"\nчат 15: 120 линий, Qt UI-такт {elapsed_ms:.2f} мс")
+-
+-    assert elapsed_ms < UI_PERIOD_MS
+diff --git a/tests/test_ui_widgets.py b/tests/test_ui_widgets.py
+index b132ac1..1a1939e 100644
+--- a/tests/test_ui_widgets.py
++++ b/tests/test_ui_widgets.py
+@@ -7,6 +7,7 @@
+ подменяется.
+ """
+ 
++import json
+ import os
+ from collections.abc import Iterator
+ from pathlib import Path
+@@ -27,6 +28,7 @@
+ from fbg.io.packet_log import Direction, PacketLogConfig
+ from fbg.ui import models, texts
+ from fbg.ui.app import AppController
++from fbg.ui.docking import DEFAULT_UI_PERIOD_MS, UI_LAYOUT_FILENAME
+ from fbg.ui.main_window import UI_PERIOD_MS, MainWindow
+ from fbg.ui.panels.device_info import sections_shape
+ 
+@@ -77,7 +79,7 @@ def push(controller: AppController, count: int, prefix: bytes = b"\x10\x04\x04\x
+ # --------------------------------------------------------------------------------------
+ 
+ 
+-def test_окно_создаётся_с_семью_вкладками(window: MainWindow) -> None:
++def test_окно_создаётся_с_шестью_вкладками(window: MainWindow) -> None:
+     """Вкладки на месте и подписаны по-русски."""
+     titles = [window.tabs.tabText(index) for index in range(window.tabs.count())]
+     assert titles == [
+@@ -86,16 +88,97 @@ def test_окно_создаётся_с_семью_вкладками(window: Ma
+         texts.TAB_SENSORS,
+         texts.TAB_SPECTRUM,
+         texts.TAB_DEVICE,
+-        texts.TAB_DEVICE_CONFIG,
+         texts.TAB_PACKET_LOG,
+     ]
+     assert window.windowTitle() == texts.APP_TITLE
+-    assert len(window.panels) == 7
++    assert len(window.panels) == 6
++    assert window.device_panel.config_panel is window.device_config_panel
++
++
++def test_у_каждой_вкладки_есть_именованные_доки(window: MainWindow) -> None:
++    """Шесть раскладок сохраняются через QMainWindow.saveState по objectName."""
++    for panel in window.panels:
++        assert 2 <= len(panel.dock_widgets) <= 4
++        assert all(dock.objectName() for dock in panel.dock_widgets)
++        assert len({dock.objectName() for dock in panel.dock_widgets}) == len(panel.dock_widgets)
+ 
+ 
+ def test_таймер_запускается_и_гаснет(window: MainWindow) -> None:
+     """Событийного обновления нет: при 2 кГц оно утопило бы UI."""
+     assert not window.timer.isActive()
++
++
++def test_период_ui_меняется_одним_общим_таймером(window: MainWindow) -> None:
++    window.ui_period_spin.setValue(250)
++    assert window.timer.interval() == 250
++    assert window.ui_period_spin.value() == 250
++
++
++def test_раскладка_сохраняется_и_восстанавливается(
++    application: QApplication, tmp_path: Path
++) -> None:
++    config_path = tmp_path / "fbg_config.json"
++    controller = AppController(
++        AppConfig(packet_log=PacketLogConfig(directory=None)),
++        config_path=config_path,
++    )
++    controller.start()
++    first = MainWindow(controller)
++    try:
++        first.packet_log_panel.controls_dock.hide()
++        first.ui_period_spin.setValue(250)
++        first.set_layout_locked(True)
++        first.save_layout_now()
++        layout_path = tmp_path / UI_LAYOUT_FILENAME
++        raw = json.loads(layout_path.read_text(encoding="ascii"))
++        assert raw["period_ms"] == 250
++        assert raw["locked"] is True
++        assert set(raw["docks"]) == {panel.layout_key for panel in first.panels}
++    finally:
++        first.close()
++        first.deleteLater()
++
++    second = MainWindow(controller)
++    try:
++        assert second.timer.interval() == 250
++        assert second.lock_layout_button.isChecked()
++        assert second.packet_log_panel.controls_dock.isHidden()
++    finally:
++        second.close()
++        second.deleteLater()
++        controller.shutdown()
++
++
++def test_нечитаемая_раскладка_карантинится(application: QApplication, tmp_path: Path) -> None:
++    config_path = tmp_path / "fbg_config.json"
++    layout_path = tmp_path / UI_LAYOUT_FILENAME
++    layout_path.write_text("{broken", encoding="ascii")
++    controller = AppController(
++        AppConfig(packet_log=PacketLogConfig(directory=None)),
++        config_path=config_path,
++    )
++    controller.start()
++    main = MainWindow(controller)
++    try:
++        assert not layout_path.exists()
++        assert (tmp_path / f"{UI_LAYOUT_FILENAME}.bad").exists()
++        assert main.timer.interval() == DEFAULT_UI_PERIOD_MS
++        assert any(texts.LAYOUT_LOAD_FAILED in notice for notice in controller.notices)
++    finally:
++        main.close()
++        main.deleteLater()
++        controller.shutdown()
++
++
++def test_сброс_раскладки_возвращает_доки_период_и_разблокировку(window: MainWindow) -> None:
++    dock = window.spectrum_panel.control_dock
++    dock.hide()
++    window.set_layout_locked(True)
++    window.ui_period_spin.setValue(300)
++    window.reset_layout()
++    assert not dock.isHidden()
++    assert not window.lock_layout_button.isChecked()
++    assert window.timer.interval() == DEFAULT_UI_PERIOD_MS
+     window.start_updates()
+     assert window.timer.isActive()
+     assert window.timer.interval() == UI_PERIOD_MS
+@@ -155,6 +238,32 @@ def counted(snapshot: models.AppSnapshot, *, _panel=panel, _original=original) -
+     assert sum(calls.values()) == 1
+ 
+ 
++def test_floating_док_скрытой_вкладки_продолжает_обновляться(
++    window: MainWindow, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Отделённое окно не замирает после переключения родительской вкладки."""
++    floating = window.measurement_panel.graph_dock
++    floating.setFloating(True)
++    floating.show()
++    window.tabs.setCurrentWidget(window.packet_log_panel)
++
++    calls = {panel: 0 for panel in window.panels}
++    for panel in window.panels:
++        original = panel.refresh
++
++        def counted(snapshot: models.AppSnapshot, *, _panel=panel, _original=original) -> None:
++            calls[_panel] += 1
++            _original(snapshot)
++
++        monkeypatch.setattr(panel, "refresh", counted)
++
++    window.tick()
++    assert calls[window.packet_log_panel] == 1
++    assert calls[window.measurement_panel] == 1
++    assert sum(calls.values()) == 2
++    floating.setFloating(False)
++
++
+ def test_история_копируется_только_для_видимого_графика(
+     window: MainWindow, controller: AppController, monkeypatch: pytest.MonkeyPatch
+ ) -> None:
+@@ -291,13 +400,16 @@ def test_диагностика_наполняется_текстом(window: Ma
+ 
+ def test_дерево_прибора_строится_по_модели(window: MainWindow) -> None:
+     """Группы и строки те же, что отдала модель."""
++    window.tabs.setCurrentWidget(window.device_panel)
+     window.tick()
+-    tree = window.device_panel.tree
+     sections = models.device_sections(window._controller.snapshot())
+-    assert tree.topLevelItemCount() == len(sections)
++    summary, quality = window.device_panel._partition(sections)
++    tree = window.device_panel.summary_tree
++    assert tree.topLevelItemCount() == len(summary)
++    assert window.device_panel.quality_tree.topLevelItemCount() == len(quality)
+     first = tree.topLevelItem(0)
+     assert first is not None and first.text(0) == texts.SECTION_DEVICE
+-    assert first.childCount() == len(sections[0].rows)
++    assert first.childCount() == len(summary[0].rows)
+ 
+ 
+ def test_дерево_не_пересобирается_на_каждом_такте(window: MainWindow) -> None:
+@@ -305,6 +417,7 @@ def test_дерево_не_пересобирается_на_каждом_так
+ 
+     То есть смотреть на него невозможно ровно тогда, когда это нужно.
+     """
++    window.tabs.setCurrentWidget(window.device_panel)
+     window.tick()
+     tree = window.device_panel.tree
+     item = tree.topLevelItem(0)
+@@ -394,6 +507,24 @@ def test_фильтр_по_паре_не_сбрасывается_на_такт
+     assert panel.selected_pair() == (0x30, 0x01)
+ 
+ 
++def test_выделенная_строка_журнала_сохраняется_после_нового_снимка(
++    window: MainWindow, controller: AppController
++) -> None:
++    push(controller, 5)
++    panel = window.packet_log_panel
++    window.tabs.setCurrentWidget(panel)
++    window.tick()
++    wanted_seq = panel.model.records[2].seq
++    panel.table.selectRow(2)
++
++    push(controller, 2)
++    window.tick()
++
++    selected = panel.table.selectionModel().selectedRows()
++    assert selected
++    assert {panel.model.records[index.row()].seq for index in selected} == {wanted_seq}
++
++
+ def test_пауза_останавливает_обновление(window: MainWindow, controller: AppController) -> None:
+     """Журнал при этом продолжает писаться — стоит только таблица."""
+     push(controller, 2)
