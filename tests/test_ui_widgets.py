@@ -7,6 +7,7 @@
 подменяется.
 """
 
+import json
 import os
 from collections.abc import Iterator
 from pathlib import Path
@@ -27,6 +28,7 @@ from fbg.io.config import AppConfig
 from fbg.io.packet_log import Direction, PacketLogConfig
 from fbg.ui import models, texts
 from fbg.ui.app import AppController
+from fbg.ui.docking import DEFAULT_UI_PERIOD_MS, UI_LAYOUT_FILENAME
 from fbg.ui.main_window import UI_PERIOD_MS, MainWindow
 from fbg.ui.panels.device_info import sections_shape
 
@@ -77,7 +79,7 @@ def push(controller: AppController, count: int, prefix: bytes = b"\x10\x04\x04\x
 # --------------------------------------------------------------------------------------
 
 
-def test_окно_создаётся_с_семью_вкладками(window: MainWindow) -> None:
+def test_окно_создаётся_с_шестью_вкладками(window: MainWindow) -> None:
     """Вкладки на месте и подписаны по-русски."""
     titles = [window.tabs.tabText(index) for index in range(window.tabs.count())]
     assert titles == [
@@ -86,16 +88,97 @@ def test_окно_создаётся_с_семью_вкладками(window: Ma
         texts.TAB_SENSORS,
         texts.TAB_SPECTRUM,
         texts.TAB_DEVICE,
-        texts.TAB_DEVICE_CONFIG,
         texts.TAB_PACKET_LOG,
     ]
     assert window.windowTitle() == texts.APP_TITLE
-    assert len(window.panels) == 7
+    assert len(window.panels) == 6
+    assert window.device_panel.config_panel is window.device_config_panel
+
+
+def test_у_каждой_вкладки_есть_именованные_доки(window: MainWindow) -> None:
+    """Шесть раскладок сохраняются через QMainWindow.saveState по objectName."""
+    for panel in window.panels:
+        assert 2 <= len(panel.dock_widgets) <= 4
+        assert all(dock.objectName() for dock in panel.dock_widgets)
+        assert len({dock.objectName() for dock in panel.dock_widgets}) == len(panel.dock_widgets)
 
 
 def test_таймер_запускается_и_гаснет(window: MainWindow) -> None:
     """Событийного обновления нет: при 2 кГц оно утопило бы UI."""
     assert not window.timer.isActive()
+
+
+def test_период_ui_меняется_одним_общим_таймером(window: MainWindow) -> None:
+    window.ui_period_spin.setValue(250)
+    assert window.timer.interval() == 250
+    assert window.ui_period_spin.value() == 250
+
+
+def test_раскладка_сохраняется_и_восстанавливается(
+    application: QApplication, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "fbg_config.json"
+    controller = AppController(
+        AppConfig(packet_log=PacketLogConfig(directory=None)),
+        config_path=config_path,
+    )
+    controller.start()
+    first = MainWindow(controller)
+    try:
+        first.packet_log_panel.controls_dock.hide()
+        first.ui_period_spin.setValue(250)
+        first.set_layout_locked(True)
+        first.save_layout_now()
+        layout_path = tmp_path / UI_LAYOUT_FILENAME
+        raw = json.loads(layout_path.read_text(encoding="ascii"))
+        assert raw["period_ms"] == 250
+        assert raw["locked"] is True
+        assert set(raw["docks"]) == {panel.layout_key for panel in first.panels}
+    finally:
+        first.close()
+        first.deleteLater()
+
+    second = MainWindow(controller)
+    try:
+        assert second.timer.interval() == 250
+        assert second.lock_layout_button.isChecked()
+        assert second.packet_log_panel.controls_dock.isHidden()
+    finally:
+        second.close()
+        second.deleteLater()
+        controller.shutdown()
+
+
+def test_нечитаемая_раскладка_карантинится(application: QApplication, tmp_path: Path) -> None:
+    config_path = tmp_path / "fbg_config.json"
+    layout_path = tmp_path / UI_LAYOUT_FILENAME
+    layout_path.write_text("{broken", encoding="ascii")
+    controller = AppController(
+        AppConfig(packet_log=PacketLogConfig(directory=None)),
+        config_path=config_path,
+    )
+    controller.start()
+    main = MainWindow(controller)
+    try:
+        assert not layout_path.exists()
+        assert (tmp_path / f"{UI_LAYOUT_FILENAME}.bad").exists()
+        assert main.timer.interval() == DEFAULT_UI_PERIOD_MS
+        assert any(texts.LAYOUT_LOAD_FAILED in notice for notice in controller.notices)
+    finally:
+        main.close()
+        main.deleteLater()
+        controller.shutdown()
+
+
+def test_сброс_раскладки_возвращает_доки_период_и_разблокировку(window: MainWindow) -> None:
+    dock = window.spectrum_panel.control_dock
+    dock.hide()
+    window.set_layout_locked(True)
+    window.ui_period_spin.setValue(300)
+    window.reset_layout()
+    assert not dock.isHidden()
+    assert not window.lock_layout_button.isChecked()
+    assert window.timer.interval() == DEFAULT_UI_PERIOD_MS
     window.start_updates()
     assert window.timer.isActive()
     assert window.timer.interval() == UI_PERIOD_MS
@@ -153,6 +236,32 @@ def test_такт_обновляет_только_видимую_панель(
 
     assert calls[window.packet_log_panel] == 1
     assert sum(calls.values()) == 1
+
+
+def test_floating_док_скрытой_вкладки_продолжает_обновляться(
+    window: MainWindow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Отделённое окно не замирает после переключения родительской вкладки."""
+    floating = window.measurement_panel.graph_dock
+    floating.setFloating(True)
+    floating.show()
+    window.tabs.setCurrentWidget(window.packet_log_panel)
+
+    calls = {panel: 0 for panel in window.panels}
+    for panel in window.panels:
+        original = panel.refresh
+
+        def counted(snapshot: models.AppSnapshot, *, _panel=panel, _original=original) -> None:
+            calls[_panel] += 1
+            _original(snapshot)
+
+        monkeypatch.setattr(panel, "refresh", counted)
+
+    window.tick()
+    assert calls[window.packet_log_panel] == 1
+    assert calls[window.measurement_panel] == 1
+    assert sum(calls.values()) == 2
+    floating.setFloating(False)
 
 
 def test_история_копируется_только_для_видимого_графика(
@@ -291,13 +400,16 @@ def test_диагностика_наполняется_текстом(window: Ma
 
 def test_дерево_прибора_строится_по_модели(window: MainWindow) -> None:
     """Группы и строки те же, что отдала модель."""
+    window.tabs.setCurrentWidget(window.device_panel)
     window.tick()
-    tree = window.device_panel.tree
     sections = models.device_sections(window._controller.snapshot())
-    assert tree.topLevelItemCount() == len(sections)
+    summary, quality = window.device_panel._partition(sections)
+    tree = window.device_panel.summary_tree
+    assert tree.topLevelItemCount() == len(summary)
+    assert window.device_panel.quality_tree.topLevelItemCount() == len(quality)
     first = tree.topLevelItem(0)
     assert first is not None and first.text(0) == texts.SECTION_DEVICE
-    assert first.childCount() == len(sections[0].rows)
+    assert first.childCount() == len(summary[0].rows)
 
 
 def test_дерево_не_пересобирается_на_каждом_такте(window: MainWindow) -> None:
@@ -305,6 +417,7 @@ def test_дерево_не_пересобирается_на_каждом_так
 
     То есть смотреть на него невозможно ровно тогда, когда это нужно.
     """
+    window.tabs.setCurrentWidget(window.device_panel)
     window.tick()
     tree = window.device_panel.tree
     item = tree.topLevelItem(0)
@@ -392,6 +505,24 @@ def test_фильтр_по_паре_не_сбрасывается_на_такт�
     push(controller, 1, prefix=b"\x10\x05\x04\x00")
     window.tick()
     assert panel.selected_pair() == (0x30, 0x01)
+
+
+def test_выделенная_строка_журнала_сохраняется_после_нового_снимка(
+    window: MainWindow, controller: AppController
+) -> None:
+    push(controller, 5)
+    panel = window.packet_log_panel
+    window.tabs.setCurrentWidget(panel)
+    window.tick()
+    wanted_seq = panel.model.records[2].seq
+    panel.table.selectRow(2)
+
+    push(controller, 2)
+    window.tick()
+
+    selected = panel.table.selectionModel().selectedRows()
+    assert selected
+    assert {panel.model.records[index.row()].seq for index in selected} == {wanted_seq}
 
 
 def test_пауза_останавливает_обновление(window: MainWindow, controller: AppController) -> None:
