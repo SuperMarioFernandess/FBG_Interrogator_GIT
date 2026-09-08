@@ -86,9 +86,7 @@ def load_layout(path: Path) -> UiLayoutState:
 
     period_ms = raw.get("period_ms", DEFAULT_UI_PERIOD_MS)
     if type(period_ms) is not int or not MIN_UI_PERIOD_MS <= period_ms <= MAX_UI_PERIOD_MS:
-        raise ValueError(
-            f"period_ms должен быть целым {MIN_UI_PERIOD_MS}…{MAX_UI_PERIOD_MS}"
-        )
+        raise ValueError(f"period_ms должен быть целым {MIN_UI_PERIOD_MS}…{MAX_UI_PERIOD_MS}")
     locked = raw.get("locked", False)
     if type(locked) is not bool:
         raise ValueError("locked должен быть true/false")
