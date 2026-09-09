@@ -99,6 +99,18 @@ def snapshot(controller: AppController, **kwargs: object) -> models.AppSnapshot:
     return models.AppSnapshot(**base)  # type: ignore[arg-type]
 
 
+def test_пустой_график_датчиков_подсказывает_следующее_действие(
+    application: QApplication, controller: AppController
+) -> None:
+    panel = SensorsPanel(controller)
+    try:
+        assert panel.empty_graph_label.text() == texts.SENSOR_EMPTY_GRAPH_HINT
+        assert texts.SENSOR_EMPTY_GRAPH_HINT == "Отметьте датчики."
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
 def test_таблица_группируется_по_каналу_и_не_прячет_пропавший_датчик(
     application: QApplication, controller: AppController
 ) -> None:
@@ -143,6 +155,59 @@ def test_все_пять_статусов_различимы_в_таблице(
         )
         shown = {panel._items[current.id].text(6) for current in sensors}
         assert shown == {texts.SENSOR_STATUS_LABELS[status.value] for status in statuses}
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
+def test_дерево_датчиков_сохраняет_прокрутку_и_выделение_при_rebuild(
+    application: QApplication, controller: AppController
+) -> None:
+    items = tuple(sensor(f"S{i:02d}", expected_nm=1540.0 + i * 0.25) for i in range(20))
+    controller.replace_sensors(items)
+    panel = SensorsPanel(controller)
+    try:
+        panel.resize(900, 600)
+        panel.show()
+        panel.sensor_tree.setFixedHeight(120)
+        panel.refresh(snapshot(controller, sensor_version=1))
+        application.processEvents()
+
+        wanted = panel._items["S10"]
+        wanted.setSelected(True)
+        application.processEvents()
+        scroll = panel.sensor_tree.verticalScrollBar()
+        scroll.setValue(scroll.maximum())
+        before_scroll = scroll.value()
+
+        controller.replace_sensors((*items, sensor("S20", expected_nm=1545.0)))
+        panel.refresh(snapshot(controller, sensor_version=2))
+        application.processEvents()
+
+        selected = panel.sensor_tree.selectedItems()
+        assert len(selected) == 1
+        assert selected[0].text(0) == "Датчик S10"
+        assert scroll.value() == before_scroll
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
+def test_редактор_датчика_использует_компактные_поля(
+    application: QApplication, controller: AppController
+) -> None:
+    panel = SensorsPanel(controller)
+    try:
+        assert panel.expected_spin.decimals() == 4
+        assert panel.window_spin.decimals() == 4
+        assert panel.k1_spin.decimals() == 4
+        assert panel.k2_spin.decimals() == 4
+        assert panel.k1_spin.minimum() == pytest.approx(-1.0e8)
+        assert panel.k1_spin.maximum() == pytest.approx(1.0e8)
+        assert panel.value0_spin.minimum() == pytest.approx(-1.0e9)
+        assert panel.value0_spin.maximum() == pytest.approx(1.0e9)
+        assert panel.expected_spin.maximumWidth() == 130
+        assert panel.k1_spin.maximumWidth() == 150
     finally:
         panel.close()
         panel.deleteLater()
@@ -219,7 +284,7 @@ def test_взять_текущую_лямбду_берёт_пик_из_теле�
         panel.refresh(snapshot(controller, ui=SimpleNamespace(wavelength_nm=wavelengths)))
         assert panel.current_peak_combo.count() == 1
         panel.take_wavelength_button.click()
-        assert panel.expected_spin.value() == pytest.approx(1544.812345, abs=1e-6)
+        assert panel.expected_spin.value() == pytest.approx(1544.8123, abs=5e-5)
     finally:
         panel.close()
         panel.deleteLater()

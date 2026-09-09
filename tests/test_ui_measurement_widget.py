@@ -163,6 +163,28 @@ def test_таблица_обновляется_без_model_reset_при_той_
     assert panel.table_model.data(panel.table_model.index(2, 2)) == texts.UNKNOWN
 
 
+def test_таблица_кадра_сохраняет_прокрутку_и_выделение(
+    application: QApplication, panel: MeasurementPanel, controller: AppController
+) -> None:
+    panel.resize(700, 500)
+    panel.show()
+    panel.table.setFixedHeight(120)
+    application.processEvents()
+    panel.table.selectRow(20)
+    scroll = panel.table.verticalScrollBar()
+    scroll.setValue(scroll.maximum())
+    before_scroll = scroll.value()
+
+    controller.pipeline.on_telemetry(REAL_FRAME, time.perf_counter())
+    controller.pipeline.publish_now()
+    panel.refresh(controller.snapshot())
+    application.processEvents()
+
+    selected = panel.table.selectionModel().selectedRows()
+    assert [index.row() for index in selected] == [20]
+    assert scroll.value() == before_scroll
+
+
 def test_график_держит_только_копию_а_не_кольцо(
     panel: MeasurementPanel, controller: AppController
 ) -> None:

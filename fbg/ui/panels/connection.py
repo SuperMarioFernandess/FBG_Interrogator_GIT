@@ -68,6 +68,8 @@ class ConnectionPanel(DockTab):
         self.mismatch_label.setWordWrap(True)
         self.diagnostics_view = QPlainTextEdit()
         self.diagnostics_view.setReadOnly(True)
+        self.notices_label = QLabel(texts.LABEL_NOTICES)
+        self.notices_label.setVisible(False)
         self.notices_view = QPlainTextEdit()
         self.notices_view.setReadOnly(True)
         self.notices_view.setMaximumHeight(110)
@@ -119,6 +121,7 @@ class ConnectionPanel(DockTab):
         diagnostics_widget = QWidget()
         diagnostics_layout = QVBoxLayout(diagnostics_widget)
         diagnostics_layout.addWidget(self.diagnostics_view)
+        diagnostics_layout.addWidget(self.notices_label)
         diagnostics_layout.addWidget(self.notices_view)
 
         self.connection_dock = self.add_panel_dock(
@@ -285,4 +288,6 @@ class ConnectionPanel(DockTab):
         if notices != self._notices_text:
             self._notices_text = notices
             self.notices_view.setPlainText(notices)
-        self.notices_view.setVisible(bool(notices))
+        has_notices = bool(notices)
+        self.notices_label.setVisible(has_notices)
+        self.notices_view.setVisible(has_notices)
