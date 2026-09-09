@@ -180,7 +180,7 @@ def test_дерево_датчиков_сохраняет_прокрутку_и_
         scroll.setValue(scroll.maximum())
         before_scroll = scroll.value()
 
-        controller.replace_sensors(items + (sensor("S20", expected_nm=1545.0),))
+        controller.replace_sensors((*items, sensor("S20", expected_nm=1545.0)))
         panel.refresh(snapshot(controller, sensor_version=2))
         application.processEvents()
 
