@@ -31,11 +31,12 @@ _UNLOCKED_FEATURES = (
 
 @dataclass(frozen=True)
 class UiLayoutState:
-    """Сохранённое состояние всех вкладок и общие UI-настройки."""
+    """Сохранённое состояние окна, вкладок и общие UI-настройки."""
 
     docks: dict[str, QByteArray]
     locked: bool = False
     period_ms: int = DEFAULT_UI_PERIOD_MS
+    window_geometry: QByteArray | None = None
 
 
 def layout_path_for_config(config_path: Path | None) -> Path | None:
@@ -65,6 +66,16 @@ def quarantine_layout(path: Path) -> Path:
     target = _quarantine_path(path)
     path.replace(target)
     return target
+
+
+def _decode_qt_bytes(value: str, field: str) -> QByteArray:
+    try:
+        decoded = base64.b64decode(value.encode("ascii"), validate=True)
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError(f"{field}: неверный base64") from exc
+    if not decoded:
+        raise ValueError(f"{field}: пустое состояние")
+    return QByteArray(decoded)
 
 
 def load_layout(path: Path) -> UiLayoutState:
@@ -98,14 +109,20 @@ def load_layout(path: Path) -> UiLayoutState:
     for name, value in encoded.items():
         if not isinstance(name, str) or not name or not isinstance(value, str):
             raise ValueError("docks должен содержать пары строк имя→base64")
-        try:
-            decoded = base64.b64decode(value.encode("ascii"), validate=True)
-        except (UnicodeError, ValueError) as exc:
-            raise ValueError(f"docks.{name}: неверный base64") from exc
-        if not decoded:
-            raise ValueError(f"docks.{name}: пустое состояние")
-        docks[name] = QByteArray(decoded)
-    return UiLayoutState(docks=docks, locked=locked, period_ms=period_ms)
+        docks[name] = _decode_qt_bytes(value, f"docks.{name}")
+
+    geometry_raw = raw.get("window_geometry")
+    geometry = None
+    if geometry_raw is not None:
+        if not isinstance(geometry_raw, str):
+            raise ValueError("window_geometry должен быть строкой base64")
+        geometry = _decode_qt_bytes(geometry_raw, "window_geometry")
+    return UiLayoutState(
+        docks=docks,
+        locked=locked,
+        period_ms=period_ms,
+        window_geometry=geometry,
+    )
 
 
 def save_layout(path: Path, state: UiLayoutState) -> Path:
@@ -121,6 +138,8 @@ def save_layout(path: Path, state: UiLayoutState) -> Path:
             for name, value in sorted(state.docks.items())
         },
     }
+    if state.window_geometry is not None:
+        payload["window_geometry"] = base64.b64encode(bytes(state.window_geometry)).decode("ascii")
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(
         json.dumps(payload, ensure_ascii=True, indent=2) + "\n",

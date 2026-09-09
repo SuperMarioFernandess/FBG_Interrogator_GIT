@@ -99,24 +99,25 @@ class SensorsPanel(DockTab):
 
         self.expected_spin = self._nm_spin()
         self.window_spin = QDoubleSpinBox()
-        self.window_spin.setDecimals(6)
-        self.window_spin.setRange(0.000001, 100.0)
+        self.window_spin.setDecimals(4)
+        self.window_spin.setRange(0.0001, 100.0)
         self.window_spin.setValue(0.35)
-        self.value0_spin = self._coefficient_spin()
+        self.window_spin.setMaximumWidth(130)
+        self.value0_spin = self._value_spin()
         self.k1_spin = self._coefficient_spin()
         self.k2_spin = self._coefficient_spin()
 
         self.down_limit_enabled = QCheckBox()
-        self.down_limit_spin = self._coefficient_spin()
+        self.down_limit_spin = self._value_spin()
         self.up_limit_enabled = QCheckBox()
-        self.up_limit_spin = self._coefficient_spin()
+        self.up_limit_spin = self._value_spin()
 
         self.current_peak_combo = QComboBox()
         self.take_wavelength_button = QPushButton(texts.BUTTON_SENSOR_TAKE_WAVELENGTH)
 
         self.points_table = QTableWidget(0, 2)
         self.points_table.setHorizontalHeaderLabels(["λ, нм", "Известное значение"])
-        self.known_value_spin = self._coefficient_spin()
+        self.known_value_spin = self._value_spin()
         self.add_point_button = QPushButton(texts.BUTTON_SENSOR_ADD_POINT)
         self.remove_point_button = QPushButton(texts.BUTTON_SENSOR_REMOVE_POINT)
         self.fit_kind = QComboBox()
@@ -133,7 +134,7 @@ class SensorsPanel(DockTab):
         self.value_plot.addLegend()
         self.value_plot.setDownsampling(auto=True, mode="peak")
         self.value_plot.setClipToView(True)
-        self.empty_graph_label = QLabel(texts.EMPTY_GRAPH_HINT)
+        self.empty_graph_label = QLabel(texts.SENSOR_EMPTY_GRAPH_HINT)
         self.empty_graph_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.map_channel = QComboBox()
@@ -160,18 +161,30 @@ class SensorsPanel(DockTab):
     @staticmethod
     def _nm_spin() -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
-        spin.setDecimals(6)
+        spin.setDecimals(4)
         spin.setRange(1000.0, 2000.0)
         spin.setValue(1550.0)
-        spin.setMaximumWidth(180)
+        spin.setMaximumWidth(130)
+        return spin
+
+    @staticmethod
+    def _value_spin() -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setDecimals(4)
+        # Значение/пределы могут быть заметно крупнее коэффициентов, но миллиард
+        # единиц всё ещё оставляет широкий запас без поля шириной под 1e12.
+        spin.setRange(-1.0e9, 1.0e9)
+        spin.setMaximumWidth(150)
         return spin
 
     @staticmethod
     def _coefficient_spin() -> QDoubleSpinBox:
         spin = QDoubleSpinBox()
-        spin.setDecimals(9)
-        spin.setRange(-1.0e12, 1.0e12)
-        spin.setMaximumWidth(180)
+        spin.setDecimals(4)
+        # Для тензодатчика из физической оценки проекта чувствительность порядка
+        # 8.3e5 µε/нм; ±1e8 оставляет более чем стократный запас.
+        spin.setRange(-1.0e8, 1.0e8)
+        spin.setMaximumWidth(150)
         return spin
 
     def _build_layout(self) -> None:

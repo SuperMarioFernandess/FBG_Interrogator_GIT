@@ -16,6 +16,7 @@ import contextlib
 from pathlib import Path
 
 from PySide6.QtCore import QTimer
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
@@ -62,7 +63,7 @@ class MainWindow(QMainWindow):
         self._layout_path = layout_path_for_config(controller.config_path)
         self._layout_locked = False
         self.setWindowTitle(texts.APP_TITLE)
-        self.resize(1100, 750)
+        self._set_default_window_geometry()
 
         self.connection_panel = ConnectionPanel(controller)
         self.measurement_panel = MeasurementPanel(controller)
@@ -94,6 +95,22 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(lambda _index: self.tick())
 
         self._load_saved_layout()
+
+    def _set_default_window_geometry(self) -> None:
+        """Вписывает первый запуск в доступную область основного экрана."""
+
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            self.resize(1100, 700)
+            return
+        available = screen.availableGeometry()
+        margin = 48
+        width = min(1100, max(1, available.width() - margin))
+        height = min(750, max(1, available.height() - margin))
+        self.resize(width, height)
+        frame = self.frameGeometry()
+        frame.moveCenter(available.center())
+        self.move(frame.topLeft())
 
     @property
     def panels(self) -> tuple[DockTab, ...]:
@@ -170,6 +187,7 @@ class MainWindow(QMainWindow):
             docks={panel.layout_key: panel.saveState() for panel in self.panels},
             locked=self._layout_locked,
             period_ms=self.ui_period_spin.value(),
+            window_geometry=self.saveGeometry(),
         )
 
     def save_layout_now(self) -> None:
@@ -188,6 +206,8 @@ class MainWindow(QMainWindow):
         expected = {panel.layout_key for panel in self.panels}
         if set(state.docks) != expected:
             raise ValueError("набор вкладок в файле раскладки не совпадает с приложением")
+        if state.window_geometry is not None and not self.restoreGeometry(state.window_geometry):
+            raise ValueError("Qt не восстановил геометрию главного окна")
         for panel in self.panels:
             if not panel.restoreState(state.docks[panel.layout_key]):
                 raise ValueError(f"Qt не восстановил раскладку {panel.layout_key}")
@@ -201,6 +221,7 @@ class MainWindow(QMainWindow):
         try:
             self._restore_layout(load_layout(path))
         except (OSError, ValueError) as exc:
+            self._set_default_window_geometry()
             for panel in self.panels:
                 panel.reset_layout()
             self.ui_period_spin.setValue(DEFAULT_UI_PERIOD_MS)
@@ -213,6 +234,7 @@ class MainWindow(QMainWindow):
         """Возвращает доки и общий период к штатному виду."""
 
         self.set_layout_locked(False)
+        self._set_default_window_geometry()
         for panel in self.panels:
             panel.reset_layout()
         self.ui_period_spin.setValue(DEFAULT_UI_PERIOD_MS)

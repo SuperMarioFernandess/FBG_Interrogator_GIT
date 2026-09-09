@@ -72,7 +72,7 @@ class SpectrumPanel(DockTab):
         self.plot.setLabel("left", texts.SPECTRUM_SCALE_ADC)
         self.plot.showGrid(x=True, y=True, alpha=0.2)
         self.curve = self.plot.plot()
-        self.empty_graph_label = QLabel(texts.EMPTY_GRAPH_HINT)
+        self.empty_graph_label = QLabel(texts.SPECTRUM_EMPTY_GRAPH_HINT)
         self.empty_graph_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels(
@@ -119,37 +119,42 @@ class SpectrumPanel(DockTab):
             texts.GROUP_SPECTRUM_CONTROL,
             scrollable(control),
             "spectrum.control",
-            Qt.DockWidgetArea.LeftDockWidgetArea,
+            Qt.DockWidgetArea.BottomDockWidgetArea,
         )
         self.graph_dock = self.add_panel_dock(
             texts.GROUP_SPECTRUM_GRAPH,
             graph,
             "spectrum.graph",
-            Qt.DockWidgetArea.RightDockWidgetArea,
+            Qt.DockWidgetArea.TopDockWidgetArea,
         )
         self.regions_dock = self.add_panel_dock(
             texts.GROUP_SPECTRUM_REGIONS,
             regions,
             "spectrum.regions",
-            Qt.DockWidgetArea.RightDockWidgetArea,
+            Qt.DockWidgetArea.BottomDockWidgetArea,
         )
         self.reset_layout()
 
     def _apply_default_splits(self) -> None:
         self.splitDockWidget(
             self.graph_dock,
-            self.regions_dock,
+            self.control_dock,
             Qt.Orientation.Vertical,
         )
-        self.resizeDocks(
-            [self.control_dock, self.graph_dock],
-            [320, 730],
+        self.splitDockWidget(
+            self.control_dock,
+            self.regions_dock,
             Qt.Orientation.Horizontal,
         )
         self.resizeDocks(
-            [self.graph_dock, self.regions_dock],
+            [self.graph_dock, self.control_dock],
             [430, 250],
             Qt.Orientation.Vertical,
+        )
+        self.resizeDocks(
+            [self.control_dock, self.regions_dock],
+            [320, 730],
+            Qt.Orientation.Horizontal,
         )
 
     def _update_frequency_label(self, period_s: float) -> None:

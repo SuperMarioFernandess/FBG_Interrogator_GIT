@@ -95,6 +95,34 @@ def test_окно_создаётся_с_шестью_вкладками(window: 
     assert window.device_panel.config_panel is window.device_config_panel
 
 
+def test_стартовый_размер_вписан_в_доступную_геометрию(window: MainWindow) -> None:
+    """Первый запуск не должен уходить ниже доступной области экрана."""
+
+    screen = window.screen()
+    assert screen is not None
+    available = screen.availableGeometry()
+    assert window.width() == min(1100, max(1, available.width() - 48))
+    assert window.height() == min(750, max(1, available.height() - 48))
+
+
+def test_все_вкладки_помещаются_в_1366x720(application: QApplication, window: MainWindow) -> None:
+    """Регресс исходной жалобы: ни одна вкладка не требует больше 1366×720."""
+
+    window.resize(1366, 720)
+    window.show()
+    application.processEvents()
+    assert window.width() == 1366
+    assert window.height() == 720
+
+    for index, panel in enumerate(window.panels):
+        window.tabs.setCurrentIndex(index)
+        application.processEvents()
+        minimum = panel.minimumSizeHint()
+        actual = panel.size()
+        assert actual.width() >= minimum.width(), window.tabs.tabText(index)
+        assert actual.height() >= minimum.height(), window.tabs.tabText(index)
+
+
 def test_у_каждой_вкладки_есть_именованные_доки(window: MainWindow) -> None:
     """Шесть раскладок сохраняются через QMainWindow.saveState по objectName."""
     for panel in window.panels:
@@ -125,14 +153,18 @@ def test_раскладка_сохраняется_и_восстанавлива
     controller.start()
     first = MainWindow(controller)
     try:
+        first.resize(640, 520)
+        first.move(25, 35)
         first.packet_log_panel.controls_dock.hide()
         first.ui_period_spin.setValue(250)
         first.set_layout_locked(True)
         first.save_layout_now()
+        saved_geometry = bytes(first.saveGeometry())
         layout_path = tmp_path / UI_LAYOUT_FILENAME
         raw = json.loads(layout_path.read_text(encoding="ascii"))
         assert raw["period_ms"] == 250
         assert raw["locked"] is True
+        assert raw["window_geometry"]
         assert set(raw["docks"]) == {panel.layout_key for panel in first.panels}
     finally:
         first.close()
@@ -143,6 +175,7 @@ def test_раскладка_сохраняется_и_восстанавлива
         assert second.timer.interval() == 250
         assert second.lock_layout_button.isChecked()
         assert second.packet_log_panel.controls_dock.isHidden()
+        assert bytes(second.saveGeometry()) == saved_geometry
     finally:
         second.close()
         second.deleteLater()
@@ -167,6 +200,36 @@ def test_нечитаемая_раскладка_карантинится(applic
     finally:
         main.close()
         main.deleteLater()
+        controller.shutdown()
+
+
+def test_нечитаемая_геометрия_окна_карантинит_весь_layout(
+    application: QApplication, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "fbg_config.json"
+    controller = AppController(
+        AppConfig(packet_log=PacketLogConfig(directory=None)),
+        config_path=config_path,
+    )
+    controller.start()
+    first = MainWindow(controller)
+    first.save_layout_now()
+    first.close()
+    first.deleteLater()
+
+    layout_path = tmp_path / UI_LAYOUT_FILENAME
+    raw = json.loads(layout_path.read_text(encoding="ascii"))
+    raw["window_geometry"] = "!!!not-base64!!!"
+    layout_path.write_text(json.dumps(raw), encoding="ascii")
+
+    second = MainWindow(controller)
+    try:
+        assert not layout_path.exists()
+        assert (tmp_path / f"{UI_LAYOUT_FILENAME}.bad").exists()
+        assert any(texts.LAYOUT_LOAD_FAILED in notice for notice in controller.notices)
+    finally:
+        second.close()
+        second.deleteLater()
         controller.shutdown()
 
 
@@ -385,6 +448,22 @@ def test_расхождение_профиля_показывается_и_пр�
     assert panel.apply_profile_button.isEnabled()
 
 
+def test_сообщения_подключения_имеют_заголовок_и_сворачиваются(
+    window: MainWindow, controller: AppController
+) -> None:
+    panel = window.connection_panel
+    window.tabs.setCurrentWidget(panel)
+    window.tick()
+    assert panel.notices_label.text() == texts.LABEL_NOTICES
+    assert not panel.notices_label.isVisibleTo(panel)
+    assert not panel.notices_view.isVisibleTo(panel)
+
+    controller.note("проверочное сообщение")
+    window.tick()
+    assert panel.notices_label.isVisibleTo(panel)
+    assert panel.notices_view.isVisibleTo(panel)
+
+
 def test_диагностика_наполняется_текстом(window: MainWindow) -> None:
     """«Ошибка подключения» человеку за стендом не говорит ничего."""
     window.tick()
@@ -423,6 +502,38 @@ def test_дерево_не_пересобирается_на_каждом_так
     item = tree.topLevelItem(0)
     window.tick()
     assert tree.topLevelItem(0) is item
+
+
+def test_дерево_прибора_сохраняет_прокрутку_и_выделение_при_rebuild(
+    application: QApplication, window: MainWindow
+) -> None:
+    """Правило №40 действует и на редкую перестройку после опроса прибора."""
+
+    from tests.test_ui_models import DEVICE, snapshot
+
+    panel = window.device_panel
+    window.tabs.setCurrentWidget(panel)
+    window.show()
+    panel.refresh(snapshot())
+    application.processEvents()
+
+    tree = panel.summary_tree
+    tree.setFixedHeight(90)
+    application.processEvents()
+    first_group = tree.topLevelItem(0)
+    assert first_group is not None and first_group.childCount() > 0
+    wanted = first_group.child(0)
+    wanted.setSelected(True)
+    scroll = tree.verticalScrollBar()
+    scroll.setValue(scroll.maximum())
+    before_scroll = scroll.value()
+    before_key = tree._selection_key()
+
+    panel.refresh(snapshot(device=DEVICE))
+    application.processEvents()
+
+    assert tree._selection_key() == before_key
+    assert scroll.value() == before_scroll
 
 
 def test_форма_модели_меняется_когда_прибор_опрошен() -> None:

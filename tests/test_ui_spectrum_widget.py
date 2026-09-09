@@ -151,6 +151,29 @@ def test_неизменившаяся_версия_спектра_не_пере�
     panel.deleteLater()
 
 
+def test_дефолтная_раскладка_спектра_держит_график_сверху(
+    application: QApplication, controller: AppController
+) -> None:
+    panel = SpectrumPanel(controller)
+    try:
+        panel.resize(1000, 700)
+        panel.show()
+        application.processEvents()
+        graph = panel.graph_dock.geometry()
+        control = panel.control_dock.geometry()
+        regions = panel.regions_dock.geometry()
+        assert graph.top() <= control.top()
+        assert graph.top() <= regions.top()
+        assert control.top() >= graph.bottom() - 2
+        assert regions.top() >= graph.bottom() - 2
+        assert graph.height() >= control.height()
+        assert graph.height() >= regions.height()
+        assert panel.empty_graph_label.text() == texts.SPECTRUM_EMPTY_GRAPH_HINT
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
 def test_таблица_областей_сохраняет_выделение_и_прокрутку(
     application: QApplication, controller: AppController
 ) -> None:
@@ -172,13 +195,13 @@ def test_таблица_областей_сохраняет_выделение_�
     before_scroll = scroll.value()
     before_item = panel.table.item(20, 0)
 
-    # Та же геометрия таблицы, но новый снимок. setRowCount/items не пересоздаются.
+    # Число строк меняется: setRowCount неизбежен, но состояние пользователя сохраняется.
     panel.refresh(
         models.AppSnapshot(
             endpoint=controller.config.endpoint,
             profile=DeviceProfile(),
             state=SessionState.IDLE,
-            spectrum=_spectrum(regions=40),
+            spectrum=_spectrum(regions=41),
             spectrum_version=2,
         )
     )
