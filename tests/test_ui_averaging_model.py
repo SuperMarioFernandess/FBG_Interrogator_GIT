@@ -42,9 +42,7 @@ def test_усреднённый_график_измерения_incremental_ра
         seq_start=0,
         seq_stop=5,
         t_mono=np.asarray([0.001, 0.020, 0.051, 0.080, 0.101]),
-        wavelength_nm=np.asarray(
-            [[1550.000], [1550.002], [1550.004], [1550.006], [1550.008]]
-        ),
+        wavelength_nm=np.asarray([[1550.000], [1550.002], [1550.004], [1550.006], [1550.008]]),
     )
     incremental = models.measurement_graph_model(
         _snapshot(trace_history=full_history),
@@ -119,7 +117,6 @@ def test_усреднённый_график_датчика_считает_ка�
     assert trace.sigma[0] == pytest.approx(np.std([20.0, 21.0, 23.0]))
 
 
-
 def test_график_измерения_вмещает_полосу_sigma_в_y_диапазон() -> None:
     slot = (models.SlotRef(0, 0),)
     history = TraceHistorySnapshot(
@@ -188,7 +185,6 @@ def test_incremental_усреднение_с_уже_известным_gap_не_
     np.testing.assert_allclose(incremental.averaged.stop_mono, full.averaged.stop_mono)
     np.testing.assert_allclose(incremental.averaged.mean, full.averaged.mean)
     np.testing.assert_array_equal(incremental.averaged.n, full.averaged.n)
-
 
 
 def test_incremental_усреднение_при_сдвиге_не_пересчитывает_готовое_окно() -> None:
@@ -374,9 +370,7 @@ def test_incremental_путь_пересчитывает_только_после
         seq_start=0,
         seq_stop=5,
         t_mono=np.asarray([0.001, 0.020, 0.051, 0.080, 0.101]),
-        wavelength_nm=np.asarray(
-            [[1550.000], [1550.002], [1550.004], [1550.006], [1550.008]]
-        ),
+        wavelength_nm=np.asarray([[1550.000], [1550.002], [1550.004], [1550.006], [1550.008]]),
     )
 
     original = models.fixed_window_average

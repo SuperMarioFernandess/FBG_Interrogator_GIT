@@ -64,9 +64,7 @@ class SensorsPanel(DockTab):
         self._controller = controller
         self._items: dict[str, QTreeWidgetItem] = {}
         self._curves: dict[str, pg.PlotDataItem] = {}
-        self._bands: dict[
-            str, tuple[pg.PlotDataItem, pg.PlotDataItem, pg.FillBetweenItem]
-        ] = {}
+        self._bands: dict[str, tuple[pg.PlotDataItem, pg.PlotDataItem, pg.FillBetweenItem]] = {}
         self._graph_model: models.SensorGraphModel | None = None
         self._map_regions: list[pg.LinearRegionItem] = []
         self._shown_sensor_version = -1
@@ -719,9 +717,7 @@ class SensorsPanel(DockTab):
             curve = self._curves.get(sensor_id)
             if curve is None:
                 color = pg.intColor(index, hues=max(1, len(selected)))
-                curve = self.value_plot.plot(
-                    pen=pg.mkPen(color), name=sensor_id
-                )
+                curve = self.value_plot.plot(pen=pg.mkPen(color), name=sensor_id)
                 self._curves[sensor_id] = curve
                 upper = pg.PlotDataItem(pen=None)
                 lower = pg.PlotDataItem(pen=None)

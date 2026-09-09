@@ -201,9 +201,7 @@ def test_потоковый_экспорт_совпадает_с_общей_ок
         atol=1e-9,
         equal_nan=True,
     )
-    np.testing.assert_array_equal(
-        [int(row[n_index]) for row in rows], reference.n[:, 0]
-    )
+    np.testing.assert_array_equal([int(row[n_index]) for row in rows], reference.n[:, 0])
     np.testing.assert_allclose(
         [float(row[sigma_index]) for row in rows],
         reference.sigma[:, 0],
