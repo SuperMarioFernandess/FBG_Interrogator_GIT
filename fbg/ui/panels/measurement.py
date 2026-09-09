@@ -512,7 +512,10 @@ class MeasurementPanel(DockTab):
             for item in band:
                 item.setVisible(band_visible)
 
-        counts = [int(trace.n[-1]) for trace in model.traces if trace.n is not None and trace.n.size]
+        counts: list[int] = []
+        for trace in model.traces:
+            if trace.n is not None and trace.n.size:
+                counts.append(int(trace.n[-1]))
         if self.averaging_enabled.isChecked() and counts:
             low, high = min(counts), max(counts)
             self.averaging_n.setText(str(low) if low == high else f"{low}…{high}")
