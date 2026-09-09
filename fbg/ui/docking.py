@@ -139,9 +139,7 @@ def save_layout(path: Path, state: UiLayoutState) -> Path:
         },
     }
     if state.window_geometry is not None:
-        payload["window_geometry"] = base64.b64encode(bytes(state.window_geometry)).decode(
-            "ascii"
-        )
+        payload["window_geometry"] = base64.b64encode(bytes(state.window_geometry)).decode("ascii")
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(
         json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
