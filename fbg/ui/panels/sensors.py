@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -73,6 +74,7 @@ class SensorsPanel(DockTab):
         self._editing_id: str | None = None
         self._editing_compensation = None
         self._last_model: SensorPanelModel | None = None
+        self._last_snapshot: AppSnapshot | None = None
         self._recalc_thread: threading.Thread | None = None
         self._recalc_result: RecalibrationResult | None = None
         self._recalc_error: str | None = None
@@ -271,12 +273,18 @@ class SensorsPanel(DockTab):
         editor_layout.addWidget(editor_box)
         editor_layout.addWidget(cal_box, 1)
 
-        graph_controls = QFormLayout()
-        graph_controls.addRow(texts.LABEL_AVERAGING_ENABLED, self.averaging_enabled)
-        graph_controls.addRow(texts.LABEL_AVERAGING_WINDOW, self.averaging_window)
-        graph_controls.addRow(texts.LABEL_AVERAGING_FRAMES, self.averaging_frames)
-        graph_controls.addRow(texts.LABEL_AVERAGING_SIGMA, self.averaging_sigma)
-        graph_controls.addRow(texts.LABEL_AVERAGING_N, self.averaging_n)
+        graph_controls = QGridLayout()
+        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_ENABLED), 0, 0)
+        graph_controls.addWidget(self.averaging_enabled, 0, 1)
+        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_WINDOW), 0, 2)
+        graph_controls.addWidget(self.averaging_window, 0, 3)
+        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_FRAMES), 0, 4)
+        graph_controls.addWidget(self.averaging_frames, 0, 5)
+        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_SIGMA), 1, 0)
+        graph_controls.addWidget(self.averaging_sigma, 1, 1)
+        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_N), 1, 2)
+        graph_controls.addWidget(self.averaging_n, 1, 3)
+        graph_controls.setColumnStretch(5, 1)
         graph_layout = QVBoxLayout()
         graph_layout.addLayout(graph_controls)
         graph_layout.addWidget(self.empty_graph_label, 1)
@@ -343,7 +351,7 @@ class SensorsPanel(DockTab):
 
     def _connect_signals(self) -> None:
         self.filter_edit.textChanged.connect(lambda _text: self._refresh_from_controller())
-        self.unit_combo.currentIndexChanged.connect(lambda _index: self._unit_changed())
+        self.unit_combo.currentIndexChanged.connect(lambda _index: self._on_unit_changed())
         self.sensor_tree.itemSelectionChanged.connect(self._selection_changed)
         self.sensor_tree.itemChanged.connect(
             lambda _item, _column: self._on_graph_selection_changed()
@@ -484,6 +492,10 @@ class SensorsPanel(DockTab):
         data = self.unit_combo.currentData()
         return "" if data is None else str(data)
 
+    def _on_unit_changed(self) -> None:
+        self._unit_changed()
+        self._refresh_from_controller()
+
     def _unit_changed(self) -> None:
         unit = self._selected_unit()
         was_blocked = self.sensor_tree.blockSignals(True)
@@ -501,7 +513,8 @@ class SensorsPanel(DockTab):
         finally:
             self.sensor_tree.blockSignals(was_blocked)
         self.value_plot.setLabel("left", unit or texts.SENSOR_NO_UNIT)
-        self._on_graph_selection_changed()
+        self._graph_model = None
+        self._sync_sensor_trace_request()
 
     def _selection_changed(self) -> None:
         items = self.sensor_tree.selectedItems()
@@ -685,7 +698,10 @@ class SensorsPanel(DockTab):
             if item.checkState(0) == Qt.CheckState.Checked
         )
 
-    def _update_graph(self, snapshot: AppSnapshot) -> None:
+    def _update_graph(self) -> None:
+        snapshot = self._last_snapshot
+        if snapshot is None:
+            return
         selected = self._checked_sensor_ids()
         graph = models.sensor_graph_model(
             snapshot,
@@ -832,6 +848,7 @@ class SensorsPanel(DockTab):
         """Показывает уже рассчитанный на частоте UI снимок датчиков."""
         model = models.sensor_panel_model(snapshot, filter_text=self.filter_edit.text())
         self._last_model = model
+        self._last_snapshot = snapshot
         filter_text = self.filter_edit.text()
         sensor_changed = snapshot.sensor_version != self._shown_sensor_version
         if sensor_changed or filter_text != self._shown_filter:
@@ -849,7 +866,7 @@ class SensorsPanel(DockTab):
             self._update_tree_values(model)
         self._update_peak_combo()
         self._update_averaging_controls(snapshot)
-        self._update_graph(snapshot)
+        self._update_graph()
         self._update_peak_map()
         self._poll_recalibration()
 
