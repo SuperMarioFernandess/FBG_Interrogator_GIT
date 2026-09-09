@@ -83,6 +83,10 @@ NOTICE_LIMIT = 50
 #: достаточно для оперативной диагностики и это всего 600×120 чисел при 10 Гц.
 SENSOR_HISTORY_POINTS = 600
 
+# Разрывы нужны модели усреднения только пока они попадают в видимую историю.
+# Сотни записей здесь означают уже аварийную сеть, но память остаётся ограниченной.
+STREAM_GAP_HISTORY = 256
+
 
 @dataclass(frozen=True)
 class ShutdownFailure:
@@ -136,6 +140,10 @@ class AppController:
         self._sensor_last_ui_seq: int | None = None
         self._sensor_history_t: deque[float] = deque(maxlen=SENSOR_HISTORY_POINTS)
         self._sensor_history_values: deque[tuple[float, ...]] = deque(maxlen=SENSOR_HISTORY_POINTS)
+        self._sensor_trace_positions: tuple[tuple[int, int], ...] = ()
+        self._sensor_trace_history_s = 5.0
+        self._stream_gaps: deque[tuple[float, float]] = deque(maxlen=STREAM_GAP_HISTORY)
+        self._stream_gap_lock = threading.Lock()
 
         # Привязка монотонных меток к настенным часам снимается один раз (Р45):
         # иначе колонка времени в панели журнала дёргалась бы вслед за NTP.
@@ -170,6 +178,8 @@ class AppController:
 
     def _build(self) -> None:
         """Создаёт журнал, тракт и сессию по текущему `AppConfig`."""
+        with self._stream_gap_lock:
+            self._stream_gaps.clear()
         profile = self._config.profile
         self._packet_log = PacketLog(profile, self._config.packet_log_config(), on_error=self.note)
         self._pipeline = Pipeline(profile, self._config.pipeline)
@@ -253,6 +263,7 @@ class AppController:
         self._sensor_last_ui_seq = None
         self._sensor_history_t.clear()
         self._sensor_history_values.clear()
+        self._sensor_trace_positions = ()
 
     def upsert_sensor(self, sensor: Sensor, *, previous_id: str | None = None) -> None:
         """Добавляет датчик либо заменяет выбранный, затем сохраняет набор."""
@@ -317,6 +328,8 @@ class AppController:
         паузы. `Recorder.mark_gap` только кладёт границы в свою очередь и не
         делает файловый I/O, поэтому бюджет приёмного потока не нарушается.
         """
+        with self._stream_gap_lock:
+            self._stream_gaps.append((float(t_mono_from), float(t_mono_to)))
         recorder = self._recorder
         if recorder is not None:
             recorder.mark_gap(t_mono_from, t_mono_to)
@@ -809,6 +822,41 @@ class AppController:
         self._trace_positions = selected
         self._trace_history_s = history_s
 
+    def set_sensor_trace_request(
+        self,
+        sensor_ids: Sequence[str],
+        history_s: float,
+    ) -> None:
+        """Запрашивает raw-историю каналов, нужных отмеченным датчикам.
+
+        При выключенном усреднении панель передаёт пустой список и дорогая
+        копия raw-кольца не строится вовсе. При включённом копируются только
+        каналы отмеченных датчиков и их опорных датчиков компенсации, а не все
+        120 позиций прибора.
+        """
+        if history_s <= 0.0:
+            raise ValueError(f"history_s={history_s} должен быть положительным")
+        by_id = {sensor.id: sensor for sensor in self._sensors}
+        requested = tuple(sensor_ids)
+        channels: set[int] = set()
+        for sensor_id in requested:
+            sensor = by_id.get(sensor_id)
+            if sensor is None:
+                continue
+            channels.add(sensor.channel)
+            if sensor.compensation is not None:
+                reference = by_id.get(sensor.compensation.reference)
+                if reference is not None:
+                    channels.add(reference.channel)
+        positions = tuple(
+            (channel, position)
+            for channel in sorted(channels)
+            for position in range(self._config.profile.fbg_per_channel)
+            if 0 <= channel < self._config.profile.channels
+        )
+        self._sensor_trace_positions = positions
+        self._sensor_trace_history_s = history_s
+
     def _recording_elapsed_s(self) -> float:
         """Длительность текущей либо последней записи для панели."""
         started = self._recording_started_mono
@@ -1008,6 +1056,11 @@ class AppController:
             )
         return ordered, history
 
+    def _stream_gap_snapshot(self) -> tuple[tuple[float, float], ...]:
+        """Копия границ сетевых разрывов без гонки с dispatcher-потоком."""
+        with self._stream_gap_lock:
+            return tuple(self._stream_gaps)
+
     def snapshot(
         self,
         *,
@@ -1031,8 +1084,17 @@ class AppController:
         )
         if include_sensor_data:
             sensor_readings, sensor_history = self._sensor_snapshot(ui_snapshot)
+            sensor_trace_history = (
+                self._pipeline.trace_history(
+                    self._sensor_trace_positions,
+                    self._sensor_trace_history_s,
+                )
+                if self._sensor_trace_positions
+                else None
+            )
         else:
             sensor_readings, sensor_history = (), None
+            sensor_trace_history = None
         return AppSnapshot(
             endpoint=self._config.endpoint,
             profile=self._config.profile,
@@ -1053,6 +1115,7 @@ class AppController:
             metrics=self._pipeline.metrics(),
             ui=ui_snapshot,
             trace_history=trace_history,
+            stream_gaps=self._stream_gap_snapshot(),
             log=self._packet_log.stats,
             recorder_config=self._config.recorder,
             recorder=recorder_stats,
@@ -1072,6 +1135,7 @@ class AppController:
             sensors=self._sensors,
             sensor_readings=sensor_readings,
             sensor_history=sensor_history,
+            sensor_trace_history=sensor_trace_history,
             sensor_version=self._sensor_version,
             connected=session.state is not SessionState.DISCONNECTED,
             recording=recorder is not None,
