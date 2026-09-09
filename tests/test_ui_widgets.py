@@ -105,9 +105,7 @@ def test_стартовый_размер_вписан_в_доступную_ге
     assert window.height() == min(750, max(1, available.height() - 48))
 
 
-def test_все_вкладки_помещаются_в_1366x720(
-    application: QApplication, window: MainWindow
-) -> None:
+def test_все_вкладки_помещаются_в_1366x720(application: QApplication, window: MainWindow) -> None:
     """Регресс исходной жалобы: ни одна вкладка не требует больше 1366×720."""
 
     window.resize(1366, 720)
