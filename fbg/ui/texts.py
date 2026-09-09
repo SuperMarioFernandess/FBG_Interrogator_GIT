@@ -177,6 +177,7 @@ def channel_label(channel: int) -> str:
 GROUP_ENDPOINT = "Адреса"
 GROUP_STREAM = "Поток телеметрии"
 GROUP_DIAGNOSTICS = "Диагностика"
+LABEL_NOTICES = "Сообщения"
 
 LABEL_DEVICE_IP = "IP прибора"
 LABEL_DEVICE_PORT = "Порт прибора"
@@ -472,6 +473,8 @@ SPECTRUM_SATURATION_WARNING = (
 )
 
 EMPTY_GRAPH_HINT = "Нет данных для отображения."
+SPECTRUM_EMPTY_GRAPH_HINT = "Нажмите «Снять спектр»."
+SENSOR_EMPTY_GRAPH_HINT = "Отметьте датчики."
 
 # --------------------------------------------------------------------------------------
 # Панель датчиков
