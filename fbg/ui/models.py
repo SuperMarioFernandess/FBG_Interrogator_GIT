@@ -508,10 +508,7 @@ def _averaged_measurement_graph_model(
         baseline = None if old_trace is None else old_trace.baseline_nm
         if baseline is None and finite.size:
             baseline = float(absolute[int(finite[0])])
-        if finite.size:
-            latest = float(absolute[int(finite[-1])])
-        else:
-            latest = None
+        latest = float(absolute[int(finite[-1])]) if finite.size else None
         if baseline is None:
             delta = np.full(absolute.shape, np.nan, dtype=np.float64)
         else:
