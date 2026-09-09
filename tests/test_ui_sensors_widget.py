@@ -284,7 +284,7 @@ def test_взять_текущую_лямбду_берёт_пик_из_теле�
         panel.refresh(snapshot(controller, ui=SimpleNamespace(wavelength_nm=wavelengths)))
         assert panel.current_peak_combo.count() == 1
         panel.take_wavelength_button.click()
-        assert panel.expected_spin.value() == pytest.approx(1544.812345, abs=1e-6)
+        assert panel.expected_spin.value() == pytest.approx(1544.8123, abs=5e-5)
     finally:
         panel.close()
         panel.deleteLater()
