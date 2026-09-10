@@ -285,6 +285,7 @@ class SensorsPanel(DockTab):
         graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_N), 1, 2)
         graph_controls.addWidget(self.averaging_n, 1, 3)
         graph_controls.setColumnStretch(5, 1)
+        graph_controls.setVerticalSpacing(0)
         graph_layout = QVBoxLayout()
         graph_layout.addLayout(graph_controls)
         graph_layout.addWidget(self.empty_graph_label, 1)

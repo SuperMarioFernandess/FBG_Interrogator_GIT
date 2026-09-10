@@ -275,6 +275,7 @@ class MeasurementPanel(DockTab):
         selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_N), 2, 2)
         selection_controls.addWidget(self.averaging_n, 2, 3)
         selection_controls.setColumnStretch(3, 1)
+        selection_controls.setVerticalSpacing(0)
         selection_layout = QVBoxLayout()
         selection_layout.addLayout(selection_controls)
         selection_layout.addWidget(self.trace_tree, 1)
