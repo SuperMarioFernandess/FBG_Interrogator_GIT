@@ -17,6 +17,13 @@ from pathlib import Path
 
 import numpy as np
 
+from fbg.core.averaging import (
+    WindowAverages,
+    concatenate_window_averages,
+    empty_window_averages,
+    fixed_window_average,
+    slice_window_averages,
+)
 from fbg.core.calibration import ReadingStatus, Sensor, SensorReading
 from fbg.core.endpoint import Endpoint
 from fbg.core.frames import AdcBlock, ChannelSetup, GainSetting
@@ -53,6 +60,12 @@ GRAPH_RANGE_PADDING = 0.10
 
 #: Оценка объёма показывается для стандартных десяти минут из требования чата.
 RECORDING_ESTIMATE_SECONDS = 600.0
+
+# Один набор границ для обоих графиков. Виджеты могут иметь независимое
+# состояние включения, но одинаковое число означает одинаковую математику.
+DEFAULT_AVERAGING_MS = 50.0
+MIN_AVERAGING_MS = 1.0
+MAX_AVERAGING_MS = 5_000.0
 
 
 # --------------------------------------------------------------------------------------
@@ -105,6 +118,7 @@ class AppSnapshot:
     metrics: PipelineMetrics | None = None
     ui: UiSnapshot | None = None
     trace_history: TraceHistorySnapshot | None = None
+    stream_gaps: tuple[tuple[float, float], ...] = ()
     log: PacketLogStats | None = None
     recorder_config: RecorderConfig | None = None
     recorder: RecorderStats | None = None
@@ -130,6 +144,7 @@ class AppSnapshot:
     sensors: tuple[Sensor, ...] = ()
     sensor_readings: tuple[SensorReading, ...] = ()
     sensor_history: "SensorHistorySnapshot | None" = None
+    sensor_trace_history: TraceHistorySnapshot | None = None
     sensor_version: int = 0
     """Версия набора датчиков; меняется при сохранённой правке конфигурации."""
 
@@ -243,6 +258,8 @@ class GraphTrace:
     baseline_nm: float | None
     latest_nm: float | None
     valid_points: int
+    sigma_nm: np.ndarray | None = None
+    n: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -259,6 +276,8 @@ class MeasurementGraphModel:
     seq_start: int = 0
     seq_stop: int = 0
     t_end_mono: float = 0.0
+    averaging_window_s: float | None = None
+    averaged: WindowAverages | None = None
 
 
 def _expanded_y_range(
@@ -311,12 +330,224 @@ def _visible_y_range(values: Sequence[np.ndarray]) -> tuple[float, float]:
     return low - padding, high + padding
 
 
+def _relevant_stream_gaps(
+    gaps: Sequence[tuple[float, float]],
+    t_mono: np.ndarray,
+    window_s: float,
+) -> tuple[tuple[float, float], ...]:
+    """Оставляет GAP, способные изменить видимую сетку текущей истории.
+
+    ``AppController`` хранит ограниченную историю разрывов дольше, чем raw-
+    кольцо графика. Передавать старые GAP в оконную арифметику нельзя: между
+    ними появились бы пустые окна, для которых raw-данные на самом деле просто
+    уже вытеснены. Нужен ещё последний GAP перед первым кадром, если его правая
+    граница лежит в том же глобальном bin: он задаёт точное начало сегмента.
+    """
+    if t_mono.size == 0:
+        return ()
+    first_bin_start = math.floor(float(t_mono[0]) / window_s) * window_s
+    last = float(t_mono[-1])
+    return tuple((start, stop) for start, stop in gaps if stop >= first_bin_start and start <= last)
+
+
+def _incremental_window_average(
+    t_mono: np.ndarray,
+    values: np.ndarray,
+    window_s: float,
+    gaps: Sequence[tuple[float, float]],
+    previous: WindowAverages | None,
+) -> WindowAverages:
+    """Переиспользует все завершённые окна и пересчитывает только хвост.
+
+    Фиксированная временная сетка даёт ключевое свойство: после завершения
+    окно больше никогда не меняется. Даже если его исходные raw-кадры уже
+    вытеснены из кольца, готовые ``mean/n/σ`` остаются в предыдущей модели.
+    Повторно считается только последнее незавершённое окно вместе с новыми
+    кадрами. Это сохраняет инкрементальность Р76 вместо полного пересчёта
+    видимой истории на каждом такте UI.
+    """
+    if t_mono.size == 0:
+        return empty_window_averages(values.shape[1])
+    if previous is None or previous.windows == 0 or previous.columns != values.shape[1]:
+        return fixed_window_average(t_mono, values, window_s, gaps=gaps)
+
+    last_seen = float(t_mono[-1])
+    reusable = previous.complete & (previous.stop_mono <= last_seen)
+    reusable_indices = np.flatnonzero(reusable)
+    if reusable_indices.size == 0:
+        return fixed_window_average(t_mono, values, window_s, gaps=gaps)
+
+    last_reusable = int(reusable_indices[-1])
+    if not np.all(reusable[: last_reusable + 1]):
+        # Завершённые окна обязаны образовывать непрерывный префикс. Если
+        # предыдущая модель этому не соответствует, безопаснее пересчитать
+        # текущий raw-снимок, чем склеить окна из разных временных сегментов.
+        return fixed_window_average(t_mono, values, window_s, gaps=gaps)
+
+    prefix = slice_window_averages(previous, slice(0, last_reusable + 1))
+    prefix_stop = float(prefix.stop_mono[-1])
+    tail_start = int(np.searchsorted(t_mono, prefix_stop, side="left"))
+    tail_times = t_mono[tail_start:]
+    tail_values = values[tail_start:]
+    tail = (
+        fixed_window_average(
+            tail_times,
+            tail_values,
+            window_s,
+            gaps=_relevant_stream_gaps(gaps, tail_times, window_s),
+        )
+        if tail_times.size
+        else empty_window_averages(values.shape[1])
+    )
+    if tail.windows:
+        tail = slice_window_averages(
+            tail,
+            tail.start_mono >= np.nextafter(prefix_stop, -np.inf),
+        )
+
+    result = concatenate_window_averages(prefix, tail)
+    gap_stops = np.asarray([stop for _start, stop in gaps], dtype=np.float64)
+    segments = (
+        np.searchsorted(gap_stops, result.start_mono, side="right").astype(np.int64)
+        if gap_stops.size
+        else np.zeros(result.windows, dtype=np.int64)
+    )
+    return WindowAverages(
+        start_mono=result.start_mono,
+        stop_mono=result.stop_mono,
+        mean=result.mean,
+        sigma=result.sigma,
+        n=result.n,
+        segment=segments,
+        complete=result.stop_mono <= last_seen,
+    )
+
+
+def _averaged_measurement_graph_model(
+    snapshot: AppSnapshot,
+    selected: Sequence[SlotRef],
+    previous: MeasurementGraphModel | None,
+    window_s: float,
+) -> MeasurementGraphModel:
+    history = snapshot.trace_history
+    if history is None or history.frames == 0:
+        low, high = _visible_y_range(())
+        return MeasurementGraphModel(
+            np.empty(0),
+            (),
+            low,
+            high,
+            0.0,
+            averaging_window_s=window_s,
+            averaged=empty_window_averages(len(selected)),
+        )
+
+    selected_tuple = tuple(selected)
+    history_slots = tuple(SlotRef(*pair) for pair in history.positions)
+    columns = {slot: index for index, slot in enumerate(history_slots)}
+    available = tuple(slot for slot in selected_tuple if slot in columns)
+    if not available:
+        low, high = _visible_y_range(())
+        return MeasurementGraphModel(
+            np.empty(0),
+            (),
+            low,
+            high,
+            history.span_s,
+            history.seq_start,
+            history.seq_stop,
+            float(history.t_mono[-1]),
+            window_s,
+            empty_window_averages(0),
+        )
+
+    if history_slots == available:
+        matrix = history.wavelength_nm
+    else:
+        matrix = np.column_stack([history.wavelength_nm[:, columns[slot]] for slot in available])
+    compatible = (
+        previous is not None
+        and previous.averaging_window_s == window_s
+        and previous.averaged is not None
+        and tuple(trace.slot for trace in previous.traces) == available
+        and history.seq_start >= previous.seq_start
+        and history.seq_start <= previous.seq_stop <= history.seq_stop
+    )
+    if (
+        compatible
+        and previous is not None
+        and history.seq_start == previous.seq_start
+        and history.seq_stop == previous.seq_stop
+    ):
+        return previous
+
+    old_windows = previous.averaged if compatible and previous is not None else None
+    averaged = _incremental_window_average(
+        history.t_mono,
+        matrix,
+        window_s,
+        _relevant_stream_gaps(snapshot.stream_gaps, history.t_mono, window_s),
+        old_windows,
+    )
+    if averaged.windows:
+        visible = averaged.stop_mono > float(history.t_mono[0])
+        averaged = slice_window_averages(averaged, visible)
+    t_end = float(history.t_mono[-1])
+    t_s = averaged.start_mono - t_end
+    traces: list[GraphTrace] = []
+    deltas: list[np.ndarray] = []
+    previous_by_slot = (
+        {trace.slot: trace for trace in previous.traces}
+        if compatible and previous is not None
+        else {}
+    )
+    for column, slot in enumerate(available):
+        absolute = averaged.mean[:, column]
+        finite = np.flatnonzero(np.isfinite(absolute))
+        old_trace = previous_by_slot.get(slot)
+        baseline = None if old_trace is None else old_trace.baseline_nm
+        if baseline is None and finite.size:
+            baseline = float(absolute[int(finite[0])])
+        latest = float(absolute[int(finite[-1])]) if finite.size else None
+        if baseline is None:
+            delta = np.full(absolute.shape, np.nan, dtype=np.float64)
+        else:
+            delta = absolute - baseline
+        sigma = averaged.sigma[:, column]
+        traces.append(
+            GraphTrace(
+                slot=slot,
+                delta_nm=delta,
+                baseline_nm=baseline,
+                latest_nm=latest,
+                valid_points=int(finite.size),
+                sigma_nm=sigma,
+                n=averaged.n[:, column],
+            )
+        )
+        deltas.extend((delta, delta - sigma, delta + sigma))
+    low, high = _visible_y_range(deltas)
+    return MeasurementGraphModel(
+        t_s=t_s,
+        traces=tuple(traces),
+        y_min_nm=low,
+        y_max_nm=high,
+        history_span_s=history.span_s,
+        seq_start=history.seq_start,
+        seq_stop=history.seq_stop,
+        t_end_mono=t_end,
+        averaging_window_s=window_s,
+        averaged=averaged,
+    )
+
+
 def measurement_graph_model(
     snapshot: AppSnapshot,
     selected: Sequence[SlotRef],
     previous: MeasurementGraphModel | None = None,
     *,
     recalculate_y: bool = False,
+    averaging_window_s: float | None = None,
 ) -> MeasurementGraphModel:
     """Строит Δλ(t) выбранных слотов из `TraceHistorySnapshot`.
 
@@ -326,6 +557,16 @@ def measurement_graph_model(
     такте. При смене выбора или глубины истории модель строится заново.
     NaN остаётся разрывом — никакого заполнения последним значением нет.
     """
+    if averaging_window_s is not None:
+        if averaging_window_s <= 0.0:
+            raise ValueError("averaging_window_s должен быть положительным")
+        return _averaged_measurement_graph_model(
+            snapshot,
+            selected,
+            previous,
+            averaging_window_s,
+        )
+
     history = snapshot.trace_history
     if history is None or history.frames == 0:
         low, high = _visible_y_range(())
@@ -341,6 +582,7 @@ def measurement_graph_model(
     # путь — это редкое событие, а не работа каждого таймера.
     can_extend = (
         previous is not None
+        and previous.averaging_window_s is None
         and tuple(trace.slot for trace in previous.traces) == selected_tuple
         and history_slots == selected_tuple
         and history.seq_start >= previous.seq_start
@@ -571,6 +813,191 @@ def sensor_panel_model(
             for channel in range(snapshot.profile.channels)
         )
     return SensorPanelModel(tuple(rows), units, peaks, snapshot.sensor_history)
+
+
+@dataclass(frozen=True)
+class SensorGraphTrace:
+    """Одна физическая величина на графике датчиков."""
+
+    sensor_id: str
+    values: np.ndarray
+    sigma: np.ndarray | None = None
+    n: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class SensorGraphModel:
+    """Временной ряд датчиков; при усреднении источник — сырые кадры pipeline."""
+
+    t_s: np.ndarray
+    traces: tuple[SensorGraphTrace, ...]
+    seq_start: int = 0
+    seq_stop: int = 0
+    t_end_mono: float = 0.0
+    averaging_window_s: float | None = None
+    averaged: WindowAverages | None = None
+
+
+def expected_averaging_frames(snapshot: AppSnapshot, window_ms: float) -> int:
+    """Сколько кадров ожидается в окне при текущей известной скорости."""
+    if window_ms <= 0.0:
+        return 0
+    expected = None if snapshot.metrics is None else snapshot.metrics.expected_rate_hz
+    rate_hz = float(expected or snapshot.profile.sweep_speed_hz)
+    if not math.isfinite(rate_hz) or rate_hz <= 0.0:
+        return 0
+    return max(1, round(rate_hz * window_ms / 1000.0))
+
+
+def _sensor_values_from_trace(
+    sensors: Sequence[Sensor],
+    selected_ids: Sequence[str],
+    history: TraceHistorySnapshot,
+) -> tuple[tuple[str, ...], np.ndarray]:
+    """Считает физические величины выбранных датчиков для **каждого** raw-кадра.
+
+    Это векторный эквивалент `calibration.evaluate_all`: ровно один пик в окне,
+    та же кривая и та же одноуровневая компенсация. Функция живёт в модели UI,
+    поэтому приёмный поток и pipeline эту цену никогда не платят (Р75).
+    """
+    by_id = {sensor.id: sensor for sensor in sensors}
+    selected = tuple(sensor_id for sensor_id in selected_ids if sensor_id in by_id)
+    if not selected:
+        return (), np.empty((history.frames, 0), dtype=np.float64)
+
+    needed: list[str] = list(selected)
+    for sensor_id in selected:
+        sensor = by_id[sensor_id]
+        if sensor.compensation is not None and sensor.compensation.reference not in needed:
+            needed.append(sensor.compensation.reference)
+
+    grouped: dict[int, list[tuple[int, int]]] = {}
+    for column, (channel, position) in enumerate(history.positions):
+        grouped.setdefault(channel, []).append((position, column))
+    channel_columns = {
+        channel: np.asarray([column for _position, column in sorted(items)], dtype=np.intp)
+        for channel, items in grouped.items()
+    }
+
+    calculated: dict[str, np.ndarray] = {}
+
+    def calculate(sensor: Sensor) -> np.ndarray:
+        columns = channel_columns.get(sensor.channel)
+        if columns is None or columns.size == 0:
+            return np.full(history.frames, np.nan, dtype=np.float64)
+        wavelengths = history.wavelength_nm[:, columns]
+        inside = np.isfinite(wavelengths) & (
+            np.abs(wavelengths - sensor.expected_nm) <= sensor.window_nm
+        )
+        count = np.count_nonzero(inside, axis=1)
+        positions = np.argmax(inside, axis=1)
+        found = wavelengths[np.arange(history.frames), positions].astype(np.float64, copy=True)
+        found[count != 1] = np.nan
+        delta = found - sensor.expected_nm
+        value = sensor.value0 + sensor.k1 * delta + sensor.k2 * delta * delta
+        if sensor.compensation is not None:
+            reference = calculated.get(sensor.compensation.reference)
+            if reference is None:
+                value[:] = np.nan
+            else:
+                value = value + sensor.compensation.coeff * (reference - sensor.compensation.base)
+                value[~np.isfinite(reference)] = np.nan
+        return value
+
+    for sensor_id in needed:
+        sensor = by_id.get(sensor_id)
+        if sensor is not None and sensor.compensation is None:
+            calculated[sensor_id] = calculate(sensor)
+    for sensor_id in needed:
+        sensor = by_id.get(sensor_id)
+        if sensor is not None and sensor.compensation is not None:
+            calculated[sensor_id] = calculate(sensor)
+
+    matrix = np.column_stack(
+        [calculated.get(sensor_id, np.full(history.frames, np.nan)) for sensor_id in selected]
+    )
+    return selected, matrix
+
+
+def sensor_graph_model(
+    snapshot: AppSnapshot,
+    selected_ids: Sequence[str],
+    previous: SensorGraphModel | None = None,
+    *,
+    averaging_window_s: float | None = None,
+) -> SensorGraphModel:
+    """Строит график датчиков с тем же окном, `n` и σ, что график измерения."""
+    selected = tuple(selected_ids)
+    if averaging_window_s is None:
+        history = snapshot.sensor_history
+        if history is None or history.frames == 0:
+            return SensorGraphModel(np.empty(0), ())
+        columns = {sensor_id: index for index, sensor_id in enumerate(history.sensor_ids)}
+        traces = tuple(
+            SensorGraphTrace(sensor_id, history.values[:, columns[sensor_id]])
+            for sensor_id in selected
+            if sensor_id in columns
+        )
+        return SensorGraphModel(history.t_mono - history.t_mono[-1], traces)
+
+    if averaging_window_s <= 0.0:
+        raise ValueError("averaging_window_s должен быть положительным")
+    history = snapshot.sensor_trace_history
+    if history is None or history.frames == 0:
+        return SensorGraphModel(
+            np.empty(0),
+            (),
+            averaging_window_s=averaging_window_s,
+            averaged=empty_window_averages(len(selected)),
+        )
+    available, matrix = _sensor_values_from_trace(snapshot.sensors, selected, history)
+    compatible = (
+        previous is not None
+        and previous.averaging_window_s == averaging_window_s
+        and previous.averaged is not None
+        and tuple(trace.sensor_id for trace in previous.traces) == available
+        and history.seq_start >= previous.seq_start
+        and history.seq_start <= previous.seq_stop <= history.seq_stop
+    )
+    if (
+        compatible
+        and previous is not None
+        and history.seq_start == previous.seq_start
+        and history.seq_stop == previous.seq_stop
+    ):
+        return previous
+    old_windows = previous.averaged if compatible and previous is not None else None
+    averaged = _incremental_window_average(
+        history.t_mono,
+        matrix,
+        averaging_window_s,
+        _relevant_stream_gaps(snapshot.stream_gaps, history.t_mono, averaging_window_s),
+        old_windows,
+    )
+    t_end = float(history.t_mono[-1])
+    history_start = float(history.t_mono[0])
+    if snapshot.sensor_history is not None and snapshot.sensor_history.frames:
+        history_start = float(snapshot.sensor_history.t_mono[0])
+    if averaged.windows:
+        averaged = slice_window_averages(averaged, averaged.stop_mono > history_start)
+    traces = tuple(
+        SensorGraphTrace(
+            sensor_id=sensor_id,
+            values=averaged.mean[:, index],
+            sigma=averaged.sigma[:, index],
+            n=averaged.n[:, index],
+        )
+        for index, sensor_id in enumerate(available)
+    )
+    return SensorGraphModel(
+        t_s=averaged.start_mono - t_end,
+        traces=traces,
+        seq_start=history.seq_start,
+        seq_stop=history.seq_stop,
+        t_end_mono=t_end,
+        averaging_window_s=averaging_window_s,
+        averaged=averaged,
+    )
 
 
 @dataclass(frozen=True)
