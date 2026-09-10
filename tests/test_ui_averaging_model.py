@@ -141,6 +141,7 @@ def test_график_измерения_вмещает_полосу_sigma_в_y_
     assert graph.y_min_nm <= lower
     assert graph.y_max_nm >= upper
 
+
 def test_число_кадров_в_окне_следует_текущей_скорости() -> None:
     snapshot = _snapshot()
     assert models.expected_averaging_frames(snapshot, 50.0) == 100
@@ -348,6 +349,7 @@ def test_датчики_сохраняют_завершённые_окна_ст�
     assert current.averaged.stop_mono[0] == pytest.approx(0.05)
     assert current.traces[0].n is not None
     assert current.traces[0].n[0] == 2
+
 
 def test_incremental_путь_пересчитывает_только_последний_хвост(
     monkeypatch: pytest.MonkeyPatch,
