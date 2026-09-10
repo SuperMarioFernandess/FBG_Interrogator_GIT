@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -260,15 +261,22 @@ class MeasurementPanel(DockTab):
             self._selection_loading = False
 
     def _build_layout(self) -> None:
-        selection_form = QFormLayout()
-        selection_form.addRow(texts.LABEL_GRAPH_HISTORY, self.history_spin)
-        selection_form.addRow(texts.LABEL_AVERAGING_ENABLED, self.averaging_enabled)
-        selection_form.addRow(texts.LABEL_AVERAGING_WINDOW, self.averaging_window)
-        selection_form.addRow(texts.LABEL_AVERAGING_FRAMES, self.averaging_frames)
-        selection_form.addRow(texts.LABEL_AVERAGING_SIGMA, self.averaging_sigma)
-        selection_form.addRow(texts.LABEL_AVERAGING_N, self.averaging_n)
+        selection_controls = QGridLayout()
+        selection_controls.addWidget(QLabel(texts.LABEL_GRAPH_HISTORY), 0, 0)
+        selection_controls.addWidget(self.history_spin, 0, 1)
+        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_ENABLED), 0, 2)
+        selection_controls.addWidget(self.averaging_enabled, 0, 3)
+        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_WINDOW), 1, 0)
+        selection_controls.addWidget(self.averaging_window, 1, 1)
+        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_FRAMES), 1, 2)
+        selection_controls.addWidget(self.averaging_frames, 1, 3)
+        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_SIGMA), 2, 0)
+        selection_controls.addWidget(self.averaging_sigma, 2, 1)
+        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_N), 2, 2)
+        selection_controls.addWidget(self.averaging_n, 2, 3)
+        selection_controls.setColumnStretch(3, 1)
         selection_layout = QVBoxLayout()
-        selection_layout.addLayout(selection_form)
+        selection_layout.addLayout(selection_controls)
         selection_layout.addWidget(self.trace_tree, 1)
         selection_box = QWidget()
         selection_box.setLayout(selection_layout)
