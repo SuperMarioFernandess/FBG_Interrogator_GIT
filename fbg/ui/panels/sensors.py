@@ -1,8 +1,9 @@
 """Панель датчиков: калибровка, карта пиков и постобработка записи.
 
 Датчик адресуется длиной волны и окном поиска (Р30), никогда номером слота.
-Калибровка уже посчитана контроллером в `AppSnapshot` на частоте UI (Р75):
-виджет не читает кольцо pipeline и не выполняет работу на 2 кГц.
+При обычном показе калибровка приходит готовой в `AppSnapshot` на частоте UI
+(Р75). При включённом усреднении Qt-свободная модель использует raw-снимок
+выбранных каналов; виджет сам кольцо pipeline не читает.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -43,10 +45,14 @@ from fbg.core.calibration import (
 from fbg.io.recalibrate import RecalibrationResult, recalibrate_recording
 from fbg.ui import models, texts
 from fbg.ui.app import AppController
-from fbg.ui.docking import DockTab, scrollable
+from fbg.ui.docking import MAX_UI_PERIOD_MS, DockTab, scrollable
 from fbg.ui.models import AppSnapshot, SensorPanelModel
 
 _SENSOR_ID_ROLE = Qt.ItemDataRole.UserRole
+#: Запас к окну усреднения гарантирует, что при максимальном периоде UI
+#: предыдущий незавершённый bin ещё целиком есть в raw-кольце. Завершённые
+#: окна дальше сохраняются инкрементальной моделью и повторно не копируются.
+SENSOR_RAW_UI_MARGIN_S = MAX_UI_PERIOD_MS / 1000.0 + 0.1
 
 
 class SensorsPanel(DockTab):
@@ -59,6 +65,8 @@ class SensorsPanel(DockTab):
         self._controller = controller
         self._items: dict[str, QTreeWidgetItem] = {}
         self._curves: dict[str, pg.PlotDataItem] = {}
+        self._bands: dict[str, tuple[pg.PlotDataItem, pg.PlotDataItem, pg.FillBetweenItem]] = {}
+        self._graph_model: models.SensorGraphModel | None = None
         self._map_regions: list[pg.LinearRegionItem] = []
         self._shown_sensor_version = -1
         self._shown_filter = ""
@@ -66,6 +74,7 @@ class SensorsPanel(DockTab):
         self._editing_id: str | None = None
         self._editing_compensation = None
         self._last_model: SensorPanelModel | None = None
+        self._last_snapshot: AppSnapshot | None = None
         self._recalc_thread: threading.Thread | None = None
         self._recalc_result: RecalibrationResult | None = None
         self._recalc_error: str | None = None
@@ -136,6 +145,17 @@ class SensorsPanel(DockTab):
         self.value_plot.setClipToView(True)
         self.empty_graph_label = QLabel(texts.SENSOR_EMPTY_GRAPH_HINT)
         self.empty_graph_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.averaging_enabled = QCheckBox()
+        self.averaging_enabled.setChecked(False)
+        self.averaging_window = QDoubleSpinBox()
+        self.averaging_window.setDecimals(1)
+        self.averaging_window.setRange(models.MIN_AVERAGING_MS, models.MAX_AVERAGING_MS)
+        self.averaging_window.setValue(models.DEFAULT_AVERAGING_MS)
+        self.averaging_window.setMaximumWidth(140)
+        self.averaging_frames = QLabel()
+        self.averaging_sigma = QCheckBox()
+        self.averaging_sigma.setChecked(True)
+        self.averaging_n = QLabel()
 
         self.map_channel = QComboBox()
         for channel in range(profile.channels):
@@ -253,7 +273,21 @@ class SensorsPanel(DockTab):
         editor_layout.addWidget(editor_box)
         editor_layout.addWidget(cal_box, 1)
 
+        graph_controls = QGridLayout()
+        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_ENABLED), 0, 0)
+        graph_controls.addWidget(self.averaging_enabled, 0, 1)
+        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_WINDOW), 0, 2)
+        graph_controls.addWidget(self.averaging_window, 0, 3)
+        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_FRAMES), 0, 4)
+        graph_controls.addWidget(self.averaging_frames, 0, 5)
+        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_SIGMA), 1, 0)
+        graph_controls.addWidget(self.averaging_sigma, 1, 1)
+        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_N), 1, 2)
+        graph_controls.addWidget(self.averaging_n, 1, 3)
+        graph_controls.setColumnStretch(5, 1)
+        graph_controls.setVerticalSpacing(0)
         graph_layout = QVBoxLayout()
+        graph_layout.addLayout(graph_controls)
         graph_layout.addWidget(self.empty_graph_label, 1)
         graph_layout.addWidget(self.value_plot)
         graph_box = QWidget()
@@ -318,9 +352,14 @@ class SensorsPanel(DockTab):
 
     def _connect_signals(self) -> None:
         self.filter_edit.textChanged.connect(lambda _text: self._refresh_from_controller())
-        self.unit_combo.currentIndexChanged.connect(lambda _index: self._unit_changed())
+        self.unit_combo.currentIndexChanged.connect(lambda _index: self._on_unit_changed())
         self.sensor_tree.itemSelectionChanged.connect(self._selection_changed)
-        self.sensor_tree.itemChanged.connect(lambda _item, _column: self._update_graph())
+        self.sensor_tree.itemChanged.connect(
+            lambda _item, _column: self._on_graph_selection_changed()
+        )
+        self.averaging_enabled.toggled.connect(self._on_averaging_changed)
+        self.averaging_window.valueChanged.connect(self._on_averaging_changed)
+        self.averaging_sigma.toggled.connect(lambda _checked: self._refresh_from_controller())
         self.new_button.clicked.connect(self._new_sensor)
         self.save_button.clicked.connect(self._save_sensor)
         self.delete_button.clicked.connect(self._delete_sensor)
@@ -338,6 +377,36 @@ class SensorsPanel(DockTab):
         self.refresh(
             self._controller.snapshot(include_trace_history=False, include_sensor_data=True)
         )
+
+    def _sync_sensor_trace_request(self) -> None:
+        selected = self._checked_sensor_ids() if self.averaging_enabled.isChecked() else ()
+        window_s = self.averaging_window.value() / 1000.0
+        self._controller.set_sensor_trace_request(
+            selected,
+            window_s + SENSOR_RAW_UI_MARGIN_S,
+        )
+
+    def _on_graph_selection_changed(self) -> None:
+        self._graph_model = None
+        self._sync_sensor_trace_request()
+        self._refresh_from_controller()
+
+    def _on_averaging_changed(self, _value: object = None) -> None:
+        self._graph_model = None
+        self._sync_sensor_trace_request()
+        self._refresh_from_controller()
+
+    def _averaging_window_s(self) -> float | None:
+        if not self.averaging_enabled.isChecked():
+            return None
+        return self.averaging_window.value() / 1000.0
+
+    def _update_averaging_controls(self, snapshot: AppSnapshot) -> None:
+        enabled = self.averaging_enabled.isChecked()
+        self.averaging_window.setEnabled(True)
+        self.averaging_sigma.setEnabled(enabled)
+        frames = models.expected_averaging_frames(snapshot, self.averaging_window.value())
+        self.averaging_frames.setText("—" if frames <= 0 else f"≈ {frames} кадров")
 
     @staticmethod
     def _finite(value: float, digits: int = 4) -> str:
@@ -424,20 +493,29 @@ class SensorsPanel(DockTab):
         data = self.unit_combo.currentData()
         return "" if data is None else str(data)
 
+    def _on_unit_changed(self) -> None:
+        self._unit_changed()
+        self._refresh_from_controller()
+
     def _unit_changed(self) -> None:
         unit = self._selected_unit()
-        for sensor in self._controller.sensors:
-            item = self._items.get(sensor.id)
-            if item is None:
-                continue
-            flags = item.flags()
-            if sensor.unit == unit:
-                item.setFlags(flags | Qt.ItemFlag.ItemIsUserCheckable)
-            else:
-                item.setCheckState(0, Qt.CheckState.Unchecked)
-                item.setFlags(flags & ~Qt.ItemFlag.ItemIsUserCheckable)
+        was_blocked = self.sensor_tree.blockSignals(True)
+        try:
+            for sensor in self._controller.sensors:
+                item = self._items.get(sensor.id)
+                if item is None:
+                    continue
+                flags = item.flags()
+                if sensor.unit == unit:
+                    item.setFlags(flags | Qt.ItemFlag.ItemIsUserCheckable)
+                else:
+                    item.setCheckState(0, Qt.CheckState.Unchecked)
+                    item.setFlags(flags & ~Qt.ItemFlag.ItemIsUserCheckable)
+        finally:
+            self.sensor_tree.blockSignals(was_blocked)
         self.value_plot.setLabel("left", unit or texts.SENSOR_NO_UNIT)
-        self._update_graph()
+        self._graph_model = None
+        self._sync_sensor_trace_request()
 
     def _selection_changed(self) -> None:
         items = self.sensor_tree.selectedItems()
@@ -622,35 +700,79 @@ class SensorsPanel(DockTab):
         )
 
     def _update_graph(self) -> None:
-        model = self._last_model
-        history = None if model is None else model.history
+        snapshot = self._last_snapshot
+        if snapshot is None:
+            return
         selected = self._checked_sensor_ids()
+        graph = models.sensor_graph_model(
+            snapshot,
+            selected,
+            self._graph_model,
+            averaging_window_s=self._averaging_window_s(),
+        )
+        unchanged = graph is self._graph_model
+        self._graph_model = graph
         selected_set = set(selected)
         for sensor_id in tuple(self._curves):
             if sensor_id not in selected_set:
                 self.value_plot.removeItem(self._curves.pop(sensor_id))
-        if history is None or history.frames == 0:
+                band = self._bands.pop(sensor_id, None)
+                if band is not None:
+                    for item in band:
+                        self.value_plot.removeItem(item)
+        if graph.t_s.size == 0:
             self.value_plot.hide()
             self.empty_graph_label.show()
+            self.averaging_n.setText("—")
             return
-        columns = {sensor_id: index for index, sensor_id in enumerate(history.sensor_ids)}
-        t_s = history.t_mono - history.t_mono[-1]
+        trace_by_id = {trace.sensor_id: trace for trace in graph.traces}
+        latest_counts: list[int] = []
         for index, sensor_id in enumerate(selected):
-            column = columns.get(sensor_id)
-            if column is None:
+            trace = trace_by_id.get(sensor_id)
+            if trace is None:
                 continue
             curve = self._curves.get(sensor_id)
             if curve is None:
-                curve = self.value_plot.plot(
-                    pen=pg.mkPen(pg.intColor(index, hues=max(1, len(selected)))), name=sensor_id
-                )
+                color = pg.intColor(index, hues=max(1, len(selected)))
+                curve = self.value_plot.plot(pen=pg.mkPen(color), name=sensor_id)
                 self._curves[sensor_id] = curve
-            curve.setData(t_s, history.values[:, column], connect="finite")
+                upper = pg.PlotDataItem(pen=None)
+                lower = pg.PlotDataItem(pen=None)
+                red, green, blue, _alpha = color.getRgb()
+                fill = pg.FillBetweenItem(
+                    upper,
+                    lower,
+                    brush=pg.mkBrush(red, green, blue, 45),
+                )
+                fill.setZValue(-10)
+                self.value_plot.addItem(upper)
+                self.value_plot.addItem(lower)
+                self.value_plot.addItem(fill)
+                self._bands[sensor_id] = (upper, lower, fill)
+            if not unchanged:
+                curve.setData(graph.t_s, trace.values, connect="finite")
+                if trace.sigma is not None:
+                    band = self._bands[sensor_id]
+                    band[0].setData(graph.t_s, trace.values + trace.sigma, connect="finite")
+                    band[1].setData(graph.t_s, trace.values - trace.sigma, connect="finite")
+            band = self._bands[sensor_id]
+            band_visible = (
+                self.averaging_enabled.isChecked()
+                and self.averaging_sigma.isChecked()
+                and trace.sigma is not None
+            )
+            for item in band:
+                item.setVisible(band_visible)
+            if trace.n is not None and trace.n.size:
+                latest_counts.append(int(trace.n[-1]))
         has_data = bool(selected) and any(
-            column is not None and np.any(np.isfinite(history.values[:, column]))
-            for sensor_id in selected
-            for column in (columns.get(sensor_id),)
+            np.any(np.isfinite(trace.values)) for trace in graph.traces
         )
+        if latest_counts:
+            low, high = min(latest_counts), max(latest_counts)
+            self.averaging_n.setText(str(low) if low == high else f"{low}…{high}")
+        else:
+            self.averaging_n.setText("—")
         self.value_plot.setVisible(has_data)
         self.empty_graph_label.setVisible(not has_data)
 
@@ -727,19 +849,24 @@ class SensorsPanel(DockTab):
         """Показывает уже рассчитанный на частоте UI снимок датчиков."""
         model = models.sensor_panel_model(snapshot, filter_text=self.filter_edit.text())
         self._last_model = model
+        self._last_snapshot = snapshot
         filter_text = self.filter_edit.text()
-        if (
-            snapshot.sensor_version != self._shown_sensor_version
-            or filter_text != self._shown_filter
-        ):
+        sensor_changed = snapshot.sensor_version != self._shown_sensor_version
+        if sensor_changed or filter_text != self._shown_filter:
             self._rebuild_tree(model)
             self._update_units(model)
             self._shown_sensor_version = snapshot.sensor_version
             self._shown_filter = filter_text
             self._shown_map_channel = -1
+            if sensor_changed:
+                # Калибровка/канал могли измениться при том же ID. Старые
+                # завершённые окна физических величин переиспользовать нельзя.
+                self._graph_model = None
+                self._sync_sensor_trace_request()
         else:
             self._update_tree_values(model)
         self._update_peak_combo()
+        self._update_averaging_controls(snapshot)
         self._update_graph()
         self._update_peak_map()
         self._poll_recalibration()

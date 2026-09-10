@@ -400,3 +400,27 @@ def test_пересчёт_csv_идёт_в_обычном_рабочем_пото
         release.set()
         panel.close()
         panel.deleteLater()
+
+
+def test_усреднение_датчиков_имеет_те_же_контролы_и_выключено_по_умолчанию(
+    application: QApplication, controller: AppController
+) -> None:
+    panel = SensorsPanel(controller)
+    try:
+        assert not panel.averaging_enabled.isChecked()
+        assert panel.averaging_window.value() == pytest.approx(models.DEFAULT_AVERAGING_MS)
+        assert panel.averaging_sigma.isChecked()
+        assert panel.averaging_window.minimum() == pytest.approx(models.MIN_AVERAGING_MS)
+        assert panel.averaging_window.maximum() == pytest.approx(models.MAX_AVERAGING_MS)
+        assert panel.averaging_window.isEnabled()
+        assert not panel.averaging_sigma.isEnabled()
+        assert panel.averaging_n.text() == texts.UNKNOWN
+
+        panel.averaging_enabled.setChecked(True)
+        panel.refresh(controller.snapshot(include_trace_history=False, include_sensor_data=True))
+        assert panel.averaging_window.isEnabled()
+        assert panel.averaging_sigma.isEnabled()
+        assert "100" in panel.averaging_frames.text()
+    finally:
+        panel.close()
+        panel.deleteLater()

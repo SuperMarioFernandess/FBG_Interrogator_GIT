@@ -223,6 +223,43 @@ def test_датчики_считаются_только_когда_их_прос
         stand.close()
 
 
+def test_усреднение_датчика_запрашивает_raw_историю_только_по_выбранному_каналу(
+    rig: Rig,
+) -> None:
+    rig.controller.replace_sensors((_temperature_sensor(),))
+    try:
+        assert rig.controller.connect().ok
+        assert rig.controller.start_stream().ok
+        assert wait_until(lambda: rig.controller.pipeline.sequence >= 5)
+        rig.controller.set_sensor_trace_request(("T1",), 0.1)
+
+        hidden = rig.controller.snapshot(include_sensor_data=False)
+        assert hidden.sensor_trace_history is None
+
+        visible = rig.controller.snapshot(include_sensor_data=True)
+        assert visible.sensor_trace_history is not None
+        assert visible.sensor_trace_history.frames > 0
+        assert visible.sensor_trace_history.positions == tuple(
+            (0, position) for position in range(rig.controller.config.profile.fbg_per_channel)
+        )
+    finally:
+        rig.controller.stop_stream()
+
+
+def test_границы_сетевого_gap_доходят_до_qt_свободного_snapshot() -> None:
+    controller = AppController(AppConfig(packet_log=PacketLogConfig(directory=None)))
+    try:
+        controller._on_stream_gap(12.25, 12.75)
+        controller._on_stream_gap(20.0, 21.5)
+
+        assert controller.snapshot(include_sensor_data=False).stream_gaps == (
+            (12.25, 12.75),
+            (20.0, 21.5),
+        )
+    finally:
+        controller.shutdown()
+
+
 def test_сохранение_датчика_проверяет_пересечение_окон(rig: Rig) -> None:
     """Невалидный набор не попадает ни в память, ни в sensors.json."""
     first = _temperature_sensor("A", expected_nm=1545.0)

@@ -7,15 +7,18 @@ pipeline по запросу выбранных позиций; `RingHistory` с
 """
 
 import math
+import threading
 from dataclasses import replace
 from pathlib import Path
 
 import pyqtgraph as pg
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -30,6 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from fbg.core.session import SessionState
+from fbg.io.averaging import AveragingExportResult, average_recording
 from fbg.ui import models, texts
 from fbg.ui.app import AppController
 from fbg.ui.docking import DockTab
@@ -136,8 +140,13 @@ class MeasurementPanel(DockTab):
         self._record_settings_loading = False
         self._record_settings_dirty = False
         self._curves: dict[SlotRef, pg.PlotDataItem] = {}
+        self._bands: dict[SlotRef, tuple[pg.PlotDataItem, pg.PlotDataItem, pg.FillBetweenItem]] = {}
         self._graph_model: models.MeasurementGraphModel | None = None
         self._graph_ticks = 0
+        self._average_thread: threading.Thread | None = None
+        self._average_result: AveragingExportResult | None = None
+        self._average_error: str | None = None
+        self._average_reported = False
 
         profile = controller.config.profile
         self.trace_tree = QTreeWidget()
@@ -149,6 +158,17 @@ class MeasurementPanel(DockTab):
         self.history_spin.setRange(MIN_HISTORY_S, 86_400.0)
         self.history_spin.setValue(5.0)
         self.history_spin.setMaximumWidth(140)
+        self.averaging_enabled = QCheckBox()
+        self.averaging_enabled.setChecked(False)
+        self.averaging_window = QDoubleSpinBox()
+        self.averaging_window.setDecimals(1)
+        self.averaging_window.setRange(models.MIN_AVERAGING_MS, models.MAX_AVERAGING_MS)
+        self.averaging_window.setValue(models.DEFAULT_AVERAGING_MS)
+        self.averaging_window.setMaximumWidth(140)
+        self.averaging_frames = QLabel()
+        self.averaging_sigma = QCheckBox()
+        self.averaging_sigma.setChecked(True)
+        self.averaging_n = QLabel()
 
         self.plot = pg.PlotWidget()
         self.plot.setMinimumHeight(220)
@@ -205,6 +225,9 @@ class MeasurementPanel(DockTab):
         self.record_error.setStyleSheet("font-weight: bold;")
         self.start_record_button = QPushButton(texts.BUTTON_START_RECORDING)
         self.stop_record_button = QPushButton(texts.BUTTON_STOP_RECORDING)
+        self.average_recording_button = QPushButton(texts.BUTTON_AVERAGE_RECORDING)
+        self.average_recording_state = QLabel()
+        self.average_recording_state.setWordWrap(True)
 
         self._build_trace_tree(profile.channels, profile.fbg_per_channel)
         self._build_layout()
@@ -238,10 +261,23 @@ class MeasurementPanel(DockTab):
             self._selection_loading = False
 
     def _build_layout(self) -> None:
-        selection_form = QFormLayout()
-        selection_form.addRow(texts.LABEL_GRAPH_HISTORY, self.history_spin)
+        selection_controls = QGridLayout()
+        selection_controls.addWidget(QLabel(texts.LABEL_GRAPH_HISTORY), 0, 0)
+        selection_controls.addWidget(self.history_spin, 0, 1)
+        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_ENABLED), 0, 2)
+        selection_controls.addWidget(self.averaging_enabled, 0, 3)
+        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_WINDOW), 1, 0)
+        selection_controls.addWidget(self.averaging_window, 1, 1)
+        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_FRAMES), 1, 2)
+        selection_controls.addWidget(self.averaging_frames, 1, 3)
+        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_SIGMA), 2, 0)
+        selection_controls.addWidget(self.averaging_sigma, 2, 1)
+        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_N), 2, 2)
+        selection_controls.addWidget(self.averaging_n, 2, 3)
+        selection_controls.setColumnStretch(3, 1)
+        selection_controls.setVerticalSpacing(0)
         selection_layout = QVBoxLayout()
-        selection_layout.addLayout(selection_form)
+        selection_layout.addLayout(selection_controls)
         selection_layout.addWidget(self.trace_tree, 1)
         selection_box = QWidget()
         selection_box.setLayout(selection_layout)
@@ -277,6 +313,8 @@ class MeasurementPanel(DockTab):
         record_buttons = QHBoxLayout()
         record_buttons.addWidget(self.start_record_button)
         record_buttons.addWidget(self.stop_record_button)
+        record_buttons.addWidget(self.average_recording_button)
+        record_buttons.addWidget(self.average_recording_state, 1)
         record_form.addRow("", record_buttons)
         record_form.addRow("", self.record_error)
         record_box = QWidget()
@@ -333,12 +371,16 @@ class MeasurementPanel(DockTab):
     def _connect_signals(self) -> None:
         self.trace_tree.itemChanged.connect(self._on_trace_changed)
         self.history_spin.valueChanged.connect(self._on_history_changed)
+        self.averaging_enabled.toggled.connect(self._on_averaging_changed)
+        self.averaging_window.valueChanged.connect(self._on_averaging_changed)
+        self.averaging_sigma.toggled.connect(lambda _checked: self._refresh_from_controller())
         self.record_directory.textEdited.connect(self._on_record_setting_changed)
         self.record_decimation.valueChanged.connect(self._on_record_setting_changed)
         self.record_limit.valueChanged.connect(self._on_record_setting_changed)
         self.browse_button.clicked.connect(self._browse_directory)
         self.start_record_button.clicked.connect(self._start_recording)
         self.stop_record_button.clicked.connect(self._stop_recording)
+        self.average_recording_button.clicked.connect(self._start_average_export)
 
     # --- Выбор графика ---------------------------------------------------------------
 
@@ -358,9 +400,13 @@ class MeasurementPanel(DockTab):
         return tuple(selected)
 
     def _sync_trace_request(self) -> None:
+        history_s = self.history_spin.value()
+        averaging_s = self._averaging_window_s()
+        if averaging_s is not None:
+            history_s = max(history_s, averaging_s)
         self._controller.set_measurement_trace_request(
             [(slot.channel, slot.position) for slot in self.selected_slots()],
-            self.history_spin.value(),
+            history_s,
         )
 
     def _on_trace_changed(self, _item: QTreeWidgetItem, _column: int) -> None:
@@ -371,6 +417,29 @@ class MeasurementPanel(DockTab):
     def _on_history_changed(self, _value: float) -> None:
         if not self._selection_loading:
             self._sync_trace_request()
+
+    def _on_averaging_changed(self, _value: object = None) -> None:
+        self._graph_model = None
+        self._sync_trace_request()
+        self._refresh_from_controller()
+
+    def _refresh_from_controller(self) -> None:
+        self.refresh(self._controller.snapshot(include_sensor_data=False))
+
+    def _averaging_window_s(self) -> float | None:
+        if not self.averaging_enabled.isChecked():
+            return None
+        return self.averaging_window.value() / 1000.0
+
+    def _update_averaging_controls(self, snapshot: AppSnapshot) -> None:
+        enabled = self.averaging_enabled.isChecked()
+        # Окно остаётся редактируемым и при выключенном live-усреднении:
+        # то же поле задаёт окно офлайн-экспорта готовой записи. На график
+        # оно не влияет, пока флажок ``averaging_enabled`` снят.
+        self.averaging_window.setEnabled(True)
+        self.averaging_sigma.setEnabled(enabled)
+        frames = models.expected_averaging_frames(snapshot, self.averaging_window.value())
+        self.averaging_frames.setText("—" if frames <= 0 else f"≈ {frames} кадров")
 
     def _update_history_limit(self, snapshot: AppSnapshot) -> None:
         metrics = snapshot.metrics
@@ -399,6 +468,7 @@ class MeasurementPanel(DockTab):
             selected,
             self._graph_model,
             recalculate_y=self._graph_ticks % Y_RANGE_RECALC_TICKS == 0,
+            averaging_window_s=self._averaging_window_s(),
         )
         unchanged = model is self._graph_model
         self._graph_model = model
@@ -406,19 +476,60 @@ class MeasurementPanel(DockTab):
         for slot in tuple(self._curves):
             if slot not in selected_set:
                 self.plot.removeItem(self._curves.pop(slot))
+                band = self._bands.pop(slot, None)
+                if band is not None:
+                    for item in band:
+                        self.plot.removeItem(item)
 
         for index, trace in enumerate(model.traces):
             curve = self._curves.get(trace.slot)
             if curve is None:
-                pen = pg.mkPen(pg.intColor(index, hues=max(1, len(selected))))
+                color = pg.intColor(index, hues=max(1, len(selected)))
+                pen = pg.mkPen(color)
                 curve = self.plot.plot(
                     pen=pen, name=texts.slot_label(trace.slot.channel, trace.slot.position)
                 )
                 self._curves[trace.slot] = curve
+                upper = pg.PlotDataItem(pen=None)
+                lower = pg.PlotDataItem(pen=None)
+                red, green, blue, _alpha = color.getRgb()
+                fill = pg.FillBetweenItem(
+                    upper,
+                    lower,
+                    brush=pg.mkBrush(red, green, blue, 45),
+                )
+                fill.setZValue(-10)
+                self.plot.addItem(upper)
+                self.plot.addItem(lower)
+                self.plot.addItem(fill)
+                self._bands[trace.slot] = (upper, lower, fill)
             # `connect="finite"` — принципиальная часть отображения: NaN
             # разрывает линию и никогда не соединяется через пропавший пик.
             if not unchanged:
                 curve.setData(model.t_s, trace.delta_nm, connect="finite")
+                band = self._bands[trace.slot]
+                sigma = trace.sigma_nm
+                if sigma is not None:
+                    band[0].setData(model.t_s, trace.delta_nm + sigma, connect="finite")
+                    band[1].setData(model.t_s, trace.delta_nm - sigma, connect="finite")
+            band = self._bands[trace.slot]
+            band_visible = (
+                self.averaging_enabled.isChecked()
+                and self.averaging_sigma.isChecked()
+                and trace.sigma_nm is not None
+            )
+            for item in band:
+                item.setVisible(band_visible)
+
+        counts: list[int] = []
+        for trace in model.traces:
+            if trace.n is not None and trace.n.size:
+                counts.append(int(trace.n[-1]))
+        if self.averaging_enabled.isChecked() and counts:
+            low, high = min(counts), max(counts)
+            self.averaging_n.setText(str(low) if low == high else f"{low}…{high}")
+        else:
+            self.averaging_n.setText(texts.UNKNOWN)
 
         self.plot.setXRange(-self.history_spin.value(), 0.0, padding=0.0)
         if not unchanged:
@@ -498,6 +609,55 @@ class MeasurementPanel(DockTab):
         self._controller.stop_recording()
         self.refresh(self._controller.snapshot())
 
+    def _start_average_export(self) -> None:
+        thread = self._average_thread
+        if thread is not None and thread.is_alive():
+            return
+        filename, _filter = QFileDialog.getOpenFileName(
+            self,
+            texts.BUTTON_AVERAGE_RECORDING,
+            str(Path.cwd()),
+            "CSV (*.csv)",
+        )
+        if not filename:
+            return
+        window_s = self.averaging_window.value() / 1000.0
+        self._average_result = None
+        self._average_error = None
+        self._average_reported = False
+        self.average_recording_state.setText("Усреднение выполняется…")
+
+        def worker() -> None:
+            try:
+                self._average_result = average_recording(Path(filename), window_s)
+            except Exception as exc:  # результат возвращается в UI, поток не теряется молча
+                self._average_error = f"{type(exc).__name__}: {exc}"
+
+        self._average_thread = threading.Thread(
+            target=worker,
+            name="fbg-average-export",
+            daemon=False,
+        )
+        self._average_thread.start()
+
+    def _poll_average_export(self, *, recording: bool) -> None:
+        thread = self._average_thread
+        running = thread is not None and thread.is_alive()
+        self.average_recording_button.setEnabled(not running and not recording)
+        if thread is None or running or self._average_reported:
+            return
+        self._average_reported = True
+        if self._average_error is not None:
+            self.average_recording_state.setText(f"Ошибка: {self._average_error}")
+            return
+        result = self._average_result
+        if result is None:
+            self.average_recording_state.setText("Усреднение завершено без результата")
+            return
+        self.average_recording_state.setText(
+            f"Готово: окон {result.windows}, # GAP {result.gaps}; {result.output.name}"
+        )
+
     @staticmethod
     def _format_bytes(value: int) -> str:
         if value >= 1_000_000_000:
@@ -570,6 +730,7 @@ class MeasurementPanel(DockTab):
             not model.active and snapshot.state is SessionState.STREAMING
         )
         self.stop_record_button.setEnabled(model.active)
+        self._poll_average_export(recording=model.active)
 
     def _update_quality(self, snapshot: AppSnapshot) -> None:
         metrics = snapshot.metrics
@@ -581,14 +742,22 @@ class MeasurementPanel(DockTab):
             if metrics.loss_estimate is None
             else f"{metrics.loss_estimate * 100.0:.3f} % (оценка)"
         )
-        self.quality_label.setText(f"Темп: {metrics.frame_rate_hz:.2f} Гц · потери: {loss}")
+        text = f"Темп: {metrics.frame_rate_hz:.2f} Гц · потери: {loss}"
+        self.quality_label.setText(text)
 
     # --- Общий такт ------------------------------------------------------------------
 
     def refresh(self, snapshot: AppSnapshot) -> None:
         """Один UI-такт: график, таблица и состояние записи целиком."""
         self._update_history_limit(snapshot)
+        self._update_averaging_controls(snapshot)
         self._update_graph(snapshot)
         self._update_table(snapshot)
         self._update_recording(snapshot)
         self._update_quality(snapshot)
+
+    def closeEvent(self, event: object) -> None:  # noqa: N802 — Qt
+        thread = self._average_thread
+        if thread is not None and thread.is_alive():
+            thread.join()
+        super().closeEvent(event)  # type: ignore[arg-type]

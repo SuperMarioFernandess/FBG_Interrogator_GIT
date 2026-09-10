@@ -6,6 +6,7 @@
 """
 
 import os
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -17,18 +18,20 @@ pytest.importorskip("PySide6", reason="тесты интерфейса треб�
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QFileDialog
 
 from fbg.core.endpoint import Endpoint
 from fbg.core.pipeline import RingHistory
 from fbg.core.profile import DeviceProfile
 from fbg.core.session import SessionState
+from fbg.io.averaging import AveragingExportResult
 from fbg.io.config import AppConfig
 from fbg.io.packet_log import PacketLogConfig
 from fbg.io.recorder import RecorderConfig, RecorderStats
 from fbg.ui import models, texts
 from fbg.ui.app import AppController
 from fbg.ui.main_window import UI_PERIOD_MS, MainWindow
+from fbg.ui.panels import measurement as measurement_module
 from fbg.ui.panels.measurement import MeasurementPanel
 from tests.synthetic import load_vectors
 
@@ -275,3 +278,61 @@ def test_оценка_объёма_сразу_реагирует_на_децим
 
     assert after != before
     assert panel.record_decimation.value() == 2
+
+
+def test_усреднение_измерения_выключено_по_умолчанию_и_не_путается_с_записью(
+    panel: MeasurementPanel, controller: AppController
+) -> None:
+    assert not panel.averaging_enabled.isChecked()
+    assert panel.averaging_window.value() == pytest.approx(models.DEFAULT_AVERAGING_MS)
+    assert panel.averaging_sigma.isChecked()
+    assert panel.averaging_window.isEnabled()
+    assert not panel.averaging_sigma.isEnabled()
+    assert panel.averaging_n.text() == texts.UNKNOWN
+    assert texts.LABEL_RECORD_DECIMATION == "Децимация записи"
+
+    panel.averaging_enabled.setChecked(True)
+    panel.refresh(controller.snapshot(include_sensor_data=False))
+    assert panel.averaging_window.isEnabled()
+    assert panel.averaging_sigma.isEnabled()
+    assert "100" in panel.averaging_frames.text()
+
+
+def test_усреднённый_экспорт_готовой_записи_не_блокирует_gui(
+    panel: MeasurementPanel,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "data.csv"
+    source.write_text("dummy", encoding="ascii")
+    entered = threading.Event()
+    release = threading.Event()
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileName",
+        lambda *args, **kwargs: (str(source), "CSV (*.csv)"),
+    )
+
+    def slow_average(path: Path, window_s: float) -> AveragingExportResult:
+        assert path == source
+        assert window_s == pytest.approx(panel.averaging_window.value() / 1000.0)
+        entered.set()
+        assert release.wait(2.0)
+        return AveragingExportResult((source,), tmp_path / "averaged.csv", 7, 2)
+
+    monkeypatch.setattr(measurement_module, "average_recording", slow_average)
+    try:
+        started = time.perf_counter()
+        panel._start_average_export()
+        elapsed = time.perf_counter() - started
+        assert entered.wait(1.0)
+        assert elapsed < 0.2
+        assert panel._average_thread is not None and panel._average_thread.is_alive()
+        release.set()
+        panel._average_thread.join(2.0)
+        panel._poll_average_export(recording=False)
+        assert "окон 7" in panel.average_recording_state.text()
+        assert "# GAP 2" in panel.average_recording_state.text()
+    finally:
+        release.set()
