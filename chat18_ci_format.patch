@@ -1,0 +1,56 @@
+diff --git a/fbg/core/calibration.py b/fbg/core/calibration.py
+index 9522e5d..d9b59d3 100644
+--- a/fbg/core/calibration.py
++++ b/fbg/core/calibration.py
+@@ -187,9 +187,7 @@ class CalibrationPoint:
+             raise ValueError("value опорной точки должно быть конечным")
+         if isinstance(self.n, bool) or not isinstance(self.n, int) or self.n < 1:
+             raise ValueError("n опорной точки должен быть целым числом ≥ 1")
+-        if self.sigma_nm is not None and (
+-            not math.isfinite(self.sigma_nm) or self.sigma_nm < 0.0
+-        ):
++        if self.sigma_nm is not None and (not math.isfinite(self.sigma_nm) or self.sigma_nm < 0.0):
+             raise ValueError("sigma_nm опорной точки должна быть конечной и неотрицательной")
+ 
+ 
+@@ -481,9 +479,7 @@ def fit_calibration(
+         else:
+             inverse_variance = 1.0 / (uncertainties * uncertainties)
+             rms = float(
+-                np.sqrt(
+-                    np.sum(inverse_variance * residual * residual) / np.sum(inverse_variance)
+-                )
++                np.sqrt(np.sum(inverse_variance * residual * residual) / np.sum(inverse_variance))
+             )
+         max_abs = float(np.max(np.abs(residual)))
+     return CalibrationFit(
+diff --git a/tests/test_calibration.py b/tests/test_calibration.py
+index 12b526a..1860d17 100644
+--- a/tests/test_calibration.py
++++ b/tests/test_calibration.py
+@@ -649,9 +649,7 @@ def test_u_выше_квантового_пола() -> None:
+ 
+ def test_u_при_sigma_zero_ограничен_квантом() -> None:
+     point = CalibrationPoint(1550.0, 1.0, n=100, sigma_nm=0.0)
+-    assert calibration_point_uncertainty(point, 0.008) == pytest.approx(
+-        0.008 / math.sqrt(12) / 10
+-    )
++    assert calibration_point_uncertainty(point, 0.008) == pytest.approx(0.008 / math.sqrt(12) / 10)
+ 
+ 
+ def test_u_одиночной_точки_равен_квантовому_полу() -> None:
+diff --git a/tests/test_ui_sensors_widget.py b/tests/test_ui_sensors_widget.py
+index 757215a..b4cf2e2 100644
+--- a/tests/test_ui_sensors_widget.py
++++ b/tests/test_ui_sensors_widget.py
+@@ -512,9 +512,7 @@ def test_калибровочная_точка_с_усреднением_берет_последнее_завершенное_окно(
+             seq_start=0,
+             seq_stop=5,
+             t_mono=np.asarray([0.001, 0.020, 0.051, 0.070, 0.090]),
+-            wavelength_nm=np.asarray(
+-                [[1550.000], [1550.004], [1550.100], [1550.104], [1550.108]]
+-            ),
++            wavelength_nm=np.asarray([[1550.000], [1550.004], [1550.100], [1550.104], [1550.108]]),
+         )
+         panel.averaging_enabled.blockSignals(True)
+         panel.averaging_enabled.setChecked(True)
