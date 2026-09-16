@@ -26,6 +26,7 @@ from fbg.core.calibration import (
     SensorType,
     TempCompensation,
     apply_curve,
+    calibration_point_uncertainty,
     evaluate,
     evaluate_all,
     fit_calibration,
@@ -35,6 +36,7 @@ from fbg.core.calibration import (
     sensors_to_json,
     validate_sensors,
 )
+from fbg.core.profile import DeviceProfile
 
 #: Длины волн решёток стенда, ✅ скрининг 27.08.2026 (KB_01).
 STAND_NM_1 = 1544.787
@@ -606,3 +608,95 @@ def test_подгонка_отвергает_повтор_одной_длины_
     )
     with pytest.raises(ValueError, match="различных длин волн"):
         fit_calibration(points, 1544.8)
+
+
+# --------------------------------------------------------------------------------------
+# Р83 / Р84: качество калибровочных точек и взвешенная подгонка
+# --------------------------------------------------------------------------------------
+
+
+def test_legacy_опорная_точка_без_n_и_sigma_читается_как_одиночная() -> None:
+    restored = sensor_from_json(
+        {
+            "id": "S1",
+            "channel": 0,
+            "type": 0,
+            "expected_nm": 1550.0,
+            "window_nm": 0.3,
+            "calibration_points": [{"wavelength_nm": 1550.1, "value": 10.0}],
+        }
+    )
+    point = restored.calibration_points[0]
+    assert point.n == 1
+    assert point.sigma_nm is None
+    assert restored.weighted_fit is True
+
+
+def test_опорная_точка_сохраняет_n_sigma_и_выбор_весов() -> None:
+    sensor = temperature_sensor(
+        calibration_points=(CalibrationPoint(1544.8, 20.0, 100, 0.0015),),
+        weighted_fit=False,
+    )
+    restored = sensor_from_json(sensor_to_json(sensor))
+    assert restored == sensor
+
+
+def test_u_выше_квантового_пола() -> None:
+    point = CalibrationPoint(1550.0, 1.0, n=100, sigma_nm=0.012)
+    expected_s = 0.012 * math.sqrt(100 / 99)
+    assert calibration_point_uncertainty(point, 0.008) == pytest.approx(expected_s / 10.0)
+
+
+def test_u_при_sigma_zero_ограничен_квантом() -> None:
+    point = CalibrationPoint(1550.0, 1.0, n=100, sigma_nm=0.0)
+    assert calibration_point_uncertainty(point, 0.008) == pytest.approx(0.008 / math.sqrt(12) / 10)
+
+
+def test_u_одиночной_точки_равен_квантовому_полу() -> None:
+    point = CalibrationPoint(1550.0, 1.0, n=1, sigma_nm=None)
+    assert calibration_point_uncertainty(point, 0.008) == pytest.approx(0.008 / math.sqrt(12))
+
+
+def test_u_n2_использует_несмещенную_оценку_sigma() -> None:
+    point = CalibrationPoint(1550.0, 1.0, n=2, sigma_nm=0.01)
+    # s = sigma_pop * sqrt(2), затем / sqrt(2) => исходные 0.01 нм.
+    assert calibration_point_uncertainty(point, 0.001) == pytest.approx(0.01)
+
+
+def test_взвешенная_и_обычная_подгонки_совпадают_при_одинаковом_качестве() -> None:
+    points = tuple(
+        CalibrationPoint(1550.0 + x, y, n=10, sigma_nm=0.002)
+        for x, y in ((0.0, 0.0), (0.1, 1.0), (0.2, 2.1), (0.3, 3.0))
+    )
+    plain = fit_calibration(points, 1550.0)
+    weighted = fit_calibration(points, 1550.0, quantization_nm=0.008)
+    assert weighted.k1 == pytest.approx(plain.k1)
+    assert weighted.value0 == pytest.approx(plain.value0)
+
+
+def test_polyfit_получает_1_на_u_а_не_1_на_u_квадрат() -> None:
+    points = (
+        CalibrationPoint(1550.0, 0.0, n=100, sigma_nm=0.001),
+        CalibrationPoint(1551.0, 1.0, n=100, sigma_nm=0.001),
+        CalibrationPoint(1552.0, 2.0, n=100, sigma_nm=0.001),
+        CalibrationPoint(1553.0, 10.0, n=1, sigma_nm=None),
+    )
+    # Три хорошие точки имеют u=0.001; одиночная последняя — u=0.01.
+    fit = fit_calibration(points, 1550.0, quantization_nm=0.034641016151377546)
+    assert fit.k1 == pytest.approx(1.0684, rel=2e-3)
+    assert fit.k1 != pytest.approx(1.0007, rel=2e-3)
+
+
+def test_невязка_прямой_по_двум_точкам_не_притворяется_нулевой() -> None:
+    fit = fit_calibration(
+        (CalibrationPoint(1550.0, 0.0), CalibrationPoint(1551.0, 1.0)),
+        1550.0,
+    )
+    assert fit.rms is None
+    assert fit.max_abs_residual is None
+
+
+def test_квантование_длины_волны_берется_из_профиля() -> None:
+    profile = DeviceProfile()
+    q = profile.wavelength_quantization_nm(1550.0)
+    assert q == pytest.approx(0.008, rel=0.02)

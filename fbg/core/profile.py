@@ -77,6 +77,11 @@ class DeviceProfile:
     threshold_auto: int = 0xFFFF
     gain_max_level: int = 5
 
+    # Р84: шаг квантования найденной частоты. Поле живёт в профиле, а не в UI:
+    # это свойство прибора, от которого считается пол неопределённости точки.
+    # Для данного прибора наблюдаемая квантовка — 1 ГГц ≈ 8 пм около 1550 нм.
+    peak_quantization_ghz: float = 1.0
+
     # N6 ✅ скрининг 30.08.2026: тёмное смещение и коэффициенты пересчёта
     # P[dBm] = 10*log10((ADC - adc_dark_offset) * X[gain]).
     # Это физические параметры конкретного семейства прибора, поэтому живут
@@ -179,6 +184,8 @@ class DeviceProfile:
             )
         if any(coefficient <= 0.0 for coefficient in self.gain_power_coefficients):
             raise ValueError("gain_power_coefficients должны быть положительными")
+        if self.peak_quantization_ghz <= 0.0:
+            raise ValueError("peak_quantization_ghz должен быть положительным")
         if self.sweep_base_ghz - self.stop_param < 1:
             raise ValueError(
                 f"sweep_base_ghz={self.sweep_base_ghz} меньше stop_param={self.stop_param}: "
@@ -186,6 +193,18 @@ class DeviceProfile:
             )
 
     # --- Расчётные величины ---
+
+    def wavelength_quantization_nm(self, wavelength_nm: float) -> float:
+        """Шаг квантования найденного пика в нм около заданной длины волны.
+
+        Пересчёт точный, а не дифференциальное приближение: берём соседний
+        уровень частоты, отстоящий на ``peak_quantization_ghz``.
+        """
+        if wavelength_nm <= 0.0:
+            raise ValueError("wavelength_nm должна быть положительной")
+        frequency_ghz = C_NM_GHZ / wavelength_nm
+        adjacent_nm = C_NM_GHZ / (frequency_ghz + self.peak_quantization_ghz)
+        return wavelength_nm - adjacent_nm
 
     @property
     def start_ghz(self) -> int:

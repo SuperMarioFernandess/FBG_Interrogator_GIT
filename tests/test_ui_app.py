@@ -120,6 +120,12 @@ def wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
     return predicate()
 
 
+def wait_for_packet_log(controller: AppController, timeout: float = 5.0) -> None:
+    """Сравнивать журнал можно только после опустошения обеих очередей."""
+    assert wait_until(lambda: controller.session._transport.queue_depth == 0, timeout=timeout)
+    assert wait_until(lambda: controller.packet_log.stats.queue_depth == 0, timeout=timeout)
+
+
 # --------------------------------------------------------------------------------------
 # Сборка
 # --------------------------------------------------------------------------------------
@@ -244,6 +250,15 @@ def test_усреднение_датчика_запрашивает_raw_исто
         )
     finally:
         rig.controller.stop_stream()
+
+
+def test_калибровка_нового_датчика_может_запросить_raw_канал_без_сохранения(
+    rig: Rig,
+) -> None:
+    rig.controller.set_sensor_trace_request((), 0.1, extra_channels=(2,))
+    assert rig.controller._sensor_trace_positions == tuple(
+        (2, position) for position in range(rig.controller.config.profile.fbg_per_channel)
+    )
 
 
 def test_границы_сетевого_gap_доходят_до_qt_свободного_snapshot() -> None:
@@ -637,7 +652,7 @@ def test_журнал_видит_обмен_подключения(rig: Rig) -> 
     закреплять несуществующую гарантию тестом нельзя.
     """
     rig.controller.connect().unwrap()
-    assert wait_until(lambda: len(rig.controller.packet_records()) > 2)
+    wait_for_packet_log(rig.controller)
     outgoing = rig.controller.packet_records(direction=Direction.TX)
     assert outgoing
     assert outgoing[0].data[:2] == bytes([0x30, 0x01])
@@ -646,7 +661,7 @@ def test_журнал_видит_обмен_подключения(rig: Rig) -> 
 def test_фильтр_записей_журнала(rig: Rig) -> None:
     """Панель просит отфильтрованный снимок, а не фильтрует кольцо сама."""
     rig.controller.connect().unwrap()
-    assert wait_until(lambda: len(rig.controller.packet_records()) > 2)
+    wait_for_packet_log(rig.controller)
     everything = rig.controller.packet_records()
     outgoing = rig.controller.packet_records(id_fc=(0x10, 0x01))
     assert 0 < len(outgoing) < len(everything)
@@ -656,7 +671,7 @@ def test_фильтр_записей_журнала(rig: Rig) -> None:
 def test_экспорт_журнала_пишет_файл(rig: Rig, tmp_path: Path) -> None:
     """Экспорт выгружает кольцо с применённым фильтром."""
     rig.controller.connect().unwrap()
-    assert wait_until(lambda: len(rig.controller.packet_records()) > 2)
+    wait_for_packet_log(rig.controller)
     target = tmp_path / "export.log"
     written = rig.controller.export_packets(target)
     assert written > 0
@@ -722,8 +737,10 @@ def test_спектр_во_время_потока_полностью_перез
 
 def test_спектр_из_idle_после_30_07_обязательно_посылает_stop(rig: Rig) -> None:
     rig.controller.connect().unwrap()
+    wait_for_packet_log(rig.controller)
     before = len(rig.controller.packet_records(direction=Direction.TX))
     rig.controller.take_spectrum(0, 3000).unwrap()
+    wait_for_packet_log(rig.controller)
     outgoing = rig.controller.packet_records(direction=Direction.TX)[before:]
     assert [record.id_fc for record in outgoing] == [(0x30, 0x07), (0x30, 0x01)]
     assert rig.controller.session.state is SessionState.IDLE
@@ -752,9 +769,11 @@ def test_одиночный_спектр_не_блокирует_вызываю�
 
 def test_debug_из_idle_после_30_03_обязательно_посылает_stop(rig: Rig) -> None:
     rig.controller.connect().unwrap()
+    wait_for_packet_log(rig.controller)
     before = len(rig.controller.packet_records(direction=Direction.TX))
     spectra = rig.controller.take_debug_spectra(3000).unwrap()
     assert len(spectra) == rig.controller.config.profile.channels
+    wait_for_packet_log(rig.controller)
     outgoing = rig.controller.packet_records(direction=Direction.TX)[before:]
     assert [record.id_fc for record in outgoing] == [(0x30, 0x03), (0x30, 0x01)]
     assert rig.controller.session.state is SessionState.IDLE

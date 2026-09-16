@@ -219,6 +219,49 @@ def test_снятие_флажка_убирает_линию(panel: MeasurementP
     assert models.SlotRef(0, 0) not in panel._curves
 
 
+def test_полоса_sigma_имеет_непустой_путь_и_разрывается_на_nan(
+    application: QApplication,
+    panel: MeasurementPanel,
+    controller: AppController,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Регрессия чата №18: проверяется геометрия FillBetweenItem, не visible."""
+    slot = models.SlotRef(0, 0)
+    t_s = np.asarray([-6.0, -5.0, -4.0, -3.0, -2.0, -1.0, 0.0])
+    delta = np.asarray([0.0, 0.01, 0.02, np.nan, 0.03, 0.04, 0.05])
+    sigma = np.asarray([0.002, 0.002, 0.002, np.nan, 0.002, 0.002, 0.002])
+    graph = models.MeasurementGraphModel(
+        t_s=t_s,
+        traces=(
+            models.GraphTrace(
+                slot=slot,
+                delta_nm=delta,
+                baseline_nm=1550.0,
+                latest_nm=1550.05,
+                valid_points=6,
+                sigma_nm=sigma,
+                n=np.asarray([10, 10, 10, 0, 10, 10, 10]),
+            ),
+        ),
+        y_min_nm=-0.01,
+        y_max_nm=0.06,
+        history_span_s=6.0,
+        averaging_window_s=0.05,
+    )
+    monkeypatch.setattr(models, "measurement_graph_model", lambda *args, **kwargs: graph)
+    panel.averaging_enabled.blockSignals(True)
+    panel.averaging_enabled.setChecked(True)
+    panel.averaging_enabled.blockSignals(False)
+
+    panel._update_graph(controller.snapshot(include_sensor_data=False))
+    application.processEvents()
+
+    fill = panel._bands[slot][2]
+    polygons = fill.path().toSubpathPolygons()
+    assert polygons
+    assert len(polygons) > 1
+
+
 def test_глубина_истории_ограничена_кольцом_10_секунд_на_2кгц(
     panel: MeasurementPanel, controller: AppController
 ) -> None:

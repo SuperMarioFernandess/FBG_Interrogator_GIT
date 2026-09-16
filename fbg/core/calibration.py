@@ -173,16 +173,22 @@ class FitKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class CalibrationPoint:
-    """Одна воспроизводимая опорная точка калибровки."""
+    """Одна воспроизводимая опорная точка калибровки (Р83)."""
 
     wavelength_nm: float
     value: float
+    n: int = 1
+    sigma_nm: float | None = None
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.wavelength_nm) or self.wavelength_nm <= 0.0:
             raise ValueError("wavelength_nm опорной точки должна быть положительной")
         if not math.isfinite(self.value):
             raise ValueError("value опорной точки должно быть конечным")
+        if isinstance(self.n, bool) or not isinstance(self.n, int) or self.n < 1:
+            raise ValueError("n опорной точки должен быть целым числом ≥ 1")
+        if self.sigma_nm is not None and (not math.isfinite(self.sigma_nm) or self.sigma_nm < 0.0):
+            raise ValueError("sigma_nm опорной точки должна быть конечной и неотрицательной")
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,9 +200,10 @@ class CalibrationFit:
     value0: float
     k1: float
     k2: float
-    rms: float
-    max_abs_residual: float
+    rms: float | None
+    max_abs_residual: float | None
     points: int
+    weighted: bool = False
 
 
 @dataclass(frozen=True)
@@ -255,6 +262,9 @@ class Sensor:
     calibration_points: tuple[CalibrationPoint, ...] = ()
     """Сохранённые исходные точки, из которых получены коэффициенты."""
 
+    weighted_fit: bool = True
+    """Использовать веса Р84 при следующей подгонке/переподгонке."""
+
     up_limit: float | None = None
     down_limit: float | None = None
 
@@ -285,6 +295,8 @@ class Sensor:
             raise ValueError(
                 f"{self.id}: up_limit={self.up_limit} ниже down_limit={self.down_limit}"
             )
+        if not isinstance(self.weighted_fit, bool):
+            raise ValueError(f"{self.id}: weighted_fit должно быть логическим значением")
         if self.compensation is not None and self.compensation.reference == self.id:
             raise ValueError(f"{self.id}: компенсация не может ссылаться на сам датчик")
 
@@ -377,18 +389,39 @@ def apply_curve(sensor: Sensor, wavelength_nm: float) -> float:
     return sensor.value0 + sensor.k1 * delta_nm + sensor.k2 * delta_nm * delta_nm
 
 
+def calibration_point_uncertainty(point: CalibrationPoint, quantization_nm: float) -> float:
+    """Стандартная неопределённость среднего для одной опорной точки (Р84).
+
+    Сохранённая σ — population σ окна. Для ``n > 1`` сначала получаем
+    несмещённую оценку ``s = σ·sqrt(n/(n-1))``. Пол ``q/sqrt(12)`` не даёт
+    нулевой σ превратиться в бесконечный вес. Для одиночной/legacy-точки
+    разброс неизвестен и остаётся только квантовый пол.
+    """
+    if not math.isfinite(quantization_nm) or quantization_nm <= 0.0:
+        raise ValueError("quantization_nm должна быть положительной")
+    floor = quantization_nm / math.sqrt(12.0)
+    if point.n <= 1 or point.sigma_nm is None:
+        spread = floor
+    else:
+        spread = point.sigma_nm * math.sqrt(point.n / (point.n - 1))
+        spread = max(spread, floor)
+    return spread / math.sqrt(point.n)
+
+
 def fit_calibration(
     points: Sequence[CalibrationPoint],
     reference_nm: float,
     *,
     kind: FitKind = FitKind.LINEAR,
+    quantization_nm: float | Sequence[float] | None = None,
 ) -> CalibrationFit:
-    """Подгоняет сохранённые точки в координате `(λ − reference_nm)`.
+    """Подгоняет сохранённые точки в координате ``(λ − reference_nm)``.
 
-    Прямая — рабочий вариант по умолчанию и требует минимум две точки.
-    Парабола разрешена только от **четырёх** точек: три точки определяют её
-    точно и дают нулевую невязку по построению, что выглядит как проверенная
-    идеальная калибровка, хотя проверено ничего не было (KB_05 №39).
+    ``quantization_nm`` включает взвешивание Р84. ``numpy.polyfit`` получает
+    ``w=1/u``: он умножает весом невязку, поэтому ``1/u²`` здесь было бы
+    двойным взвешиванием. Невязка не выдаётся числом, если число точек равно
+    числу коэффициентов: такая подгонка определена, но ничем не проверена
+    (предлагаемое правило KB_05 №42).
     """
     if not math.isfinite(reference_nm) or reference_nm <= 0.0:
         raise ValueError("reference_nm должна быть положительной")
@@ -406,7 +439,26 @@ def fit_calibration(
         raise ValueError(
             f"для подгонки степени {degree} нужно не менее {required_distinct} различных длин волн"
         )
-    coefficients = np.polyfit(x, values, degree)
+
+    uncertainties: np.ndarray | None = None
+    if quantization_nm is not None:
+        if isinstance(quantization_nm, Sequence):
+            q = np.asarray(tuple(quantization_nm), dtype=np.float64)
+            if q.shape != (len(points),):
+                raise ValueError("quantization_nm должен содержать по одному значению на точку")
+        else:
+            q = np.full(len(points), float(quantization_nm), dtype=np.float64)
+        uncertainties = np.asarray(
+            [
+                calibration_point_uncertainty(point, float(qv))
+                for point, qv in zip(points, q, strict=True)
+            ],
+            dtype=np.float64,
+        )
+        coefficients = np.polyfit(x, values, degree, w=1.0 / uncertainties)
+    else:
+        coefficients = np.polyfit(x, values, degree)
+
     if degree == 2:
         k2, k1, value0 = (float(value) for value in coefficients)
     else:
@@ -414,9 +466,25 @@ def fit_calibration(
         k2 = 0.0
     predicted = value0 + k1 * x + k2 * x * x
     residual = values - predicted
-    rms = float(np.sqrt(np.mean(residual * residual)))
-    max_abs = float(np.max(np.abs(residual)))
-    return CalibrationFit(kind, reference_nm, value0, k1, k2, rms, max_abs, len(points))
+
+    # Прямая по двум точкам имеет нулевую невязку по построению — это не
+    # измерение качества. Для параболы приложение требует 4 точки, поэтому её
+    # минимальный допустимый набор уже содержит одну проверочную степень свободы.
+    if len(points) == degree + 1:
+        rms = None
+        max_abs = None
+    else:
+        if uncertainties is None:
+            rms = float(np.sqrt(np.mean(residual * residual)))
+        else:
+            inverse_variance = 1.0 / (uncertainties * uncertainties)
+            rms = float(
+                np.sqrt(np.sum(inverse_variance * residual * residual) / np.sum(inverse_variance))
+            )
+        max_abs = float(np.max(np.abs(residual)))
+    return CalibrationFit(
+        kind, reference_nm, value0, k1, k2, rms, max_abs, len(points), uncertainties is not None
+    )
 
 
 def _classify_limits(sensor: Sensor, value: float) -> ReadingStatus:
@@ -580,8 +648,14 @@ def sensor_to_json(sensor: Sensor) -> dict[str, object]:
         "value0": sensor.value0,
         "k1": sensor.k1,
         "k2": sensor.k2,
+        "weighted_fit": sensor.weighted_fit,
         "calibration_points": [
-            {"wavelength_nm": point.wavelength_nm, "value": point.value}
+            {
+                "wavelength_nm": point.wavelength_nm,
+                "value": point.value,
+                "n": point.n,
+                **({"sigma_nm": point.sigma_nm} if point.sigma_nm is not None else {}),
+            }
             for point in sensor.calibration_points
         ],
     }
@@ -612,6 +686,16 @@ def _number(source: Mapping[str, object], key: str, default: float) -> float:
     """То же, но с умолчанием: отсутствующее поле не ошибка."""
     value = _optional_number(source, key)
     return default if value is None else value
+
+
+def _boolean(source: Mapping[str, object], key: str, default: bool) -> bool:
+    """Читает bool с умолчанием, не принимая 0/1 за логическое значение."""
+    if key not in source:
+        return default
+    value = source[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"поле {key!r}: ожидалось логическое значение, получено {value!r}")
+    return value
 
 
 def sensor_from_json(source: Mapping[str, object]) -> Sensor:
@@ -679,7 +763,11 @@ def sensor_from_json(source: Mapping[str, object]) -> Sensor:
         value = _optional_number(raw_point, "value")
         if wavelength_nm is None or value is None:
             raise ValueError(f"{raw_id}: calibration_points[{index}] требует wavelength_nm и value")
-        parsed_points.append(CalibrationPoint(wavelength_nm, value))
+        raw_n = raw_point.get("n", 1)
+        if isinstance(raw_n, bool) or not isinstance(raw_n, int):
+            raise ValueError(f"{raw_id}: calibration_points[{index}].n должно быть целым")
+        sigma_nm = _optional_number(raw_point, "sigma_nm")
+        parsed_points.append(CalibrationPoint(wavelength_nm, value, raw_n, sigma_nm))
     calibration_points = tuple(parsed_points)
 
     return Sensor(
@@ -693,6 +781,7 @@ def sensor_from_json(source: Mapping[str, object]) -> Sensor:
         k1=_number(source, "k1", 0.0),
         k2=_number(source, "k2", 0.0),
         calibration_points=calibration_points,
+        weighted_fit=_boolean(source, "weighted_fit", True),
         up_limit=_optional_number(source, "up_limit"),
         down_limit=_optional_number(source, "down_limit"),
         compensation=compensation,

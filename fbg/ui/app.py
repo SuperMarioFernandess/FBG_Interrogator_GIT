@@ -826,6 +826,8 @@ class AppController:
         self,
         sensor_ids: Sequence[str],
         history_s: float,
+        *,
+        extra_channels: Sequence[int] = (),
     ) -> None:
         """Запрашивает raw-историю каналов, нужных отмеченным датчикам.
 
@@ -838,7 +840,12 @@ class AppController:
             raise ValueError(f"history_s={history_s} должен быть положительным")
         by_id = {sensor.id: sensor for sensor in self._sensors}
         requested = tuple(sensor_ids)
-        channels: set[int] = set()
+        channels: set[int] = set(extra_channels)
+        for channel in channels:
+            if not 0 <= channel < self._config.profile.channels:
+                raise ValueError(
+                    f"канал {channel} вне диапазона 0…{self._config.profile.channels - 1}"
+                )
         for sensor_id in requested:
             sensor = by_id.get(sensor_id)
             if sensor is None:

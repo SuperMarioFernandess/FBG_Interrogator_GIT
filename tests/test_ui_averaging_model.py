@@ -392,3 +392,72 @@ def test_incremental_путь_пересчитывает_только_после
 
     assert rows_seen == [3]
     assert rows_seen[0] < full_history.frames
+
+
+def test_калибровочная_точка_берет_последнее_завершенное_окно_absolute_lambda() -> None:
+    history = TraceHistorySnapshot(
+        positions=((0, 0), (0, 1)),
+        seq_start=0,
+        seq_stop=5,
+        t_mono=np.asarray([0.001, 0.020, 0.051, 0.070, 0.090]),
+        wavelength_nm=np.asarray(
+            [
+                [1550.000, np.nan],
+                [1550.004, np.nan],
+                [1550.100, np.nan],
+                [1550.104, np.nan],
+                [1550.108, np.nan],
+            ]
+        ),
+    )
+
+    mean, n, sigma = models.averaged_calibration_wavelength(
+        history,
+        0,
+        1550.0,
+        0.2,
+        0.05,
+    )
+
+    # Окно 0.05…0.10 ещё не завершено: последний кадр 0.09. Берётся 0…0.05.
+    assert mean == pytest.approx(1550.002)
+    assert n == 2
+    assert sigma == pytest.approx(0.002)
+
+
+def test_калибровочная_точка_усредняет_lambda_а_не_физическую_величину() -> None:
+    sensor = Sensor(
+        id="S0",
+        name="S0",
+        channel=0,
+        type=SensorType.TEMPERATURE,
+        expected_nm=1550.0,
+        window_nm=0.2,
+        value0=0.0,
+        k1=0.0,
+        k2=0.0,
+    )
+    history = TraceHistorySnapshot(
+        positions=((0, 0),),
+        seq_start=0,
+        seq_stop=3,
+        t_mono=np.asarray([0.001, 0.020, 0.051]),
+        wavelength_nm=np.asarray([[1550.010], [1550.014], [1550.018]]),
+    )
+    graph = models.sensor_graph_model(
+        _snapshot(sensors=(sensor,), sensor_trace_history=history),
+        ("S0",),
+        averaging_window_s=0.05,
+    )
+    mean, n, sigma = models.averaged_calibration_wavelength(
+        history,
+        0,
+        1550.012,
+        0.2,
+        0.05,
+    )
+
+    assert graph.traces[0].values[0] == 0.0
+    assert mean == pytest.approx(1550.012)
+    assert n == 2
+    assert sigma == pytest.approx(0.002)

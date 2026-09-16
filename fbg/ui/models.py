@@ -815,6 +815,53 @@ def sensor_panel_model(
     return SensorPanelModel(tuple(rows), units, peaks, snapshot.sensor_history)
 
 
+def averaged_calibration_wavelength(
+    history: TraceHistorySnapshot,
+    channel: int,
+    target_nm: float,
+    window_nm: float,
+    window_s: float,
+    *,
+    gaps: Sequence[tuple[float, float]] = (),
+) -> tuple[float, int, float]:
+    """Последнее завершённое окно **абсолютной λ** для калибровочной точки.
+
+    В каждом raw-кадре сначала находится ровно один пик выбранного канала
+    около ``target_nm``; затем те же фиксированные окна Р81 считают mean/n/σ.
+    Физическая величина датчика и Δλ графика здесь намеренно не участвуют.
+    """
+    if window_s <= 0.0:
+        raise ValueError("window_s должен быть положительным")
+    columns = [
+        column
+        for column, (candidate_channel, _position) in enumerate(history.positions)
+        if candidate_channel == channel
+    ]
+    if not columns or history.frames == 0:
+        raise ValueError("нет raw-истории выбранного канала")
+    wavelengths = history.wavelength_nm[:, np.asarray(columns, dtype=np.intp)]
+    inside = np.isfinite(wavelengths) & (np.abs(wavelengths - target_nm) <= window_nm)
+    counts = np.count_nonzero(inside, axis=1)
+    positions = np.argmax(inside, axis=1)
+    found = wavelengths[np.arange(history.frames), positions].astype(np.float64, copy=True)
+    found[counts != 1] = np.nan
+    averaged = fixed_window_average(
+        history.t_mono,
+        found[:, np.newaxis],
+        window_s,
+        gaps=_relevant_stream_gaps(gaps, history.t_mono, window_s),
+    )
+    valid = np.flatnonzero(averaged.complete & (averaged.n[:, 0] > 0))
+    if valid.size == 0:
+        raise ValueError("ещё нет завершённого окна усреднения для выбранного пика")
+    index = int(valid[-1])
+    return (
+        float(averaged.mean[index, 0]),
+        int(averaged.n[index, 0]),
+        float(averaged.sigma[index, 0]),
+    )
+
+
 @dataclass(frozen=True)
 class SensorGraphTrace:
     """Одна физическая величина на графике датчиков."""

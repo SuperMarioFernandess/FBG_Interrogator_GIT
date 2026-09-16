@@ -17,7 +17,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QFileDialog
 
-from fbg.core.calibration import ReadingStatus, Sensor, SensorReading, SensorType
+from fbg.core.calibration import (
+    CalibrationPoint,
+    ReadingStatus,
+    Sensor,
+    SensorReading,
+    SensorType,
+)
+from fbg.core.pipeline import TraceHistorySnapshot
 from fbg.core.profile import DeviceProfile
 from fbg.core.session import SessionState
 from fbg.io.config import AppConfig
@@ -421,6 +428,178 @@ def test_усреднение_датчиков_имеет_те_же_контро
         assert panel.averaging_window.isEnabled()
         assert panel.averaging_sigma.isEnabled()
         assert "100" in panel.averaging_frames.text()
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
+def test_полоса_sigma_датчиков_имеет_путь_и_разрывается_на_nan(
+    application: QApplication,
+    controller: AppController,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller.replace_sensors((sensor("T1", expected_nm=1550.0),))
+    panel = SensorsPanel(controller)
+    try:
+        item = panel._items["T1"]
+        panel.sensor_tree.blockSignals(True)
+        item.setCheckState(0, Qt.CheckState.Checked)
+        panel.sensor_tree.blockSignals(False)
+        panel.averaging_enabled.blockSignals(True)
+        panel.averaging_enabled.setChecked(True)
+        panel.averaging_enabled.blockSignals(False)
+        t_s = np.asarray([-6.0, -5.0, -4.0, -3.0, -2.0, -1.0, 0.0])
+        values = np.asarray([1.0, 1.1, 1.2, np.nan, 1.3, 1.4, 1.5])
+        sigma = np.asarray([0.02, 0.02, 0.02, np.nan, 0.02, 0.02, 0.02])
+        graph = models.SensorGraphModel(
+            t_s=t_s,
+            traces=(
+                models.SensorGraphTrace(
+                    "T1",
+                    values,
+                    sigma=sigma,
+                    n=np.asarray([10, 10, 10, 0, 10, 10, 10]),
+                ),
+            ),
+            averaging_window_s=0.05,
+        )
+        monkeypatch.setattr(models, "sensor_graph_model", lambda *args, **kwargs: graph)
+
+        panel._update_graph()
+        application.processEvents()
+
+        fill = panel._bands["T1"][2]
+        polygons = fill.path().toSubpathPolygons()
+        assert polygons
+        assert len(polygons) > 1
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
+def test_калибровочная_точка_без_усреднения_имеет_n1_и_неизвестную_sigma(
+    application: QApplication, controller: AppController
+) -> None:
+    panel = SensorsPanel(controller)
+    try:
+        wavelengths = np.full((PROFILE.channels, PROFILE.fbg_per_channel), np.nan)
+        wavelengths[0, 4] = 1544.812345
+        panel.refresh(snapshot(controller, ui=SimpleNamespace(wavelength_nm=wavelengths)))
+        panel.known_value_spin.setValue(25.0)
+
+        panel._add_point()
+
+        point = panel._points()[0]
+        assert point.wavelength_nm == pytest.approx(1544.812345)
+        assert point.n == 1
+        assert point.sigma_nm is None
+        assert panel.points_table.item(0, 2).text() == "1"
+        assert panel.points_table.item(0, 3).text() == texts.UNKNOWN
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
+def test_калибровочная_точка_с_усреднением_берет_последнее_завершенное_окно(
+    application: QApplication, controller: AppController
+) -> None:
+    panel = SensorsPanel(controller)
+    try:
+        wavelengths = np.full((PROFILE.channels, PROFILE.fbg_per_channel), np.nan)
+        wavelengths[0, 0] = 1550.108
+        history = TraceHistorySnapshot(
+            positions=((0, 0),),
+            seq_start=0,
+            seq_stop=5,
+            t_mono=np.asarray([0.001, 0.020, 0.051, 0.070, 0.090]),
+            wavelength_nm=np.asarray([[1550.000], [1550.004], [1550.100], [1550.104], [1550.108]]),
+        )
+        panel.averaging_enabled.blockSignals(True)
+        panel.averaging_enabled.setChecked(True)
+        panel.averaging_enabled.blockSignals(False)
+        panel.averaging_window.setValue(50.0)
+        panel.window_spin.setValue(0.2)
+        panel.refresh(
+            snapshot(
+                controller,
+                ui=SimpleNamespace(wavelength_nm=wavelengths),
+                sensor_trace_history=history,
+            )
+        )
+
+        panel._add_point()
+
+        point = panel._points()[0]
+        assert point.wavelength_nm == pytest.approx(1550.002)
+        assert point.n == 2
+        assert point.sigma_nm == pytest.approx(0.002)
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
+def test_взвешивание_доступно_при_выключенном_усреднении_и_включено_по_умолчанию(
+    application: QApplication, controller: AppController
+) -> None:
+    panel = SensorsPanel(controller)
+    try:
+        assert not panel.averaging_enabled.isChecked()
+        assert panel.weighted_fit.isChecked()
+        assert panel.weighted_fit.isEnabled()
+        panel.averaging_enabled.setChecked(True)
+        assert panel.weighted_fit.isEnabled()
+        panel.averaging_enabled.setChecked(False)
+        assert panel.weighted_fit.isEnabled()
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
+def test_смена_expected_nm_переподгоняет_сохраненные_точки(
+    application: QApplication, controller: AppController
+) -> None:
+    panel = SensorsPanel(controller)
+    try:
+        panel.expected_spin.setValue(1550.0)
+        panel._set_points(
+            (
+                CalibrationPoint(1550.0, 0.0),
+                CalibrationPoint(1551.0, 2.0),
+            )
+        )
+        panel._fit_points()
+        assert panel.k1_spin.value() == pytest.approx(2.0)
+        assert panel.value0_spin.value() == pytest.approx(0.0)
+        assert panel.fit_residual.text().startswith("—")
+
+        panel.current_peak_combo.clear()
+        panel.current_peak_combo.addItem("1550.2500 нм", "1550.25")
+        panel._take_current_wavelength()
+
+        assert panel.expected_spin.value() == pytest.approx(1550.25)
+        assert panel.k1_spin.value() == pytest.approx(2.0)
+        assert panel.value0_spin.value() == pytest.approx(0.5)
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
+def test_смена_expected_nm_без_точек_сбрасывает_старые_коэффициенты(
+    application: QApplication, controller: AppController
+) -> None:
+    panel = SensorsPanel(controller)
+    try:
+        panel.k1_spin.setValue(100.0)
+        panel.k2_spin.setValue(5.0)
+        panel.value0_spin.setValue(25.0)
+        panel.current_peak_combo.clear()
+        panel.current_peak_combo.addItem("1550.2500 нм", "1550.25")
+
+        panel._take_current_wavelength()
+
+        assert panel.value0_spin.value() == 0.0
+        assert panel.k1_spin.value() == 0.0
+        assert panel.k2_spin.value() == 0.0
     finally:
         panel.close()
         panel.deleteLater()

@@ -490,8 +490,9 @@ class MeasurementPanel(DockTab):
                     pen=pen, name=texts.slot_label(trace.slot.channel, trace.slot.position)
                 )
                 self._curves[trace.slot] = curve
-                upper = pg.PlotDataItem(pen=None)
-                lower = pg.PlotDataItem(pen=None)
+                transparent_pen = pg.mkPen(0, 0, 0, 0)
+                upper = pg.PlotDataItem(pen=transparent_pen)
+                lower = pg.PlotDataItem(pen=transparent_pen)
                 red, green, blue, _alpha = color.getRgb()
                 fill = pg.FillBetweenItem(
                     upper,

@@ -36,10 +36,12 @@ from PySide6.QtWidgets import (
 )
 
 from fbg.core.calibration import (
+    CalibrationFit,
     CalibrationPoint,
     FitKind,
     Sensor,
     SensorType,
+    calibration_point_uncertainty,
     fit_calibration,
 )
 from fbg.io.recalibrate import RecalibrationResult, recalibrate_recording
@@ -124,10 +126,14 @@ class SensorsPanel(DockTab):
         self.current_peak_combo = QComboBox()
         self.take_wavelength_button = QPushButton(texts.BUTTON_SENSOR_TAKE_WAVELENGTH)
 
-        self.points_table = QTableWidget(0, 2)
-        self.points_table.setHorizontalHeaderLabels(["λ, нм", "Известное значение"])
+        self.points_table = QTableWidget(0, 5)
+        self.points_table.setHorizontalHeaderLabels(
+            ["λ, нм", "Известное значение", "n", "σ, нм", "u, нм"]
+        )
         self.known_value_spin = self._value_spin()
         self.add_point_button = QPushButton(texts.BUTTON_SENSOR_ADD_POINT)
+        self.weighted_fit = QCheckBox(texts.LABEL_SENSOR_WEIGHTED_FIT)
+        self.weighted_fit.setChecked(True)
         self.remove_point_button = QPushButton(texts.BUTTON_SENSOR_REMOVE_POINT)
         self.fit_kind = QComboBox()
         self.fit_kind.addItem(texts.SENSOR_FIT_LINEAR, FitKind.LINEAR.value)
@@ -256,6 +262,7 @@ class SensorsPanel(DockTab):
         point_controls.addWidget(QLabel(texts.LABEL_SENSOR_KNOWN_VALUE))
         point_controls.addWidget(self.known_value_spin)
         point_controls.addWidget(self.add_point_button)
+        point_controls.addWidget(self.weighted_fit)
         point_controls.addWidget(self.remove_point_button)
         fit_controls = QFormLayout()
         fit_controls.addRow(texts.LABEL_SENSOR_FIT_KIND, self.fit_kind)
@@ -364,7 +371,9 @@ class SensorsPanel(DockTab):
         self.save_button.clicked.connect(self._save_sensor)
         self.delete_button.clicked.connect(self._delete_sensor)
         self.take_wavelength_button.clicked.connect(self._take_current_wavelength)
-        self.channel_combo.currentIndexChanged.connect(lambda _index: self._update_peak_combo())
+        self.channel_combo.currentIndexChanged.connect(
+            lambda _index: self._on_editor_channel_changed()
+        )
         self.add_point_button.clicked.connect(self._add_point)
         self.remove_point_button.clicked.connect(self._remove_point)
         self.fit_button.clicked.connect(self._fit_points)
@@ -372,6 +381,11 @@ class SensorsPanel(DockTab):
             lambda _index: self._update_peak_map(force=True)
         )
         self.recalibrate_button.clicked.connect(self._start_recalibration)
+
+    def _on_editor_channel_changed(self) -> None:
+        self._update_peak_combo()
+        if self.averaging_enabled.isChecked():
+            self._sync_sensor_trace_request()
 
     def _refresh_from_controller(self) -> None:
         self.refresh(
@@ -381,9 +395,15 @@ class SensorsPanel(DockTab):
     def _sync_sensor_trace_request(self) -> None:
         selected = self._checked_sensor_ids() if self.averaging_enabled.isChecked() else ()
         window_s = self.averaging_window.value() / 1000.0
+        extra_channels = (
+            (int(str(self.channel_combo.currentData())),)
+            if self.averaging_enabled.isChecked()
+            else ()
+        )
         self._controller.set_sensor_trace_request(
             selected,
             window_s + SENSOR_RAW_UI_MARGIN_S,
+            extra_channels=extra_channels,
         )
 
     def _on_graph_selection_changed(self) -> None:
@@ -545,6 +565,8 @@ class SensorsPanel(DockTab):
         self.up_limit_enabled.setChecked(sensor.up_limit is not None)
         self.up_limit_spin.setValue(0.0 if sensor.up_limit is None else sensor.up_limit)
         self._set_points(sensor.calibration_points)
+        self.weighted_fit.setChecked(sensor.weighted_fit)
+        self.fit_kind.setCurrentIndex(1 if sensor.k2 != 0.0 else 0)
         self.fit_residual.setText(texts.UNKNOWN)
         self._update_peak_combo()
 
@@ -564,6 +586,7 @@ class SensorsPanel(DockTab):
         self.up_limit_enabled.setChecked(False)
         self._set_points(())
         self.fit_kind.setCurrentIndex(0)
+        self.weighted_fit.setChecked(True)
         self.fit_residual.setText(texts.UNKNOWN)
         self._update_peak_combo()
 
@@ -583,6 +606,7 @@ class SensorsPanel(DockTab):
             k1=self.k1_spin.value(),
             k2=self.k2_spin.value(),
             calibration_points=self._points(),
+            weighted_fit=self.weighted_fit.isChecked(),
             down_limit=(
                 self.down_limit_spin.value() if self.down_limit_enabled.isChecked() else None
             ),
@@ -640,35 +664,127 @@ class SensorsPanel(DockTab):
             raise ValueError("в текущем кадре выбранного канала нет пиков")
         return float(str(data))
 
+    def _quantization_nm(self, wavelength_nm: float) -> float:
+        return self._controller.config.profile.wavelength_quantization_nm(wavelength_nm)
+
+    def _fit_quantization(self, points: tuple[CalibrationPoint, ...]) -> tuple[float, ...] | None:
+        if not self.weighted_fit.isChecked():
+            return None
+        return tuple(self._quantization_nm(point.wavelength_nm) for point in points)
+
+    def _show_fit(self, fit: CalibrationFit) -> None:
+        # Формат строки — UI; арифметика подгонки остаётся в core.
+        self.value0_spin.setValue(fit.value0)
+        self.k1_spin.setValue(fit.k1)
+        self.k2_spin.setValue(fit.k2)
+        if fit.rms is None:
+            self.fit_residual.setText(
+                f"—; точек {fit.points}: коэффициенты определены, проверить невязку нечем"
+            )
+        else:
+            mode = "взвеш.; " if fit.weighted else ""
+            self.fit_residual.setText(
+                f"{mode}RMS {fit.rms:.6g}; max |r| {fit.max_abs_residual:.6g}; точек {fit.points}"
+            )
+
+    def _refit_for_reference(self, reference_nm: float) -> None:
+        points = self._points()
+        self.expected_spin.setValue(reference_nm)
+        if not points:
+            self.value0_spin.setValue(0.0)
+            self.k1_spin.setValue(0.0)
+            self.k2_spin.setValue(0.0)
+            self.fit_residual.setText(texts.UNKNOWN)
+            return
+        try:
+            kind = FitKind(str(self.fit_kind.currentData()))
+            fit = fit_calibration(
+                points,
+                reference_nm,
+                kind=kind,
+                quantization_nm=self._fit_quantization(points),
+            )
+        except (ValueError, FloatingPointError) as exc:
+            # Старые коэффициенты относительно старой λ0 оставлять нельзя: это
+            # молчаливая смена смысла модели. Если переподогнать нельзя — сброс.
+            self.value0_spin.setValue(0.0)
+            self.k1_spin.setValue(0.0)
+            self.k2_spin.setValue(0.0)
+            self.fit_residual.setText(f"коэффициенты сброшены: {exc}")
+            return
+        self._show_fit(fit)
+
     def _take_current_wavelength(self) -> None:
         try:
-            self.expected_spin.setValue(self._selected_peak())
+            self._refit_for_reference(self._selected_peak())
         except ValueError as exc:
             self._controller.note(str(exc))
 
     def _set_points(self, points: tuple[CalibrationPoint, ...]) -> None:
         self.points_table.setRowCount(len(points))
         for row, point in enumerate(points):
-            for column, value in enumerate((point.wavelength_nm, point.value)):
+            sigma_text = texts.UNKNOWN if point.sigma_nm is None else f"{point.sigma_nm:.9g}"
+            u = calibration_point_uncertainty(point, self._quantization_nm(point.wavelength_nm))
+            values = (
+                f"{point.wavelength_nm:.9g}",
+                f"{point.value:.9g}",
+                str(point.n),
+                sigma_text,
+                f"{u:.9g}",
+            )
+            for column, value in enumerate(values):
                 item = self.points_table.item(row, column)
                 if item is None:
                     item = QTableWidgetItem()
                     self.points_table.setItem(row, column, item)
-                item.setText(f"{value:.9g}")
+                item.setText(value)
+                if column >= 2:
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
     def _points(self) -> tuple[CalibrationPoint, ...]:
         points: list[CalibrationPoint] = []
         for row in range(self.points_table.rowCount()):
             wavelength_item = self.points_table.item(row, 0)
             value_item = self.points_table.item(row, 1)
+            n_item = self.points_table.item(row, 2)
+            sigma_item = self.points_table.item(row, 3)
             if wavelength_item is None or value_item is None:
                 continue
-            points.append(CalibrationPoint(float(wavelength_item.text()), float(value_item.text())))
+            n = 1 if n_item is None else int(n_item.text())
+            sigma_nm = None
+            if sigma_item is not None and sigma_item.text() != texts.UNKNOWN:
+                sigma_nm = float(sigma_item.text())
+            points.append(
+                CalibrationPoint(
+                    float(wavelength_item.text()),
+                    float(value_item.text()),
+                    n,
+                    sigma_nm,
+                )
+            )
         return tuple(points)
+
+    def _calibration_wavelength(self) -> tuple[float, int, float | None]:
+        selected = self._selected_peak()
+        if not self.averaging_enabled.isChecked():
+            return selected, 1, None
+        snapshot = self._last_snapshot
+        if snapshot is None or snapshot.sensor_trace_history is None:
+            raise ValueError("нет raw-истории для усреднённой калибровочной точки")
+        mean, n, sigma = models.averaged_calibration_wavelength(
+            snapshot.sensor_trace_history,
+            int(str(self.channel_combo.currentData())),
+            selected,
+            self.window_spin.value(),
+            self.averaging_window.value() / 1000.0,
+            gaps=snapshot.stream_gaps,
+        )
+        return mean, n, sigma
 
     def _add_point(self) -> None:
         try:
-            point = CalibrationPoint(self._selected_peak(), self.known_value_spin.value())
+            wavelength_nm, n, sigma_nm = self._calibration_wavelength()
+            point = CalibrationPoint(wavelength_nm, self.known_value_spin.value(), n, sigma_nm)
             self._set_points((*self._points(), point))
         except ValueError as exc:
             self._controller.note(f"опорная точка не добавлена: {exc}")
@@ -681,16 +797,18 @@ class SensorsPanel(DockTab):
     def _fit_points(self) -> None:
         try:
             kind = FitKind(str(self.fit_kind.currentData()))
-            fit = fit_calibration(self._points(), self.expected_spin.value(), kind=kind)
+            points = self._points()
+            self._set_points(points)
+            fit = fit_calibration(
+                points,
+                self.expected_spin.value(),
+                kind=kind,
+                quantization_nm=self._fit_quantization(points),
+            )
         except (ValueError, FloatingPointError) as exc:
             self.fit_residual.setText(str(exc))
             return
-        self.value0_spin.setValue(fit.value0)
-        self.k1_spin.setValue(fit.k1)
-        self.k2_spin.setValue(fit.k2)
-        self.fit_residual.setText(
-            f"RMS {fit.rms:.6g}; max |r| {fit.max_abs_residual:.6g}; точек {fit.points}"
-        )
+        self._show_fit(fit)
 
     def _checked_sensor_ids(self) -> tuple[str, ...]:
         return tuple(
@@ -736,8 +854,9 @@ class SensorsPanel(DockTab):
                 color = pg.intColor(index, hues=max(1, len(selected)))
                 curve = self.value_plot.plot(pen=pg.mkPen(color), name=sensor_id)
                 self._curves[sensor_id] = curve
-                upper = pg.PlotDataItem(pen=None)
-                lower = pg.PlotDataItem(pen=None)
+                transparent_pen = pg.mkPen(0, 0, 0, 0)
+                upper = pg.PlotDataItem(pen=transparent_pen)
+                lower = pg.PlotDataItem(pen=transparent_pen)
                 red, green, blue, _alpha = color.getRgb()
                 fill = pg.FillBetweenItem(
                     upper,
