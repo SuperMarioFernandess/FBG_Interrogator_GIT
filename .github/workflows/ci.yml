@@ -105,3 +105,35 @@ jobs:
 
       - name: Симулятор 2000 кадров/с на loopback
         run: pytest tests -m slow -q -s
+
+  package:
+    name: Сформировать mbox chat18
+    runs-on: ubuntu-latest
+    needs: [core, ui, load]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Применить проверенный патч chat18
+        shell: bash
+        run: |
+          cat chat18_ci_part_* | git apply -
+          git apply chat18_ci_fix.patch
+          git apply chat18_ci_format.patch
+
+      - name: Сформировать git format-patch
+        shell: bash
+        run: |
+          git config user.name "ChatGPT"
+          git config user.email "chatgpt@users.noreply.github.com"
+          git add fbg tests main.py pyproject.toml README.md
+          git commit -m "Chat 18: calibration points and test debts"
+          git format-patch --stdout HEAD^ > chat18_calibration_points.mbox
+          git status --short
+
+      - name: Загрузить mbox
+        uses: actions/upload-artifact@v4
+        with:
+          name: chat18_calibration_points
+          path: chat18_calibration_points.mbox
+          if-no-files-found: error
+          retention-days: 7
