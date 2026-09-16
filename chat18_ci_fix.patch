@@ -1,0 +1,15 @@
+diff --git a/fbg/ui/panels/sensors.py b/fbg/ui/panels/sensors.py
+index 25bef8a..94e7c5e 100644
+--- a/fbg/ui/panels/sensors.py
++++ b/fbg/ui/panels/sensors.py
+@@ -39,9 +39,9 @@ from fbg.core.calibration import (
+     CalibrationFit,
+     CalibrationPoint,
+     FitKind,
+-    calibration_point_uncertainty,
+     Sensor,
+     SensorType,
++    calibration_point_uncertainty,
+     fit_calibration,
+ )
+ from fbg.io.recalibrate import RecalibrationResult, recalibrate_recording
