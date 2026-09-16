@@ -1,0 +1,288 @@
++        frequency_ghz = C_NM_GHZ / wavelength_nm
++        adjacent_nm = C_NM_GHZ / (frequency_ghz + self.peak_quantization_ghz)
++        return wavelength_nm - adjacent_nm
++
+     @property
+     def start_ghz(self) -> int:
+         """Верхняя частота развёртки, ГГц.
+diff --git a/fbg/ui/app.py b/fbg/ui/app.py
+index e5300b4..0b2064f 100644
+--- a/fbg/ui/app.py
++++ b/fbg/ui/app.py
+@@ -826,6 +826,8 @@ class AppController:
+         self,
+         sensor_ids: Sequence[str],
+         history_s: float,
++        *,
++        extra_channels: Sequence[int] = (),
+     ) -> None:
+         """Запрашивает raw-историю каналов, нужных отмеченным датчикам.
+ 
+@@ -838,7 +840,12 @@ class AppController:
+             raise ValueError(f"history_s={history_s} должен быть положительным")
+         by_id = {sensor.id: sensor for sensor in self._sensors}
+         requested = tuple(sensor_ids)
+-        channels: set[int] = set()
++        channels: set[int] = set(extra_channels)
++        for channel in channels:
++            if not 0 <= channel < self._config.profile.channels:
++                raise ValueError(
++                    f"канал {channel} вне диапазона 0…{self._config.profile.channels - 1}"
++                )
+         for sensor_id in requested:
+             sensor = by_id.get(sensor_id)
+             if sensor is None:
+diff --git a/fbg/ui/models.py b/fbg/ui/models.py
+index 85313d7..2117545 100644
+--- a/fbg/ui/models.py
++++ b/fbg/ui/models.py
+@@ -815,6 +815,53 @@ def sensor_panel_model(
+     return SensorPanelModel(tuple(rows), units, peaks, snapshot.sensor_history)
+ 
+ 
++def averaged_calibration_wavelength(
++    history: TraceHistorySnapshot,
++    channel: int,
++    target_nm: float,
++    window_nm: float,
++    window_s: float,
++    *,
++    gaps: Sequence[tuple[float, float]] = (),
++) -> tuple[float, int, float]:
++    """Последнее завершённое окно **абсолютной λ** для калибровочной точки.
++
++    В каждом raw-кадре сначала находится ровно один пик выбранного канала
++    около ``target_nm``; затем те же фиксированные окна Р81 считают mean/n/σ.
++    Физическая величина датчика и Δλ графика здесь намеренно не участвуют.
++    """
++    if window_s <= 0.0:
++        raise ValueError("window_s должен быть положительным")
++    columns = [
++        column
++        for column, (candidate_channel, _position) in enumerate(history.positions)
++        if candidate_channel == channel
++    ]
++    if not columns or history.frames == 0:
++        raise ValueError("нет raw-истории выбранного канала")
++    wavelengths = history.wavelength_nm[:, np.asarray(columns, dtype=np.intp)]
++    inside = np.isfinite(wavelengths) & (np.abs(wavelengths - target_nm) <= window_nm)
++    counts = np.count_nonzero(inside, axis=1)
++    positions = np.argmax(inside, axis=1)
++    found = wavelengths[np.arange(history.frames), positions].astype(np.float64, copy=True)
++    found[counts != 1] = np.nan
++    averaged = fixed_window_average(
++        history.t_mono,
++        found[:, np.newaxis],
++        window_s,
++        gaps=_relevant_stream_gaps(gaps, history.t_mono, window_s),
++    )
++    valid = np.flatnonzero(averaged.complete & (averaged.n[:, 0] > 0))
++    if valid.size == 0:
++        raise ValueError("ещё нет завершённого окна усреднения для выбранного пика")
++    index = int(valid[-1])
++    return (
++        float(averaged.mean[index, 0]),
++        int(averaged.n[index, 0]),
++        float(averaged.sigma[index, 0]),
++    )
++
++
+ @dataclass(frozen=True)
+ class SensorGraphTrace:
+     """Одна физическая величина на графике датчиков."""
+diff --git a/fbg/ui/panels/measurement.py b/fbg/ui/panels/measurement.py
+index a2630a8..bef8f01 100644
+--- a/fbg/ui/panels/measurement.py
++++ b/fbg/ui/panels/measurement.py
+@@ -490,8 +490,9 @@ class MeasurementPanel(DockTab):
+                     pen=pen, name=texts.slot_label(trace.slot.channel, trace.slot.position)
+                 )
+                 self._curves[trace.slot] = curve
+-                upper = pg.PlotDataItem(pen=None)
+-                lower = pg.PlotDataItem(pen=None)
++                transparent_pen = pg.mkPen(0, 0, 0, 0)
++                upper = pg.PlotDataItem(pen=transparent_pen)
++                lower = pg.PlotDataItem(pen=transparent_pen)
+                 red, green, blue, _alpha = color.getRgb()
+                 fill = pg.FillBetweenItem(
+                     upper,
+diff --git a/fbg/ui/panels/sensors.py b/fbg/ui/panels/sensors.py
+index c9d9c49..25bef8a 100644
+--- a/fbg/ui/panels/sensors.py
++++ b/fbg/ui/panels/sensors.py
+@@ -36,8 +36,10 @@ from PySide6.QtWidgets import (
+ )
+ 
+ from fbg.core.calibration import (
++    CalibrationFit,
+     CalibrationPoint,
+     FitKind,
++    calibration_point_uncertainty,
+     Sensor,
+     SensorType,
+     fit_calibration,
+@@ -124,10 +126,14 @@ class SensorsPanel(DockTab):
+         self.current_peak_combo = QComboBox()
+         self.take_wavelength_button = QPushButton(texts.BUTTON_SENSOR_TAKE_WAVELENGTH)
+ 
+-        self.points_table = QTableWidget(0, 2)
+-        self.points_table.setHorizontalHeaderLabels(["λ, нм", "Известное значение"])
++        self.points_table = QTableWidget(0, 5)
++        self.points_table.setHorizontalHeaderLabels(
++            ["λ, нм", "Известное значение", "n", "σ, нм", "u, нм"]
++        )
+         self.known_value_spin = self._value_spin()
+         self.add_point_button = QPushButton(texts.BUTTON_SENSOR_ADD_POINT)
++        self.weighted_fit = QCheckBox(texts.LABEL_SENSOR_WEIGHTED_FIT)
++        self.weighted_fit.setChecked(True)
+         self.remove_point_button = QPushButton(texts.BUTTON_SENSOR_REMOVE_POINT)
+         self.fit_kind = QComboBox()
+         self.fit_kind.addItem(texts.SENSOR_FIT_LINEAR, FitKind.LINEAR.value)
+@@ -256,6 +262,7 @@ class SensorsPanel(DockTab):
+         point_controls.addWidget(QLabel(texts.LABEL_SENSOR_KNOWN_VALUE))
+         point_controls.addWidget(self.known_value_spin)
+         point_controls.addWidget(self.add_point_button)
++        point_controls.addWidget(self.weighted_fit)
+         point_controls.addWidget(self.remove_point_button)
+         fit_controls = QFormLayout()
+         fit_controls.addRow(texts.LABEL_SENSOR_FIT_KIND, self.fit_kind)
+@@ -364,7 +371,9 @@ class SensorsPanel(DockTab):
+         self.save_button.clicked.connect(self._save_sensor)
+         self.delete_button.clicked.connect(self._delete_sensor)
+         self.take_wavelength_button.clicked.connect(self._take_current_wavelength)
+-        self.channel_combo.currentIndexChanged.connect(lambda _index: self._update_peak_combo())
++        self.channel_combo.currentIndexChanged.connect(
++            lambda _index: self._on_editor_channel_changed()
++        )
+         self.add_point_button.clicked.connect(self._add_point)
+         self.remove_point_button.clicked.connect(self._remove_point)
+         self.fit_button.clicked.connect(self._fit_points)
+@@ -373,6 +382,11 @@ class SensorsPanel(DockTab):
+         )
+         self.recalibrate_button.clicked.connect(self._start_recalibration)
+ 
++    def _on_editor_channel_changed(self) -> None:
++        self._update_peak_combo()
++        if self.averaging_enabled.isChecked():
++            self._sync_sensor_trace_request()
++
+     def _refresh_from_controller(self) -> None:
+         self.refresh(
+             self._controller.snapshot(include_trace_history=False, include_sensor_data=True)
+@@ -381,9 +395,15 @@ class SensorsPanel(DockTab):
+     def _sync_sensor_trace_request(self) -> None:
+         selected = self._checked_sensor_ids() if self.averaging_enabled.isChecked() else ()
+         window_s = self.averaging_window.value() / 1000.0
++        extra_channels = (
++            (int(str(self.channel_combo.currentData())),)
++            if self.averaging_enabled.isChecked()
++            else ()
++        )
+         self._controller.set_sensor_trace_request(
+             selected,
+             window_s + SENSOR_RAW_UI_MARGIN_S,
++            extra_channels=extra_channels,
+         )
+ 
+     def _on_graph_selection_changed(self) -> None:
+@@ -545,6 +565,8 @@ class SensorsPanel(DockTab):
+         self.up_limit_enabled.setChecked(sensor.up_limit is not None)
+         self.up_limit_spin.setValue(0.0 if sensor.up_limit is None else sensor.up_limit)
+         self._set_points(sensor.calibration_points)
++        self.weighted_fit.setChecked(sensor.weighted_fit)
++        self.fit_kind.setCurrentIndex(1 if sensor.k2 != 0.0 else 0)
+         self.fit_residual.setText(texts.UNKNOWN)
+         self._update_peak_combo()
+ 
+@@ -564,6 +586,7 @@ class SensorsPanel(DockTab):
+         self.up_limit_enabled.setChecked(False)
+         self._set_points(())
+         self.fit_kind.setCurrentIndex(0)
++        self.weighted_fit.setChecked(True)
+         self.fit_residual.setText(texts.UNKNOWN)
+         self._update_peak_combo()
+ 
+@@ -583,6 +606,7 @@ class SensorsPanel(DockTab):
+             k1=self.k1_spin.value(),
+             k2=self.k2_spin.value(),
+             calibration_points=self._points(),
++            weighted_fit=self.weighted_fit.isChecked(),
+             down_limit=(
+                 self.down_limit_spin.value() if self.down_limit_enabled.isChecked() else None
+             ),
+@@ -640,35 +664,127 @@ class SensorsPanel(DockTab):
+             raise ValueError("в текущем кадре выбранного канала нет пиков")
+         return float(str(data))
+ 
++    def _quantization_nm(self, wavelength_nm: float) -> float:
++        return self._controller.config.profile.wavelength_quantization_nm(wavelength_nm)
++
++    def _fit_quantization(self, points: tuple[CalibrationPoint, ...]) -> tuple[float, ...] | None:
++        if not self.weighted_fit.isChecked():
++            return None
++        return tuple(self._quantization_nm(point.wavelength_nm) for point in points)
++
++    def _show_fit(self, fit: CalibrationFit) -> None:
++        # Формат строки — UI; арифметика подгонки остаётся в core.
++        self.value0_spin.setValue(fit.value0)
++        self.k1_spin.setValue(fit.k1)
++        self.k2_spin.setValue(fit.k2)
++        if fit.rms is None:
++            self.fit_residual.setText(
++                f"—; точек {fit.points}: коэффициенты определены, проверить невязку нечем"
++            )
++        else:
++            mode = "взвеш.; " if fit.weighted else ""
++            self.fit_residual.setText(
++                f"{mode}RMS {fit.rms:.6g}; max |r| {fit.max_abs_residual:.6g}; точек {fit.points}"
++            )
++
++    def _refit_for_reference(self, reference_nm: float) -> None:
++        points = self._points()
++        self.expected_spin.setValue(reference_nm)
++        if not points:
++            self.value0_spin.setValue(0.0)
++            self.k1_spin.setValue(0.0)
++            self.k2_spin.setValue(0.0)
++            self.fit_residual.setText(texts.UNKNOWN)
++            return
++        try:
++            kind = FitKind(str(self.fit_kind.currentData()))
++            fit = fit_calibration(
++                points,
++                reference_nm,
++                kind=kind,
++                quantization_nm=self._fit_quantization(points),
++            )
++        except (ValueError, FloatingPointError) as exc:
++            # Старые коэффициенты относительно старой λ0 оставлять нельзя: это
++            # молчаливая смена смысла модели. Если переподогнать нельзя — сброс.
++            self.value0_spin.setValue(0.0)
++            self.k1_spin.setValue(0.0)
++            self.k2_spin.setValue(0.0)
++            self.fit_residual.setText(f"коэффициенты сброшены: {exc}")
++            return
++        self._show_fit(fit)
++
+     def _take_current_wavelength(self) -> None:
+         try:
+-            self.expected_spin.setValue(self._selected_peak())
++            self._refit_for_reference(self._selected_peak())
+         except ValueError as exc:
+             self._controller.note(str(exc))
+ 
+     def _set_points(self, points: tuple[CalibrationPoint, ...]) -> None:
+         self.points_table.setRowCount(len(points))
+         for row, point in enumerate(points):
+-            for column, value in enumerate((point.wavelength_nm, point.value)):
++            sigma_text = texts.UNKNOWN if point.sigma_nm is None else f"{point.sigma_nm:.9g}"
++            u = calibration_point_uncertainty(point, self._quantization_nm(point.wavelength_nm))
++            values = (
++                f"{point.wavelength_nm:.9g}",
++                f"{point.value:.9g}",
++                str(point.n),
++                sigma_text,
++                f"{u:.9g}",
++            )
++            for column, value in enumerate(values):
+                 item = self.points_table.item(row, column)
