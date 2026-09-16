@@ -1,0 +1,286 @@
+                 if item is None:
+                     item = QTableWidgetItem()
+                     self.points_table.setItem(row, column, item)
+-                item.setText(f"{value:.9g}")
++                item.setText(value)
++                if column >= 2:
++                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+ 
+     def _points(self) -> tuple[CalibrationPoint, ...]:
+         points: list[CalibrationPoint] = []
+         for row in range(self.points_table.rowCount()):
+             wavelength_item = self.points_table.item(row, 0)
+             value_item = self.points_table.item(row, 1)
++            n_item = self.points_table.item(row, 2)
++            sigma_item = self.points_table.item(row, 3)
+             if wavelength_item is None or value_item is None:
+                 continue
+-            points.append(CalibrationPoint(float(wavelength_item.text()), float(value_item.text())))
++            n = 1 if n_item is None else int(n_item.text())
++            sigma_nm = None
++            if sigma_item is not None and sigma_item.text() != texts.UNKNOWN:
++                sigma_nm = float(sigma_item.text())
++            points.append(
++                CalibrationPoint(
++                    float(wavelength_item.text()),
++                    float(value_item.text()),
++                    n,
++                    sigma_nm,
++                )
++            )
+         return tuple(points)
+ 
++    def _calibration_wavelength(self) -> tuple[float, int, float | None]:
++        selected = self._selected_peak()
++        if not self.averaging_enabled.isChecked():
++            return selected, 1, None
++        snapshot = self._last_snapshot
++        if snapshot is None or snapshot.sensor_trace_history is None:
++            raise ValueError("нет raw-истории для усреднённой калибровочной точки")
++        mean, n, sigma = models.averaged_calibration_wavelength(
++            snapshot.sensor_trace_history,
++            int(str(self.channel_combo.currentData())),
++            selected,
++            self.window_spin.value(),
++            self.averaging_window.value() / 1000.0,
++            gaps=snapshot.stream_gaps,
++        )
++        return mean, n, sigma
++
+     def _add_point(self) -> None:
+         try:
+-            point = CalibrationPoint(self._selected_peak(), self.known_value_spin.value())
++            wavelength_nm, n, sigma_nm = self._calibration_wavelength()
++            point = CalibrationPoint(wavelength_nm, self.known_value_spin.value(), n, sigma_nm)
+             self._set_points((*self._points(), point))
+         except ValueError as exc:
+             self._controller.note(f"опорная точка не добавлена: {exc}")
+@@ -681,16 +797,18 @@ class SensorsPanel(DockTab):
+     def _fit_points(self) -> None:
+         try:
+             kind = FitKind(str(self.fit_kind.currentData()))
+-            fit = fit_calibration(self._points(), self.expected_spin.value(), kind=kind)
++            points = self._points()
++            self._set_points(points)
++            fit = fit_calibration(
++                points,
++                self.expected_spin.value(),
++                kind=kind,
++                quantization_nm=self._fit_quantization(points),
++            )
+         except (ValueError, FloatingPointError) as exc:
+             self.fit_residual.setText(str(exc))
+             return
+-        self.value0_spin.setValue(fit.value0)
+-        self.k1_spin.setValue(fit.k1)
+-        self.k2_spin.setValue(fit.k2)
+-        self.fit_residual.setText(
+-            f"RMS {fit.rms:.6g}; max |r| {fit.max_abs_residual:.6g}; точек {fit.points}"
+-        )
++        self._show_fit(fit)
+ 
+     def _checked_sensor_ids(self) -> tuple[str, ...]:
+         return tuple(
+@@ -736,8 +854,9 @@ class SensorsPanel(DockTab):
+                 color = pg.intColor(index, hues=max(1, len(selected)))
+                 curve = self.value_plot.plot(pen=pg.mkPen(color), name=sensor_id)
+                 self._curves[sensor_id] = curve
+-                upper = pg.PlotDataItem(pen=None)
+-                lower = pg.PlotDataItem(pen=None)
++                transparent_pen = pg.mkPen(0, 0, 0, 0)
++                upper = pg.PlotDataItem(pen=transparent_pen)
++                lower = pg.PlotDataItem(pen=transparent_pen)
+                 red, green, blue, _alpha = color.getRgb()
+                 fill = pg.FillBetweenItem(
+                     upper,
+diff --git a/fbg/ui/texts.py b/fbg/ui/texts.py
+index 8681666..d419630 100644
+--- a/fbg/ui/texts.py
++++ b/fbg/ui/texts.py
+@@ -509,6 +509,7 @@ LABEL_SENSOR_UP_LIMIT = "Верхний предел"
+ LABEL_SENSOR_CURRENT_PEAK = "Текущий пик"
+ LABEL_SENSOR_KNOWN_VALUE = "Известное значение"
+ LABEL_SENSOR_FIT_KIND = "Подгонка"
++LABEL_SENSOR_WEIGHTED_FIT = "Взвешивать по u"
+ LABEL_SENSOR_FIT_RESIDUAL = "Невязка"
+ LABEL_PEAK_MAP_CHANNEL = "Канал карты"
+ BUTTON_SENSOR_NEW = "Новый"
+diff --git a/tests/test_calibration.py b/tests/test_calibration.py
+index 8df5388..12b526a 100644
+--- a/tests/test_calibration.py
++++ b/tests/test_calibration.py
+@@ -26,6 +26,7 @@ from fbg.core.calibration import (
+     SensorType,
+     TempCompensation,
+     apply_curve,
++    calibration_point_uncertainty,
+     evaluate,
+     evaluate_all,
+     fit_calibration,
+@@ -35,6 +36,7 @@ from fbg.core.calibration import (
+     sensors_to_json,
+     validate_sensors,
+ )
++from fbg.core.profile import DeviceProfile
+ 
+ #: Длины волн решёток стенда, ✅ скрининг 27.08.2026 (KB_01).
+ STAND_NM_1 = 1544.787
+@@ -606,3 +608,97 @@ def test_подгонка_отвергает_повтор_одной_длины_
+     )
+     with pytest.raises(ValueError, match="различных длин волн"):
+         fit_calibration(points, 1544.8)
++
++
++# --------------------------------------------------------------------------------------
++# Р83 / Р84: качество калибровочных точек и взвешенная подгонка
++# --------------------------------------------------------------------------------------
++
++
++def test_legacy_опорная_точка_без_n_и_sigma_читается_как_одиночная() -> None:
++    restored = sensor_from_json(
++        {
++            "id": "S1",
++            "channel": 0,
++            "type": 0,
++            "expected_nm": 1550.0,
++            "window_nm": 0.3,
++            "calibration_points": [{"wavelength_nm": 1550.1, "value": 10.0}],
++        }
++    )
++    point = restored.calibration_points[0]
++    assert point.n == 1
++    assert point.sigma_nm is None
++    assert restored.weighted_fit is True
++
++
++def test_опорная_точка_сохраняет_n_sigma_и_выбор_весов() -> None:
++    sensor = temperature_sensor(
++        calibration_points=(CalibrationPoint(1544.8, 20.0, 100, 0.0015),),
++        weighted_fit=False,
++    )
++    restored = sensor_from_json(sensor_to_json(sensor))
++    assert restored == sensor
++
++
++def test_u_выше_квантового_пола() -> None:
++    point = CalibrationPoint(1550.0, 1.0, n=100, sigma_nm=0.012)
++    expected_s = 0.012 * math.sqrt(100 / 99)
++    assert calibration_point_uncertainty(point, 0.008) == pytest.approx(expected_s / 10.0)
++
++
++def test_u_при_sigma_zero_ограничен_квантом() -> None:
++    point = CalibrationPoint(1550.0, 1.0, n=100, sigma_nm=0.0)
++    assert calibration_point_uncertainty(point, 0.008) == pytest.approx(
++        0.008 / math.sqrt(12) / 10
++    )
++
++
++def test_u_одиночной_точки_равен_квантовому_полу() -> None:
++    point = CalibrationPoint(1550.0, 1.0, n=1, sigma_nm=None)
++    assert calibration_point_uncertainty(point, 0.008) == pytest.approx(0.008 / math.sqrt(12))
++
++
++def test_u_n2_использует_несмещенную_оценку_sigma() -> None:
++    point = CalibrationPoint(1550.0, 1.0, n=2, sigma_nm=0.01)
++    # s = sigma_pop * sqrt(2), затем / sqrt(2) => исходные 0.01 нм.
++    assert calibration_point_uncertainty(point, 0.001) == pytest.approx(0.01)
++
++
++def test_взвешенная_и_обычная_подгонки_совпадают_при_одинаковом_качестве() -> None:
++    points = tuple(
++        CalibrationPoint(1550.0 + x, y, n=10, sigma_nm=0.002)
++        for x, y in ((0.0, 0.0), (0.1, 1.0), (0.2, 2.1), (0.3, 3.0))
++    )
++    plain = fit_calibration(points, 1550.0)
++    weighted = fit_calibration(points, 1550.0, quantization_nm=0.008)
++    assert weighted.k1 == pytest.approx(plain.k1)
++    assert weighted.value0 == pytest.approx(plain.value0)
++
++
++def test_polyfit_получает_1_на_u_а_не_1_на_u_квадрат() -> None:
++    points = (
++        CalibrationPoint(1550.0, 0.0, n=100, sigma_nm=0.001),
++        CalibrationPoint(1551.0, 1.0, n=100, sigma_nm=0.001),
++        CalibrationPoint(1552.0, 2.0, n=100, sigma_nm=0.001),
++        CalibrationPoint(1553.0, 10.0, n=1, sigma_nm=None),
++    )
++    # Три хорошие точки имеют u=0.001; одиночная последняя — u=0.01.
++    fit = fit_calibration(points, 1550.0, quantization_nm=0.034641016151377546)
++    assert fit.k1 == pytest.approx(1.0684, rel=2e-3)
++    assert fit.k1 != pytest.approx(1.0007, rel=2e-3)
++
++
++def test_невязка_прямой_по_двум_точкам_не_притворяется_нулевой() -> None:
++    fit = fit_calibration(
++        (CalibrationPoint(1550.0, 0.0), CalibrationPoint(1551.0, 1.0)),
++        1550.0,
++    )
++    assert fit.rms is None
++    assert fit.max_abs_residual is None
++
++
++def test_квантование_длины_волны_берется_из_профиля() -> None:
++    profile = DeviceProfile()
++    q = profile.wavelength_quantization_nm(1550.0)
++    assert q == pytest.approx(0.008, rel=0.02)
+diff --git a/tests/test_ui_app.py b/tests/test_ui_app.py
+index 760ff9f..371838a 100644
+--- a/tests/test_ui_app.py
++++ b/tests/test_ui_app.py
+@@ -120,6 +120,12 @@ def wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> bool:
+     return predicate()
+ 
+ 
++def wait_for_packet_log(controller: AppController, timeout: float = 5.0) -> None:
++    """Сравнивать журнал можно только после опустошения обеих очередей."""
++    assert wait_until(lambda: controller.session._transport.queue_depth == 0, timeout=timeout)
++    assert wait_until(lambda: controller.packet_log.stats.queue_depth == 0, timeout=timeout)
++
++
+ # --------------------------------------------------------------------------------------
+ # Сборка
+ # --------------------------------------------------------------------------------------
+@@ -246,6 +252,15 @@ def test_усреднение_датчика_запрашивает_raw_исто
+         rig.controller.stop_stream()
+ 
+ 
++def test_калибровка_нового_датчика_может_запросить_raw_канал_без_сохранения(
++    rig: Rig,
++) -> None:
++    rig.controller.set_sensor_trace_request((), 0.1, extra_channels=(2,))
++    assert rig.controller._sensor_trace_positions == tuple(
++        (2, position) for position in range(rig.controller.config.profile.fbg_per_channel)
++    )
++
++
+ def test_границы_сетевого_gap_доходят_до_qt_свободного_snapshot() -> None:
+     controller = AppController(AppConfig(packet_log=PacketLogConfig(directory=None)))
+     try:
+@@ -637,7 +652,7 @@ def test_журнал_видит_обмен_подключения(rig: Rig) ->
+     закреплять несуществующую гарантию тестом нельзя.
+     """
+     rig.controller.connect().unwrap()
+-    assert wait_until(lambda: len(rig.controller.packet_records()) > 2)
++    wait_for_packet_log(rig.controller)
+     outgoing = rig.controller.packet_records(direction=Direction.TX)
+     assert outgoing
+     assert outgoing[0].data[:2] == bytes([0x30, 0x01])
+@@ -646,7 +661,7 @@ def test_журнал_видит_обмен_подключения(rig: Rig) ->
+ def test_фильтр_записей_журнала(rig: Rig) -> None:
+     """Панель просит отфильтрованный снимок, а не фильтрует кольцо сама."""
+     rig.controller.connect().unwrap()
+-    assert wait_until(lambda: len(rig.controller.packet_records()) > 2)
++    wait_for_packet_log(rig.controller)
+     everything = rig.controller.packet_records()
+     outgoing = rig.controller.packet_records(id_fc=(0x10, 0x01))
+     assert 0 < len(outgoing) < len(everything)
+@@ -656,7 +671,7 @@ def test_фильтр_записей_журнала(rig: Rig) -> None:
+ def test_экспорт_журнала_пишет_файл(rig: Rig, tmp_path: Path) -> None:
+     """Экспорт выгружает кольцо с применённым фильтром."""
+     rig.controller.connect().unwrap()
+-    assert wait_until(lambda: len(rig.controller.packet_records()) > 2)
++    wait_for_packet_log(rig.controller)
+     target = tmp_path / "export.log"
+     written = rig.controller.export_packets(target)
+     assert written > 0
+@@ -722,8 +737,10 @@ def test_спектр_во_время_потока_полностью_перез
