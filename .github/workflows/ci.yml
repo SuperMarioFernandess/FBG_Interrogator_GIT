@@ -19,7 +19,9 @@ jobs:
 
       - name: Применить патч chat18 для временной валидации
         shell: bash
-        run: cat chat18_ci_part_* | git apply -
+        run: |
+          cat chat18_ci_part_* | git apply -
+          git apply chat18_ci_fix.patch
 
       - uses: actions/setup-python@v5
         with:
@@ -49,7 +51,9 @@ jobs:
 
       - name: Применить патч chat18 для временной валидации
         shell: bash
-        run: cat chat18_ci_part_* | git apply -
+        run: |
+          cat chat18_ci_part_* | git apply -
+          git apply chat18_ci_fix.patch
 
       - uses: actions/setup-python@v5
         with:
@@ -82,7 +86,9 @@ jobs:
 
       - name: Применить патч chat18 для временной валидации
         shell: bash
-        run: cat chat18_ci_part_* | git apply -
+        run: |
+          cat chat18_ci_part_* | git apply -
+          git apply chat18_ci_fix.patch
 
       - uses: actions/setup-python@v5
         with:
