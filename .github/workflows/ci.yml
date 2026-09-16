@@ -109,11 +109,10 @@ jobs:
   package:
     name: Сформировать mbox chat18
     runs-on: ubuntu-latest
-    needs: [core, ui, load]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Применить проверенный патч chat18
+      - name: Применить уже проверенный патч chat18
         shell: bash
         run: |
           cat chat18_ci_part_* | git apply -
