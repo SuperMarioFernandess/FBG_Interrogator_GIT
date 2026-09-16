@@ -22,6 +22,7 @@ jobs:
         run: |
           cat chat18_ci_part_* | git apply -
           git apply chat18_ci_fix.patch
+          git apply chat18_ci_format.patch
 
       - uses: actions/setup-python@v5
         with:
@@ -54,6 +55,7 @@ jobs:
         run: |
           cat chat18_ci_part_* | git apply -
           git apply chat18_ci_fix.patch
+          git apply chat18_ci_format.patch
 
       - uses: actions/setup-python@v5
         with:
@@ -89,6 +91,7 @@ jobs:
         run: |
           cat chat18_ci_part_* | git apply -
           git apply chat18_ci_fix.patch
+          git apply chat18_ci_format.patch
 
       - uses: actions/setup-python@v5
         with:
