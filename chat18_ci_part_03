@@ -1,0 +1,351 @@
+ 
+ def test_спектр_из_idle_после_30_07_обязательно_посылает_stop(rig: Rig) -> None:
+     rig.controller.connect().unwrap()
++    wait_for_packet_log(rig.controller)
+     before = len(rig.controller.packet_records(direction=Direction.TX))
+     rig.controller.take_spectrum(0, 3000).unwrap()
++    wait_for_packet_log(rig.controller)
+     outgoing = rig.controller.packet_records(direction=Direction.TX)[before:]
+     assert [record.id_fc for record in outgoing] == [(0x30, 0x07), (0x30, 0x01)]
+     assert rig.controller.session.state is SessionState.IDLE
+@@ -752,9 +769,11 @@ def test_одиночный_спектр_не_блокирует_вызываю
+ 
+ def test_debug_из_idle_после_30_03_обязательно_посылает_stop(rig: Rig) -> None:
+     rig.controller.connect().unwrap()
++    wait_for_packet_log(rig.controller)
+     before = len(rig.controller.packet_records(direction=Direction.TX))
+     spectra = rig.controller.take_debug_spectra(3000).unwrap()
+     assert len(spectra) == rig.controller.config.profile.channels
++    wait_for_packet_log(rig.controller)
+     outgoing = rig.controller.packet_records(direction=Direction.TX)[before:]
+     assert [record.id_fc for record in outgoing] == [(0x30, 0x03), (0x30, 0x01)]
+     assert rig.controller.session.state is SessionState.IDLE
+diff --git a/tests/test_ui_averaging_model.py b/tests/test_ui_averaging_model.py
+index 501e249..36d062b 100644
+--- a/tests/test_ui_averaging_model.py
++++ b/tests/test_ui_averaging_model.py
+@@ -392,3 +392,72 @@ def test_incremental_путь_пересчитывает_только_после
+ 
+     assert rows_seen == [3]
+     assert rows_seen[0] < full_history.frames
++
++
++def test_калибровочная_точка_берет_последнее_завершенное_окно_absolute_lambda() -> None:
++    history = TraceHistorySnapshot(
++        positions=((0, 0), (0, 1)),
++        seq_start=0,
++        seq_stop=5,
++        t_mono=np.asarray([0.001, 0.020, 0.051, 0.070, 0.090]),
++        wavelength_nm=np.asarray(
++            [
++                [1550.000, np.nan],
++                [1550.004, np.nan],
++                [1550.100, np.nan],
++                [1550.104, np.nan],
++                [1550.108, np.nan],
++            ]
++        ),
++    )
++
++    mean, n, sigma = models.averaged_calibration_wavelength(
++        history,
++        0,
++        1550.0,
++        0.2,
++        0.05,
++    )
++
++    # Окно 0.05…0.10 ещё не завершено: последний кадр 0.09. Берётся 0…0.05.
++    assert mean == pytest.approx(1550.002)
++    assert n == 2
++    assert sigma == pytest.approx(0.002)
++
++
++def test_калибровочная_точка_усредняет_lambda_а_не_физическую_величину() -> None:
++    sensor = Sensor(
++        id="S0",
++        name="S0",
++        channel=0,
++        type=SensorType.TEMPERATURE,
++        expected_nm=1550.0,
++        window_nm=0.2,
++        value0=0.0,
++        k1=0.0,
++        k2=0.0,
++    )
++    history = TraceHistorySnapshot(
++        positions=((0, 0),),
++        seq_start=0,
++        seq_stop=3,
++        t_mono=np.asarray([0.001, 0.020, 0.051]),
++        wavelength_nm=np.asarray([[1550.010], [1550.014], [1550.018]]),
++    )
++    graph = models.sensor_graph_model(
++        _snapshot(sensors=(sensor,), sensor_trace_history=history),
++        ("S0",),
++        averaging_window_s=0.05,
++    )
++    mean, n, sigma = models.averaged_calibration_wavelength(
++        history,
++        0,
++        1550.012,
++        0.2,
++        0.05,
++    )
++
++    assert graph.traces[0].values[0] == 0.0
++    assert mean == pytest.approx(1550.012)
++    assert n == 2
++    assert sigma == pytest.approx(0.002)
+diff --git a/tests/test_ui_measurement_widget.py b/tests/test_ui_measurement_widget.py
+index fb7aba0..07e66bb 100644
+--- a/tests/test_ui_measurement_widget.py
++++ b/tests/test_ui_measurement_widget.py
+@@ -219,6 +219,49 @@ def test_снятие_флажка_убирает_линию(panel: MeasurementP
+     assert models.SlotRef(0, 0) not in panel._curves
+ 
+ 
++def test_полоса_sigma_имеет_непустой_путь_и_разрывается_на_nan(
++    application: QApplication,
++    panel: MeasurementPanel,
++    controller: AppController,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Регрессия чата №18: проверяется геометрия FillBetweenItem, не visible."""
++    slot = models.SlotRef(0, 0)
++    t_s = np.asarray([-6.0, -5.0, -4.0, -3.0, -2.0, -1.0, 0.0])
++    delta = np.asarray([0.0, 0.01, 0.02, np.nan, 0.03, 0.04, 0.05])
++    sigma = np.asarray([0.002, 0.002, 0.002, np.nan, 0.002, 0.002, 0.002])
++    graph = models.MeasurementGraphModel(
++        t_s=t_s,
++        traces=(
++            models.GraphTrace(
++                slot=slot,
++                delta_nm=delta,
++                baseline_nm=1550.0,
++                latest_nm=1550.05,
++                valid_points=6,
++                sigma_nm=sigma,
++                n=np.asarray([10, 10, 10, 0, 10, 10, 10]),
++            ),
++        ),
++        y_min_nm=-0.01,
++        y_max_nm=0.06,
++        history_span_s=6.0,
++        averaging_window_s=0.05,
++    )
++    monkeypatch.setattr(models, "measurement_graph_model", lambda *args, **kwargs: graph)
++    panel.averaging_enabled.blockSignals(True)
++    panel.averaging_enabled.setChecked(True)
++    panel.averaging_enabled.blockSignals(False)
++
++    panel._update_graph(controller.snapshot(include_sensor_data=False))
++    application.processEvents()
++
++    fill = panel._bands[slot][2]
++    polygons = fill.path().toSubpathPolygons()
++    assert polygons
++    assert len(polygons) > 1
++
++
+ def test_глубина_истории_ограничена_кольцом_10_секунд_на_2кгц(
+     panel: MeasurementPanel, controller: AppController
+ ) -> None:
+diff --git a/tests/test_ui_sensors_widget.py b/tests/test_ui_sensors_widget.py
+index f0c5958..757215a 100644
+--- a/tests/test_ui_sensors_widget.py
++++ b/tests/test_ui_sensors_widget.py
+@@ -17,7 +17,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+ from PySide6.QtCore import Qt
+ from PySide6.QtWidgets import QApplication, QFileDialog
+ 
+-from fbg.core.calibration import ReadingStatus, Sensor, SensorReading, SensorType
++from fbg.core.calibration import (
++    CalibrationPoint,
++    ReadingStatus,
++    Sensor,
++    SensorReading,
++    SensorType,
++)
++from fbg.core.pipeline import TraceHistorySnapshot
+ from fbg.core.profile import DeviceProfile
+ from fbg.core.session import SessionState
+ from fbg.io.config import AppConfig
+@@ -424,3 +431,177 @@ def test_усреднение_датчиков_имеет_те_же_контро
+     finally:
+         panel.close()
+         panel.deleteLater()
++
++
++def test_полоса_sigma_датчиков_имеет_путь_и_разрывается_на_nan(
++    application: QApplication,
++    controller: AppController,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    controller.replace_sensors((sensor("T1", expected_nm=1550.0),))
++    panel = SensorsPanel(controller)
++    try:
++        item = panel._items["T1"]
++        panel.sensor_tree.blockSignals(True)
++        item.setCheckState(0, Qt.CheckState.Checked)
++        panel.sensor_tree.blockSignals(False)
++        panel.averaging_enabled.blockSignals(True)
++        panel.averaging_enabled.setChecked(True)
++        panel.averaging_enabled.blockSignals(False)
++        t_s = np.asarray([-6.0, -5.0, -4.0, -3.0, -2.0, -1.0, 0.0])
++        values = np.asarray([1.0, 1.1, 1.2, np.nan, 1.3, 1.4, 1.5])
++        sigma = np.asarray([0.02, 0.02, 0.02, np.nan, 0.02, 0.02, 0.02])
++        graph = models.SensorGraphModel(
++            t_s=t_s,
++            traces=(
++                models.SensorGraphTrace(
++                    "T1",
++                    values,
++                    sigma=sigma,
++                    n=np.asarray([10, 10, 10, 0, 10, 10, 10]),
++                ),
++            ),
++            averaging_window_s=0.05,
++        )
++        monkeypatch.setattr(models, "sensor_graph_model", lambda *args, **kwargs: graph)
++
++        panel._update_graph()
++        application.processEvents()
++
++        fill = panel._bands["T1"][2]
++        polygons = fill.path().toSubpathPolygons()
++        assert polygons
++        assert len(polygons) > 1
++    finally:
++        panel.close()
++        panel.deleteLater()
++
++
++def test_калибровочная_точка_без_усреднения_имеет_n1_и_неизвестную_sigma(
++    application: QApplication, controller: AppController
++) -> None:
++    panel = SensorsPanel(controller)
++    try:
++        wavelengths = np.full((PROFILE.channels, PROFILE.fbg_per_channel), np.nan)
++        wavelengths[0, 4] = 1544.812345
++        panel.refresh(snapshot(controller, ui=SimpleNamespace(wavelength_nm=wavelengths)))
++        panel.known_value_spin.setValue(25.0)
++
++        panel._add_point()
++
++        point = panel._points()[0]
++        assert point.wavelength_nm == pytest.approx(1544.812345)
++        assert point.n == 1
++        assert point.sigma_nm is None
++        assert panel.points_table.item(0, 2).text() == "1"
++        assert panel.points_table.item(0, 3).text() == texts.UNKNOWN
++    finally:
++        panel.close()
++        panel.deleteLater()
++
++
++def test_калибровочная_точка_с_усреднением_берет_последнее_завершенное_окно(
++    application: QApplication, controller: AppController
++) -> None:
++    panel = SensorsPanel(controller)
++    try:
++        wavelengths = np.full((PROFILE.channels, PROFILE.fbg_per_channel), np.nan)
++        wavelengths[0, 0] = 1550.108
++        history = TraceHistorySnapshot(
++            positions=((0, 0),),
++            seq_start=0,
++            seq_stop=5,
++            t_mono=np.asarray([0.001, 0.020, 0.051, 0.070, 0.090]),
++            wavelength_nm=np.asarray(
++                [[1550.000], [1550.004], [1550.100], [1550.104], [1550.108]]
++            ),
++        )
++        panel.averaging_enabled.blockSignals(True)
++        panel.averaging_enabled.setChecked(True)
++        panel.averaging_enabled.blockSignals(False)
++        panel.averaging_window.setValue(50.0)
++        panel.window_spin.setValue(0.2)
++        panel.refresh(
++            snapshot(
++                controller,
++                ui=SimpleNamespace(wavelength_nm=wavelengths),
++                sensor_trace_history=history,
++            )
++        )
++
++        panel._add_point()
++
++        point = panel._points()[0]
++        assert point.wavelength_nm == pytest.approx(1550.002)
++        assert point.n == 2
++        assert point.sigma_nm == pytest.approx(0.002)
++    finally:
++        panel.close()
++        panel.deleteLater()
++
++
++def test_взвешивание_доступно_при_выключенном_усреднении_и_включено_по_умолчанию(
++    application: QApplication, controller: AppController
++) -> None:
++    panel = SensorsPanel(controller)
++    try:
++        assert not panel.averaging_enabled.isChecked()
++        assert panel.weighted_fit.isChecked()
++        assert panel.weighted_fit.isEnabled()
++        panel.averaging_enabled.setChecked(True)
++        assert panel.weighted_fit.isEnabled()
++        panel.averaging_enabled.setChecked(False)
++        assert panel.weighted_fit.isEnabled()
++    finally:
++        panel.close()
++        panel.deleteLater()
++
++
++def test_смена_expected_nm_переподгоняет_сохраненные_точки(
++    application: QApplication, controller: AppController
++) -> None:
++    panel = SensorsPanel(controller)
++    try:
++        panel.expected_spin.setValue(1550.0)
++        panel._set_points(
++            (
++                CalibrationPoint(1550.0, 0.0),
++                CalibrationPoint(1551.0, 2.0),
++            )
++        )
++        panel._fit_points()
++        assert panel.k1_spin.value() == pytest.approx(2.0)
++        assert panel.value0_spin.value() == pytest.approx(0.0)
++        assert panel.fit_residual.text().startswith("—")
++
++        panel.current_peak_combo.clear()
++        panel.current_peak_combo.addItem("1550.2500 нм", "1550.25")
++        panel._take_current_wavelength()
++
++        assert panel.expected_spin.value() == pytest.approx(1550.25)
++        assert panel.k1_spin.value() == pytest.approx(2.0)
++        assert panel.value0_spin.value() == pytest.approx(0.5)
++    finally:
++        panel.close()
++        panel.deleteLater()
++
++
++def test_смена_expected_nm_без_точек_сбрасывает_старые_коэффициенты(
++    application: QApplication, controller: AppController
++) -> None:
++    panel = SensorsPanel(controller)
++    try:
++        panel.k1_spin.setValue(100.0)
++        panel.k2_spin.setValue(5.0)
++        panel.value0_spin.setValue(25.0)
++        panel.current_peak_combo.clear()
++        panel.current_peak_combo.addItem("1550.2500 нм", "1550.25")
++
++        panel._take_current_wavelength()
++
++        assert panel.value0_spin.value() == 0.0
++        assert panel.k1_spin.value() == 0.0
++        assert panel.k2_spin.value() == 0.0
++    finally:
++        panel.close()
++        panel.deleteLater()
