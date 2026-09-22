@@ -9,6 +9,7 @@ import os
 import threading
 import time
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -157,7 +158,8 @@ def test_таблица_обновляется_без_model_reset_при_той_
     panel.table_model.dataChanged.connect(count_change)
     controller.pipeline.on_telemetry(REAL_FRAME, time.perf_counter())
     controller.pipeline.publish_now()
-    panel.refresh(controller.snapshot())
+    snapshot = controller.snapshot()
+    panel.refresh(replace(snapshot, ui=controller.pipeline.snapshot()))
 
     assert resets == 0
     assert changes == 1

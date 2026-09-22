@@ -9,6 +9,7 @@
 
 import json
 import os
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -131,6 +132,30 @@ def test_у_каждой_вкладки_есть_именованные_доки
         assert len({dock.objectName() for dock in panel.dock_widgets}) == len(panel.dock_widgets)
 
 
+def test_закрытие_главного_окна_дожидается_офлайн_потоков(
+    application: QApplication, controller: AppController
+) -> None:
+    window = MainWindow(controller)
+    gate = threading.Event()
+    average = threading.Thread(target=lambda: gate.wait(0.20), name="test-average", daemon=False)
+    recalibrate = threading.Thread(
+        target=lambda: gate.wait(0.20), name="test-recalibrate", daemon=False
+    )
+    window.measurement_panel._average_thread = average
+    window.sensors_panel._recalc_thread = recalibrate
+    average.start()
+    recalibrate.start()
+    try:
+        window.close()
+        assert not average.is_alive()
+        assert not recalibrate.is_alive()
+    finally:
+        gate.set()
+        average.join(timeout=1.0)
+        recalibrate.join(timeout=1.0)
+        window.deleteLater()
+
+
 def test_таймер_запускается_и_гаснет(window: MainWindow) -> None:
     """Событийного обновления нет: при 2 кГц оно утопило бы UI."""
     assert not window.timer.isActive()
@@ -200,6 +225,100 @@ def test_нечитаемая_раскладка_карантинится(applic
     finally:
         main.close()
         main.deleteLater()
+        controller.shutdown()
+
+
+def test_неизвестное_поле_раскладки_карантинит_весь_layout(
+    application: QApplication, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "fbg_config.json"
+    controller = AppController(
+        AppConfig(packet_log=PacketLogConfig(directory=None)),
+        config_path=config_path,
+    )
+    controller.start()
+    first = MainWindow(controller)
+    first.save_layout_now()
+    first.close()
+    first.deleteLater()
+
+    layout_path = tmp_path / UI_LAYOUT_FILENAME
+    raw = json.loads(layout_path.read_text(encoding="ascii"))
+    raw["future_field"] = {"must": "survive"}
+    layout_path.write_text(json.dumps(raw), encoding="ascii")
+
+    second = MainWindow(controller)
+    try:
+        assert not layout_path.exists()
+        backup = tmp_path / f"{UI_LAYOUT_FILENAME}.bad"
+        assert json.loads(backup.read_text(encoding="ascii"))["future_field"] == {"must": "survive"}
+        assert any(texts.LAYOUT_LOAD_FAILED in notice for notice in controller.notices)
+    finally:
+        second.close()
+        second.deleteLater()
+        controller.shutdown()
+
+
+def test_отсутствующие_необязательные_поля_раскладки_совместимы(
+    application: QApplication, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "fbg_config.json"
+    controller = AppController(
+        AppConfig(packet_log=PacketLogConfig(directory=None)),
+        config_path=config_path,
+    )
+    controller.start()
+    first = MainWindow(controller)
+    first.save_layout_now()
+    first.close()
+    first.deleteLater()
+
+    layout_path = tmp_path / UI_LAYOUT_FILENAME
+    raw = json.loads(layout_path.read_text(encoding="ascii"))
+    raw.pop("period_ms", None)
+    raw.pop("locked", None)
+    raw.pop("window_geometry", None)
+    layout_path.write_text(json.dumps(raw), encoding="ascii")
+
+    second = MainWindow(controller)
+    try:
+        assert layout_path.exists()
+        assert not (tmp_path / f"{UI_LAYOUT_FILENAME}.bad").exists()
+        assert second.timer.interval() == DEFAULT_UI_PERIOD_MS
+        assert not second.lock_layout_button.isChecked()
+    finally:
+        second.close()
+        second.deleteLater()
+        controller.shutdown()
+
+
+def test_поле_раскладки_неверного_типа_карантинит_весь_layout(
+    application: QApplication, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "fbg_config.json"
+    controller = AppController(
+        AppConfig(packet_log=PacketLogConfig(directory=None)),
+        config_path=config_path,
+    )
+    controller.start()
+    first = MainWindow(controller)
+    first.save_layout_now()
+    first.close()
+    first.deleteLater()
+
+    layout_path = tmp_path / UI_LAYOUT_FILENAME
+    raw = json.loads(layout_path.read_text(encoding="ascii"))
+    raw["period_ms"] = "100"
+    layout_path.write_text(json.dumps(raw), encoding="ascii")
+
+    second = MainWindow(controller)
+    try:
+        assert not layout_path.exists()
+        assert (tmp_path / f"{UI_LAYOUT_FILENAME}.bad").exists()
+        assert second.timer.interval() == DEFAULT_UI_PERIOD_MS
+    finally:
+        second.close()
+        second.deleteLater()
         controller.shutdown()
 
 

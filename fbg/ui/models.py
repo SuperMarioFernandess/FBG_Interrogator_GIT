@@ -1401,7 +1401,11 @@ def state_view(snapshot: AppSnapshot) -> StateView:
 def status_line(snapshot: AppSnapshot) -> str:
     """Строка состояния окна: состояние, темп, журнал, запись."""
     parts = [texts.STATE_LABELS[snapshot.state][0]]
-    if snapshot.metrics is not None and snapshot.metrics.frame_rate_hz > 0:
+    if (
+        snapshot.state is SessionState.STREAMING
+        and snapshot.metrics is not None
+        and snapshot.metrics.frame_rate_hz > 0
+    ):
         parts.append(f"{snapshot.metrics.frame_rate_hz:.1f} Гц")
     if snapshot.log is not None:
         parts.append(f"журнал: {_int(snapshot.log.records_in)}")
@@ -1538,16 +1542,20 @@ def _quality_section(snapshot: AppSnapshot) -> InfoSection:
     stats = snapshot.session
     transport = snapshot.transport
     metrics = snapshot.metrics
+    live_metrics = metrics if snapshot.state is SessionState.STREAMING else None
     rows = [
-        InfoRow(texts.ROW_FRAME_RATE, _float(None if metrics is None else metrics.frame_rate_hz)),
+        InfoRow(
+            texts.ROW_FRAME_RATE,
+            _float(None if live_metrics is None else live_metrics.frame_rate_hz),
+        ),
         InfoRow(
             texts.ROW_EXPECTED_RATE, _float(None if metrics is None else metrics.expected_rate_hz)
         ),
         InfoRow(
             texts.ROW_LOSS,
             texts.UNKNOWN
-            if metrics is None or metrics.loss_estimate is None
-            else f"{metrics.loss_estimate * 100:.2f} %",
+            if live_metrics is None or live_metrics.loss_estimate is None
+            else f"{live_metrics.loss_estimate * 100:.2f} %",
             texts.LOSS_IS_AN_ESTIMATE,
         ),
         InfoRow(texts.ROW_FRAMES, _int(None if metrics is None else metrics.frames)),

@@ -137,6 +137,14 @@ def test_неизменившаяся_версия_спектра_не_пере�
         panel.refresh(snapshot)
     assert calls == 1
 
+    # Проверяем результат отрисовки, а не только факт вызова метода.
+    x_data, y_data = panel.curve.getData()
+    assert x_data is not None and y_data is not None
+    np.testing.assert_allclose(x_data, model.wavelength_nm)
+    np.testing.assert_allclose(y_data, model.adc)
+    assert panel.table.rowCount() == len(model.regions)
+    assert panel.table.item(0, 3).text() == str(model.regions[0].amplitude_adc)
+
     # Содержимое то же самое, но версия новая: это новое измерение и оно рисуется.
     panel.refresh(
         models.AppSnapshot(

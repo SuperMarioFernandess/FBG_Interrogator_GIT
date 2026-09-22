@@ -990,8 +990,12 @@ class SensorsPanel(DockTab):
         self._update_peak_map()
         self._poll_recalibration()
 
-    def closeEvent(self, event: object) -> None:  # noqa: N802 — Qt
+    def wait_for_background_work(self) -> None:
+        """Дожидается собственного офлайн-потока перед закрытием приложения."""
         thread = self._recalc_thread
         if thread is not None and thread.is_alive():
             thread.join()
+
+    def closeEvent(self, event: object) -> None:  # noqa: N802 — Qt
+        self.wait_for_background_work()
         super().closeEvent(event)  # type: ignore[arg-type]

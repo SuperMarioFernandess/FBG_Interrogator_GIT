@@ -626,6 +626,8 @@ class AppController:
                 raise RuntimeError("поток спектра не завершился за 15 секунд")
         self._spectrum_thread = None
         self._spectrum_continuous = False
+        self._spectrum_completed_mono.clear()
+        self._spectrum_actual_period_s = None
 
     # --- Настройка прибора -------------------------------------------------------------
 
@@ -1083,7 +1085,10 @@ class AppController:
         session = self._session
         recorder = self._recorder
         recorder_stats = recorder.stats if recorder is not None else self._last_recorder_stats
-        ui_snapshot = self._pipeline.snapshot()
+        # Последний кадр остаётся в pipeline как история принятых данных. Но в
+        # поле ``ui`` он означает текущий кадр; вне Streaming это выдавало бы
+        # старые λ, температуру и значения датчиков за живое измерение (№7).
+        ui_snapshot = self._pipeline.snapshot() if session.state is SessionState.STREAMING else None
         trace_history = (
             self._pipeline.trace_history(self._trace_positions, self._trace_history_s)
             if include_trace_history
@@ -1132,7 +1137,17 @@ class AppController:
             spectrum_busy=self.spectrum_busy,
             spectrum_running=self.spectrum_running,
             spectrum_period_s=self._spectrum_period_s,
-            spectrum_actual_period_s=self._spectrum_actual_period_s,
+            spectrum_actual_period_s=(
+                self._spectrum_actual_period_s
+                if self.spectrum_running
+                and session.state
+                not in (
+                    SessionState.DISCONNECTED,
+                    SessionState.DEGRADED,
+                    SessionState.RECONNECTING,
+                )
+                else None
+            ),
             last_spectrum_max_adc=(
                 None if self._last_spectrum is None else self._last_spectrum.max_adc
             ),

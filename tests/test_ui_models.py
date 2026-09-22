@@ -267,7 +267,10 @@ def test_оценка_потерь_помечена_оценкой() -> None:
         history_bytes=1,
         evicted=17,
     )
-    quality = _rows(models.device_sections(snapshot(metrics=metrics)), texts.SECTION_QUALITY)
+    quality = _rows(
+        models.device_sections(snapshot(state=SessionState.STREAMING, metrics=metrics)),
+        texts.SECTION_QUALITY,
+    )
     assert quality[texts.ROW_LOSS].value == "5.00 %"
     assert quality[texts.ROW_LOSS].note == texts.LOSS_IS_AN_ESTIMATE
 
@@ -601,3 +604,29 @@ def test_фильтр_датчиков_не_зависит_от_статуса()
     model = models.sensor_panel_model(snapshot(sensors=(alpha, beta)), filter_text="свая")
     assert [row.sensor.id for row in model.rows] == ["B"]
     assert set(model.units) == {"°C", "µε"}
+
+
+def test_устаревший_фактический_темп_не_показывается_вне_streaming() -> None:
+    metrics = PipelineMetrics(
+        frames=10,
+        parse_errors=0,
+        frame_rate_hz=1999.7,
+        expected_rate_hz=2000.0,
+        loss_estimate=0.001,
+        filled_by_channel=(2, 0, 0, 0),
+        ingest_lag_s=0.0,
+        ui_latency_s=0.0,
+        ui_updates=1,
+        ui_gates=1,
+        history_frames=100,
+        history_used=10,
+        history_bytes=1,
+        evicted=0,
+    )
+    idle = snapshot(state=SessionState.IDLE, metrics=metrics)
+
+    assert "1999.7 Гц" not in models.status_line(idle)
+    quality = _rows(models.device_sections(idle), texts.SECTION_QUALITY)
+    assert quality[texts.ROW_FRAME_RATE].value == texts.UNKNOWN
+    assert quality[texts.ROW_LOSS].value == texts.UNKNOWN
+    assert quality[texts.ROW_EXPECTED_RATE].value == "2000.00"

@@ -229,6 +229,52 @@ def test_датчики_считаются_только_когда_их_прос
         stand.close()
 
 
+def test_текущие_значения_исчезают_после_stop(rig: Rig) -> None:
+    rig.controller.replace_sensors((_temperature_sensor(),))
+    assert rig.controller.connect().ok
+    assert rig.controller.start_stream().ok
+    assert wait_until(lambda: rig.controller.pipeline.sequence >= 5)
+    live = rig.controller.snapshot(include_sensor_data=True)
+    assert live.ui is not None and len(live.sensor_readings) == 1
+
+    assert rig.controller.stop_stream().ok
+    stopped = rig.controller.snapshot(include_sensor_data=True)
+    assert stopped.state is SessionState.IDLE
+    assert stopped.ui is None
+    assert stopped.sensor_readings == ()
+    assert stopped.sensor_history is None
+
+
+def test_текущие_значения_исчезают_после_disconnect(rig: Rig) -> None:
+    rig.controller.replace_sensors((_temperature_sensor(),))
+    assert rig.controller.connect().ok
+    assert rig.controller.start_stream().ok
+    assert wait_until(lambda: rig.controller.pipeline.sequence >= 5)
+    assert rig.controller.snapshot(include_sensor_data=True).ui is not None
+
+    rig.controller.disconnect()
+    disconnected = rig.controller.snapshot(include_sensor_data=True)
+    assert disconnected.state is SessionState.DISCONNECTED
+    assert disconnected.ui is None
+    assert disconnected.sensor_readings == ()
+    assert disconnected.sensor_history is None
+
+
+def test_текущие_значения_исчезают_в_degraded(rig: Rig) -> None:
+    rig.controller.replace_sensors((_temperature_sensor(),))
+    assert rig.controller.connect().ok
+    assert rig.controller.start_stream().ok
+    assert wait_until(lambda: rig.controller.pipeline.sequence >= 5)
+    assert rig.controller.snapshot(include_sensor_data=True).ui is not None
+
+    rig.sim.go_silent(0.6)
+    assert wait_until(lambda: rig.controller.session.state is SessionState.DEGRADED)
+    degraded = rig.controller.snapshot(include_sensor_data=True)
+    assert degraded.ui is None
+    assert degraded.sensor_readings == ()
+    assert degraded.sensor_history is None
+
+
 def test_усреднение_датчика_запрашивает_raw_историю_только_по_выбранному_каналу(
     rig: Rig,
 ) -> None:
@@ -791,6 +837,36 @@ def test_спектр_во_время_записи_запрещён(rig: Rig) ->
         rig.controller.stop_recording()
 
 
+def test_блокировки_r67_r71_живут_в_controller_и_не_посылают_команд(rig: Rig) -> None:
+    rig.controller.connect().unwrap()
+    assert rig.controller.start_stream().ok
+    assert wait_until(lambda: rig.controller.session.stats().telemetry_frames > 3)
+    rig.controller.start_recording()
+    wait_for_packet_log(rig.controller)
+    before = len(rig.controller.packet_records(direction=Direction.TX))
+    profile = rig.controller.config.profile
+    try:
+        blocked = (
+            lambda: rig.controller.take_spectrum(0, 3000),
+            lambda: rig.controller.take_spectrum_async(0, 3000),
+            lambda: rig.controller.take_debug_spectra(3000),
+            lambda: rig.controller.start_spectrum_continuous(0, 0.1, 3000),
+            lambda: rig.controller.set_sweep(
+                profile.start_param,
+                profile.step_param,
+                profile.stop_param,
+                profile.adc_step_param,
+            ),
+        )
+        for action in blocked:
+            with pytest.raises(RuntimeError, match="во время записи"):
+                action()
+        wait_for_packet_log(rig.controller)
+        assert len(rig.controller.packet_records(direction=Direction.TX)) == before
+    finally:
+        rig.controller.stop_recording()
+
+
 def test_фактический_период_continuous_измеряется_по_завершённым_циклам(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -813,9 +889,11 @@ def test_фактический_период_continuous_измеряется_п�
     actual = rig.controller.snapshot().spectrum_actual_period_s
     rig.controller.stop_spectrum_continuous()
 
+    stopped = rig.controller.snapshot()
     assert actual is not None
     assert actual >= 0.045
-    assert actual > rig.controller.snapshot().spectrum_period_s * 3
+    assert actual > stopped.spectrum_period_s * 3
+    assert stopped.spectrum_actual_period_s is None
 
 
 def test_непрерывный_спектр_делает_несколько_снимков_без_наложения(rig: Rig) -> None:

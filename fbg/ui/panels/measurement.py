@@ -735,7 +735,11 @@ class MeasurementPanel(DockTab):
 
     def _update_quality(self, snapshot: AppSnapshot) -> None:
         metrics = snapshot.metrics
-        if metrics is None or metrics.frame_rate_hz <= 0.0:
+        if (
+            snapshot.state is not SessionState.STREAMING
+            or metrics is None
+            or metrics.frame_rate_hz <= 0.0
+        ):
             self.quality_label.setText("Темп: — · оценка потерь: —")
             return
         loss = (
@@ -757,8 +761,12 @@ class MeasurementPanel(DockTab):
         self._update_recording(snapshot)
         self._update_quality(snapshot)
 
-    def closeEvent(self, event: object) -> None:  # noqa: N802 — Qt
+    def wait_for_background_work(self) -> None:
+        """Дожидается собственного офлайн-потока перед закрытием приложения."""
         thread = self._average_thread
         if thread is not None and thread.is_alive():
             thread.join()
+
+    def closeEvent(self, event: object) -> None:  # noqa: N802 — Qt
+        self.wait_for_background_work()
         super().closeEvent(event)  # type: ignore[arg-type]

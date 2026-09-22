@@ -92,6 +92,10 @@ def load_layout(path: Path) -> UiLayoutState:
         raise ValueError(f"файл раскладки не читается: {exc}") from exc
     if not isinstance(raw, dict):
         raise ValueError("корень файла раскладки должен быть объектом")
+    allowed_fields = {"version", "period_ms", "locked", "docks", "window_geometry"}
+    unknown_fields = sorted(set(raw) - allowed_fields)
+    if unknown_fields:
+        raise ValueError(f"неизвестные поля раскладки: {', '.join(unknown_fields)}")
     if raw.get("version") != UI_LAYOUT_VERSION:
         raise ValueError(f"неподдерживаемая версия раскладки: {raw.get('version')!r}")
 

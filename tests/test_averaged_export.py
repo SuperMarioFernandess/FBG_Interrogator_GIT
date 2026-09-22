@@ -5,8 +5,10 @@ import numpy as np
 import pytest
 
 from fbg.core.averaging import fixed_window_average
+from fbg.core.calibration import Sensor, SensorType
 from fbg.core.profile import DeviceProfile
 from fbg.io.averaging import average_recording
+from fbg.io.recalibrate import recalibrate_recording, recording_parts
 from fbg.io.recorder import RecorderConfig, build_header, column_names, format_gap
 
 PROFILE = DeviceProfile()
@@ -20,8 +22,14 @@ def _row(frame_no: int, t_mono: float, first_nm: str) -> str:
     return ";".join(fields) + "\n"
 
 
-def _part(path: Path, part: int, lines: list[str]) -> Path:
-    config = RecorderConfig(directory=path.parent, decimation=10)
+def _part(
+    path: Path,
+    part: int,
+    lines: list[str],
+    *,
+    config: RecorderConfig | None = None,
+) -> Path:
+    config = config or RecorderConfig(directory=path.parent, decimation=10)
     columns = column_names(PROFILE.channels, 1)
     header = build_header(
         PROFILE,
@@ -209,3 +217,114 @@ def test_потоковый_экспорт_совпадает_с_общей_ок
         atol=1e-9,
         equal_nan=True,
     )
+
+
+def _sensor() -> Sensor:
+    return Sensor(
+        id="T1",
+        name="Температура",
+        channel=0,
+        type=SensorType.TEMPERATURE,
+        expected_nm=1545.0,
+        window_nm=10.0,
+        value0=20.0,
+        k1=10.0,
+    )
+
+
+def test_откалиброванные_части_усредняются_отдельно_от_сырых(tmp_path: Path) -> None:
+    _part(
+        tmp_path / "raw_a.csv",
+        1,
+        [_row(0, 0.0, "1544.0"), _row(10, 0.4, "1546.0")],
+    )
+    second = _part(
+        tmp_path / "raw_b.csv",
+        2,
+        [_row(20, 0.8, "1548.0"), _row(30, 1.2, "1550.0")],
+    )
+    calibrated = recalibrate_recording(second, (_sensor(),))
+
+    result = average_recording(calibrated.outputs[1], 1.0)
+
+    assert result.inputs == calibrated.outputs
+    assert result.output.name.endswith("_calibrated_averaged_1000ms.csv")
+    lines = _data_lines(result.output)
+    header = lines[0].split(";")
+    raw_mean = header.index("ch1_fbg1_nm_mean")
+    value_mean = header.index("sensor001_T1_value_mean")
+    first_window = lines[1].split(";")
+    assert float(first_window[raw_mean]) == pytest.approx(1546.0)
+    assert float(first_window[value_mean]) == pytest.approx(30.0)
+    assert all(path.stem.endswith("_calibrated") for path in result.inputs)
+
+
+def test_провенанс_усреднения_есть_но_не_маскируется_под_raw_шапку(tmp_path: Path) -> None:
+    config = RecorderConfig(
+        directory=tmp_path,
+        decimation=10,
+        device_model="GC-97001C-03-01-A-F",
+        serial=94401220,
+        firmware="4.10",
+    )
+    source = _part(tmp_path / "source.csv", 1, [_row(0, 0.0, "1544.0")], config=config)
+
+    result = average_recording(source, 1.0)
+    text = result.output.read_text(encoding="ascii")
+
+    assert "# source_metadata device=GC-97001C-03-01-A-F sn=94401220 fw=4.10" in text
+    assert "# source_metadata sweep_start_ghz=" in text
+    assert f"# source_metadata t_wall_start={START.isoformat()}" in text
+    assert "# source_metadata t_wall_file=" in text and "file_part=1" in text
+    assert f"# t_wall_start={START.isoformat()}" not in text
+    with pytest.raises(ValueError, match="усреднённый CSV не является частью"):
+        recording_parts(result.output)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (b"", "пустой файл"),
+        (b"a;b\n1;2\n", "не CSV записи FBG-Interrogator"),
+        (b"# only comments\n# still comments\n", "не CSV записи FBG-Interrogator"),
+    ],
+)
+def test_усреднение_чужого_или_пустого_csv_отказывает_понятно_и_не_меняет_его(
+    tmp_path: Path, payload: bytes, message: str
+) -> None:
+    source = tmp_path / "input.csv"
+    source.write_bytes(payload)
+
+    with pytest.raises(ValueError, match=message):
+        average_recording(source, 1.0)
+
+    assert source.read_bytes() == payload
+    assert not list(tmp_path.glob("*_averaged_*.csv"))
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_повторное_усреднение_готового_файла_отказывает_с_подсказкой(tmp_path: Path) -> None:
+    source = _part(tmp_path / "source.csv", 1, [_row(0, 0.0, "1544.0")])
+    averaged = average_recording(source, 1.0).output
+    before = averaged.read_bytes()
+
+    with pytest.raises(ValueError, match="усреднённый CSV не является частью"):
+        average_recording(averaged, 1.0)
+
+    assert averaged.read_bytes() == before
+
+
+def test_обрезанная_строка_усреднения_не_оставляет_готовый_или_tmp_результат(
+    tmp_path: Path,
+) -> None:
+    source = _part(tmp_path / "source.csv", 1, [_row(0, 0.0, "1544.0")])
+    with source.open("a", encoding="ascii") as handle:
+        handle.write("1;0.5;1700000000.5;1545.0")
+    before = source.read_bytes()
+
+    with pytest.raises(ValueError, match="строка содержит"):
+        average_recording(source, 1.0)
+
+    assert source.read_bytes() == before
+    assert not list(tmp_path.glob("*_averaged_*.csv"))
+    assert not list(tmp_path.glob("*.tmp"))

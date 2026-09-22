@@ -268,8 +268,13 @@ class MainWindow(QMainWindow):
         self.status_label.setText(models.status_line(snapshot))
 
     def closeEvent(self, event: object) -> None:  # noqa: N802 — Qt
-        """Сохраняет раскладку и гасит таймер перед закрытием окна."""
+        """Дожидается офлайн-работ, сохраняет раскладку и гасит таймер."""
 
+        # Вложенные DockTab не обязаны получить собственный closeEvent при
+        # закрытии родительского окна. Их non-daemon потоки иначе способны
+        # пережить окно и удержать процесс (KB_05 №34).
+        self.measurement_panel.wait_for_background_work()
+        self.sensors_panel.wait_for_background_work()
         if self._layout_path is not None:
             try:
                 save_layout(self._layout_path, self._layout_state())

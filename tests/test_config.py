@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from fbg.core.calibration import CalibrationPoint, Sensor, SensorType
 from fbg.core.endpoint import Endpoint
 from fbg.core.frames import ModuleParams, SweepConfig
 from fbg.core.pipeline import PipelineConfig
@@ -267,6 +268,39 @@ def test_битый_файл_тоже_откладывается(tmp_path: Path)
     target.write_text("{не json", encoding="utf-8")
     save(AppConfig(), target)
     assert (tmp_path / "c.json.bad").read_text(encoding="utf-8") == "{не json"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        minimal(endpoint={"device_ip": "10.0.0.5", "device_prt": 9000}),
+        minimal(endpoint={"device_ip": "10.0.0.5", "device_port": "четыре"}),
+        minimal(неизвестный_раздел={"x": 1}),
+    ],
+)
+def test_сохранение_откладывает_файл_с_любым_непонятым_содержимым(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    target = write(tmp_path / "c.json", payload)
+    original = target.read_text(encoding="utf-8")
+    assert load(target).issues
+
+    save(AppConfig(), target)
+
+    assert (tmp_path / "c.json.bad").read_text(encoding="utf-8") == original
+    assert load(target).ok
+
+
+def test_карантин_настроек_не_затирает_предыдущий_bad(tmp_path: Path) -> None:
+    target = tmp_path / "c.json"
+    target.write_text("{broken", encoding="utf-8")
+    first_bad = tmp_path / "c.json.bad"
+    first_bad.write_text("previous\n", encoding="utf-8")
+
+    save(AppConfig(), target)
+
+    assert first_bad.read_text(encoding="utf-8") == "previous\n"
+    assert (tmp_path / "c.json.bad.2").read_text(encoding="utf-8") == "{broken"
 
 
 def test_исправный_файл_перезаписывается_без_копии(tmp_path: Path) -> None:
@@ -545,6 +579,128 @@ def test_круговорот_датчиков(tmp_path: Path) -> None:
     path = save_sensors(original, tmp_path / "sensors.json")
     sensors, issues = load_sensors(path)
     assert issues == () and sensors == original
+
+
+def test_старый_датчик_без_полей_чата18_читается_с_умолчаниями(tmp_path: Path) -> None:
+    payload = {
+        "sensors": [
+            {
+                "id": "T1",
+                "channel": 0,
+                "type": 0,
+                "expected_nm": 1545.0,
+                "window_nm": 0.3,
+                "calibration_points": [{"wavelength_nm": 1545.0, "value": 25.0}],
+            }
+        ]
+    }
+    sensors, issues = load_sensors(write(tmp_path / "sensors.json", payload))
+    assert issues == ()
+    assert sensors[0].weighted_fit is True
+    assert sensors[0].calibration_points == (CalibrationPoint(1545.0, 25.0),)
+
+
+def test_неизвестные_поля_датчиков_не_теряются_при_сохранении(tmp_path: Path) -> None:
+    path = tmp_path / "sensors.json"
+    payload = {
+        "sensors": [
+            {
+                "id": "T1",
+                "name": "T",
+                "channel": 0,
+                "type": 0,
+                "expected_nm": 1545.0,
+                "window_nm": 0.3,
+                "future_sensor_field": 17,
+                "calibration_points": [
+                    {
+                        "wavelength_nm": 1545.0,
+                        "value": 25.0,
+                        "future_point_field": "keep",
+                    }
+                ],
+                "future_compensation": "keep",
+            }
+        ],
+        "future_root_field": {"keep": "me"},
+    }
+    write(path, payload)
+    original = path.read_text(encoding="utf-8")
+    loaded, issues = load_sensors(path)
+    unknown = [issue for issue in issues if issue.kind is IssueKind.UNKNOWN_FIELD]
+    assert len(loaded) == 1
+    assert {issue.location for issue in unknown} == {
+        "future_root_field",
+        "sensors[0].future_sensor_field",
+        "sensors[0].future_compensation",
+        "sensors[0].calibration_points[0].future_point_field",
+    }
+
+    replacement = Sensor(
+        id="T1",
+        name="T",
+        channel=0,
+        type=SensorType.TEMPERATURE,
+        expected_nm=1545.0,
+        window_nm=0.3,
+    )
+    save_sensors((replacement,), path)
+
+    assert (tmp_path / "sensors.json.bad").read_text(encoding="utf-8") == original
+    sensors, clean_issues = load_sensors(path)
+    assert clean_issues == () and sensors == (replacement,)
+
+
+def test_неверный_тип_new_sensor_field_карантинится_при_save(tmp_path: Path) -> None:
+    path = write(
+        tmp_path / "sensors.json",
+        {
+            "sensors": [
+                {
+                    "id": "T1",
+                    "channel": 0,
+                    "type": 0,
+                    "expected_nm": 1545.0,
+                    "window_nm": 0.3,
+                    "weighted_fit": "yes",
+                }
+            ]
+        },
+    )
+    original = path.read_text(encoding="utf-8")
+    sensors, issues = load_sensors(path)
+    assert sensors == ()
+    assert any(issue.kind is IssueKind.REJECTED_VALUE for issue in issues)
+
+    replacement = Sensor(
+        id="T1",
+        name="T",
+        channel=0,
+        type=SensorType.TEMPERATURE,
+        expected_nm=1545.0,
+        window_nm=0.3,
+    )
+    save_sensors((replacement,), path)
+    assert (tmp_path / "sensors.json.bad").read_text(encoding="utf-8") == original
+
+
+def test_сохранение_датчиков_карантинит_битый_json(tmp_path: Path) -> None:
+    path = tmp_path / "sensors.json"
+    path.write_text("{сломано", encoding="utf-8")
+    replacement = Sensor(
+        id="T1",
+        name="T",
+        channel=0,
+        type=SensorType.TEMPERATURE,
+        expected_nm=1545.0,
+        window_nm=0.3,
+    )
+
+    save_sensors((replacement,), path)
+
+    assert (tmp_path / "sensors.json.bad").read_text(encoding="utf-8") == "{сломано"
+    sensors, issues = load_sensors(path)
+    assert issues == () and sensors == (replacement,)
 
 
 def test_испорченная_запись_стоит_одной_записи(tmp_path: Path) -> None:

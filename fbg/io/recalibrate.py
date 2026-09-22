@@ -29,6 +29,11 @@ _BATCH_ROWS = 4096
 _PART_RE = re.compile(r"\bfile_part=(\d+)\b")
 _START_RE = re.compile(r"^# t_wall_start=(.+)$")
 _WAVELENGTH_COLUMN_RE = re.compile(r"^ch(\d+)_fbg(\d+)_nm$")
+_TEMPERATURE_COLUMN_RE = re.compile(r"^ch(\d+)_temp$")
+_CALIBRATED_COLUMN_RE = re.compile(r"^sensor\d{3}_.+_value$")
+
+_RAW_COLUMNS_PREFIX = ("frame_no", "t_mono", "t_wall")
+_AVERAGED_COLUMNS_PREFIX = ("window_start_mono", "window_stop_mono", "t_wall_mean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +44,40 @@ class RecalibrationResult:
     outputs: tuple[Path, ...]
     rows: int
     gaps: int
+
+
+def _csv_kind(path: Path) -> str:
+    """Определяет вид CSV по схеме колонок, а не по имени файла."""
+    try:
+        with path.open("r", encoding="ascii", errors="strict") as handle:
+            header = handle.readline()
+    except FileNotFoundError:
+        raise ValueError(f"{path}: файл не существует") from None
+    if not header:
+        raise ValueError(f"{path}: пустой файл")
+
+    columns = tuple(header.rstrip("\r\n").split(SEPARATOR))
+    if columns[:3] == _AVERAGED_COLUMNS_PREFIX:
+        return "averaged"
+    if columns[:3] != _RAW_COLUMNS_PREFIX:
+        raise ValueError(
+            f"{path}: это не CSV записи FBG-Interrogator: "
+            "ожидались первые колонки frame_no;t_mono;t_wall"
+        )
+
+    tail = columns[3:]
+    raw_count = 0
+    for name in tail:
+        if _WAVELENGTH_COLUMN_RE.match(name) or _TEMPERATURE_COLUMN_RE.match(name):
+            raw_count += 1
+            continue
+        break
+    if raw_count == len(tail):
+        return "raw"
+    extra = tail[raw_count:]
+    if raw_count and extra and all(_CALIBRATED_COLUMN_RE.match(name) for name in extra):
+        return "calibrated"
+    raise ValueError(f"{path}: схема колонок не соответствует известному формату записи")
 
 
 def _read_recording_identity(path: Path) -> tuple[str, int]:
@@ -61,29 +100,44 @@ def _read_recording_identity(path: Path) -> tuple[str, int]:
                 part = int(part_match.group(1))
             if started is not None and part is not None:
                 return started, part
-    raise ValueError(f"{path}: в шапке нет t_wall_start/file_part")
+    raise ValueError(
+        f"{path}: в шапке нет t_wall_start/file_part; "
+        "это не часть записи Recorder либо шапка повреждена"
+    )
 
 
 def recording_parts(path: Path) -> tuple[Path, ...]:
-    """Находит все части ротации той же записи и сортирует по `file_part`."""
+    """Находит части ротации того же вида и сортирует по `file_part`."""
     target = path.resolve()
+    target_kind = _csv_kind(target)
+    if target_kind == "averaged":
+        raise ValueError(
+            f"{path}: усреднённый CSV не является частью исходной записи; "
+            "выберите сырую либо *_calibrated часть записи"
+        )
     started, _part = _read_recording_identity(target)
     found: list[tuple[int, Path]] = []
     for candidate in target.parent.glob("*.csv"):
-        if candidate.stem.endswith("_calibrated"):
-            continue
         try:
             candidate_started, candidate_part = _read_recording_identity(candidate)
         except (OSError, UnicodeError, ValueError):
             continue
-        if candidate_started == started:
+        if candidate_started != started:
+            continue
+        try:
+            candidate_kind = _csv_kind(candidate)
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise ValueError(
+                f"{candidate}: часть той же записи, но её формат не удалось определить: {exc}"
+            ) from exc
+        if candidate_kind == target_kind:
             found.append((candidate_part, candidate))
-    if not found:
-        return (target,)
     found.sort(key=lambda item: item[0])
     parts = tuple(candidate for _part_no, candidate in found)
     if target not in tuple(candidate.resolve() for candidate in parts):
-        raise ValueError(f"{path}: выбранный файл не найден среди частей своей записи")
+        raise ValueError(
+            f"{path}: файл имеет идентификаторы записи, но не найден среди её частей того же вида"
+        )
     return parts
 
 
@@ -259,6 +313,17 @@ def recalibrate_recording(path: Path, sensors: tuple[Sensor, ...]) -> Recalibrat
     problems = validate_sensors(sensors)
     if problems:
         raise ValueError("; ".join(problems))
+    kind = _csv_kind(path.resolve())
+    if kind == "calibrated":
+        raise ValueError(
+            f"{path}: файл уже откалиброван; для повторного пересчёта "
+            "выберите соответствующую сырую часть записи"
+        )
+    if kind == "averaged":
+        raise ValueError(
+            f"{path}: усреднённый CSV нельзя пересчитать в физические величины; "
+            "сначала пересчитайте исходную сырую запись, затем усредните *_calibrated.csv"
+        )
     parts = recording_parts(path)
     outputs: list[Path] = []
     rows = 0

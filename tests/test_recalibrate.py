@@ -8,6 +8,7 @@ import pytest
 
 from fbg.core.calibration import Sensor, SensorType
 from fbg.core.profile import DeviceProfile
+from fbg.io.averaging import average_recording
 from fbg.io.recalibrate import calibrated_path, recalibrate_recording, recording_parts
 from fbg.io.recorder import RecorderConfig, build_header, column_names
 
@@ -149,3 +150,61 @@ def test_вход_читается_numpy_после_пересчёта(tmp_path:
     assert data.dtype.names[-1] == "sensor001_T1_value"
     assert data["sensor001_T1_value"][0] == pytest.approx(25.0)
     assert np.isnan(data["sensor001_T1_value"][1])
+
+
+def test_повторный_пересчёт_calibrated_отказывает_с_подсказкой(tmp_path: Path) -> None:
+    source = make_part(tmp_path / "data_0001.csv", 1, [row(0, "1544.8000")])
+    calibrated = recalibrate_recording(source, (sensor(),)).outputs[0]
+    before = calibrated.read_bytes()
+
+    with pytest.raises(ValueError, match=r"уже откалиброван.*сырую часть"):
+        recalibrate_recording(calibrated, (sensor(),))
+
+    assert calibrated.read_bytes() == before
+
+
+def test_пересчёт_averaged_объясняет_правильный_порядок(tmp_path: Path) -> None:
+    source = make_part(tmp_path / "data_0001.csv", 1, [row(0, "1544.8000")])
+    averaged = average_recording(source, 1.0).output
+    before = averaged.read_bytes()
+
+    with pytest.raises(ValueError, match=r"сначала пересчитайте.*затем усредните"):
+        recalibrate_recording(averaged, (sensor(),))
+
+    assert averaged.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (b"", "пустой файл"),
+        (b"a;b\n1;2\n", "не CSV записи FBG-Interrogator"),
+        (b"# only comments\n# still comments\n", "не CSV записи FBG-Interrogator"),
+    ],
+)
+def test_пересчёт_чужого_или_пустого_csv_отказывает_понятно_и_не_меняет_его(
+    tmp_path: Path, payload: bytes, message: str
+) -> None:
+    source = tmp_path / "input.csv"
+    source.write_bytes(payload)
+
+    with pytest.raises(ValueError, match=message):
+        recalibrate_recording(source, (sensor(),))
+
+    assert source.read_bytes() == payload
+    assert not calibrated_path(source).exists()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_обрезанная_строка_пересчёта_не_оставляет_готовый_или_tmp_файл(tmp_path: Path) -> None:
+    source = make_part(tmp_path / "data_0001.csv", 1, [row(0, "1544.8000")])
+    with source.open("a", encoding="ascii") as handle:
+        handle.write("1;0.1;1700000001;1544.8")
+    before = source.read_bytes()
+
+    with pytest.raises(ValueError, match="строка данных содержит"):
+        recalibrate_recording(source, (sensor(),))
+
+    assert source.read_bytes() == before
+    assert not calibrated_path(source).exists()
+    assert not list(tmp_path.glob("*.tmp"))

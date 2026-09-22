@@ -139,6 +139,27 @@ IDENTITY_FIELDS: frozenset[str] = frozenset({"device_model", "serial", "firmware
 #: проверяется тестом, который подставляет сюда шаг.
 MIGRATIONS: dict[int, typing.Callable[[dict[str, object]], dict[str, object]]] = {}
 
+_SENSOR_FIELDS = frozenset(
+    {
+        "id",
+        "name",
+        "channel",
+        "type",
+        "expected_nm",
+        "window_nm",
+        "value0",
+        "k1",
+        "k2",
+        "weighted_fit",
+        "calibration_points",
+        "up_limit",
+        "down_limit",
+        "compensation",
+    }
+)
+_CALIBRATION_POINT_FIELDS = frozenset({"wavelength_nm", "value", "n", "sigma_nm"})
+_COMPENSATION_FIELDS = frozenset({"reference", "coeff", "base"})
+
 
 class IssueKind(StrEnum):
     """Что именно не так с прочитанным."""
@@ -708,25 +729,31 @@ def load(path: Path | None = None) -> LoadResult:
     )
 
 
+def _quarantine_path(path: Path) -> Path:
+    """Свободное имя карантина, не затирающее предыдущие ``*.bad``."""
+    backup = path.with_name(path.name + ".bad")
+    suffix = 2
+    while backup.exists():
+        backup = path.with_name(f"{path.name}.bad.{suffix}")
+        suffix += 1
+    return backup
+
+
+def _quarantine(path: Path) -> Path:
+    backup = _quarantine_path(path)
+    path.replace(backup)
+    return backup
+
+
 def save(config: AppConfig, path: Path | None = None) -> Path:
-    """Сохраняет настройки. Возвращает путь записанного файла.
-
-    Запись атомарная — через временный файл рядом и `os.replace`, — поэтому
-    оборванное сохранение не оставляет полуфайла настроек.
-
-    Файл, который `load` прочитать не смог (битый JSON, версия новее),
-    не затирается, а переименовывается в `<имя>.bad`. Причина одна и та же
-    для обоих случаев: там лежит то, чего мы не понимаем, а стирание —
-    единственное необратимое действие, доступное этому модулю.
-
-    `OSError` не перехватывается: не записавшиеся настройки — отказ, о котором
-    пользователь обязан узнать, а не поле в отчёте.
-    """
+    """Сохраняет настройки, не затирая непонятое прежнее содержимое."""
     target = path or default_path()
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    if target.exists() and not load(target).readable:
-        target.replace(target.with_name(target.name + ".bad"))
+    if target.exists():
+        loaded = load(target)
+        if not loaded.readable or loaded.issues:
+            _quarantine(target)
 
     payload = json.dumps(to_json(config), ensure_ascii=False, indent=2, sort_keys=False)
     temporary = target.with_name(target.name + ".tmp")
@@ -738,6 +765,21 @@ def save(config: AppConfig, path: Path | None = None) -> Path:
 # --------------------------------------------------------------------------------------
 # Файл калибровок
 # --------------------------------------------------------------------------------------
+
+
+def _unknown_sensor_fields(
+    source: Mapping[str, object],
+    allowed: frozenset[str],
+    location: str,
+) -> tuple[ConfigIssue, ...]:
+    return tuple(
+        ConfigIssue(
+            IssueKind.UNKNOWN_FIELD,
+            f"{location}.{name}" if location else name,
+            "поле неизвестно и пропущено",
+        )
+        for name in sorted(set(source) - allowed)
+    )
 
 
 def load_sensors(path: Path) -> tuple[tuple[Sensor, ...], tuple[ConfigIssue, ...]]:
@@ -771,6 +813,8 @@ def load_sensors(path: Path) -> tuple[tuple[Sensor, ...], tuple[ConfigIssue, ...
             ),
         )
 
+    issues.extend(_unknown_sensor_fields(raw, frozenset({SENSORS_KEY}), ""))
+
     # Файлы до чата №15 использовали абсолютный полином c0+c1·λ+c2·λ².
     # Автоматической миграции нет: коэффициенты могли быть введены вручную,
     # а молча принять их как новую опорную форму означало бы получить
@@ -796,6 +840,27 @@ def load_sensors(path: Path) -> tuple[tuple[Sensor, ...], tuple[ConfigIssue, ...
         if not isinstance(item, Mapping):
             issues.append(ConfigIssue(IssueKind.WRONG_TYPE, location, "ожидался объект"))
             continue
+        issues.extend(_unknown_sensor_fields(item, _SENSOR_FIELDS, location))
+        raw_points = item.get("calibration_points", [])
+        if isinstance(raw_points, list):
+            for point_index, raw_point in enumerate(raw_points):
+                if isinstance(raw_point, Mapping):
+                    issues.extend(
+                        _unknown_sensor_fields(
+                            raw_point,
+                            _CALIBRATION_POINT_FIELDS,
+                            f"{location}.calibration_points[{point_index}]",
+                        )
+                    )
+        raw_compensation = item.get("compensation")
+        if isinstance(raw_compensation, Mapping):
+            issues.extend(
+                _unknown_sensor_fields(
+                    raw_compensation,
+                    _COMPENSATION_FIELDS,
+                    f"{location}.compensation",
+                )
+            )
         try:
             sensors.append(sensor_from_json(item))
         except ValueError as exc:
@@ -808,13 +873,8 @@ def save_sensors(sensors: Sequence[Sensor], path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         _loaded, issues = load_sensors(path)
-        if any(issue.kind is IssueKind.FILE_UNREADABLE for issue in issues):
-            backup = path.with_name(path.name + ".bad")
-            suffix = 2
-            while backup.exists():
-                backup = path.with_name(f"{path.name}.bad.{suffix}")
-                suffix += 1
-            path.replace(backup)
+        if issues:
+            _quarantine(path)
     payload = json.dumps(sensors_to_json(sensors), ensure_ascii=False, indent=2)
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(payload + "\n", encoding="utf-8")
