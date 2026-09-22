@@ -44,6 +44,7 @@ jobs:
           pip install numpy pytest pytest-cov ruff
       - name: Ruff
         run: |
+          ruff format fbg tests main.py
           ruff check fbg tests main.py
           ruff format --check fbg tests main.py
       - name: Core tests
