@@ -25,7 +25,14 @@ jobs:
           python - <<'PY'
           import base64, gzip
           from pathlib import Path
-          payload = Path(".chat19-validation/chat19_patch.mbox.gz.b64").read_text(encoding="ascii")
+          parts = (
+              ".chat19-validation/gzchunk_00",
+              ".chat19-validation/gzchunk_01",
+              ".chat19-validation/gz2_0",
+              ".chat19-validation/gz2_1",
+              ".chat19-validation/gz2_2",
+          )
+          payload = "".join(Path(part).read_text(encoding="ascii") for part in parts)
           Path("chat19_validation.mbox").write_bytes(gzip.decompress(base64.b64decode(payload)))
           PY
           git config user.name "ChatGPT validation"
@@ -62,7 +69,14 @@ jobs:
           python - <<'PY'
           import base64, gzip
           from pathlib import Path
-          payload = Path(".chat19-validation/chat19_patch.mbox.gz.b64").read_text(encoding="ascii")
+          parts = (
+              ".chat19-validation/gzchunk_00",
+              ".chat19-validation/gzchunk_01",
+              ".chat19-validation/gz2_0",
+              ".chat19-validation/gz2_1",
+              ".chat19-validation/gz2_2",
+          )
+          payload = "".join(Path(part).read_text(encoding="ascii") for part in parts)
           Path("chat19_validation.mbox").write_bytes(gzip.decompress(base64.b64decode(payload)))
           PY
           git config user.name "ChatGPT validation"
@@ -93,7 +107,14 @@ jobs:
           python - <<'PY'
           import base64, gzip
           from pathlib import Path
-          payload = Path(".chat19-validation/chat19_patch.mbox.gz.b64").read_text(encoding="ascii")
+          parts = (
+              ".chat19-validation/gzchunk_00",
+              ".chat19-validation/gzchunk_01",
+              ".chat19-validation/gz2_0",
+              ".chat19-validation/gz2_1",
+              ".chat19-validation/gz2_2",
+          )
+          payload = "".join(Path(part).read_text(encoding="ascii") for part in parts)
           Path("chat19_validation.mbox").write_bytes(gzip.decompress(base64.b64decode(payload)))
           PY
           git config user.name "ChatGPT validation"
