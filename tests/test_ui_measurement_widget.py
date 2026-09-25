@@ -18,7 +18,6 @@ import pytest
 pytest.importorskip("PySide6", reason="тесты интерфейса требуют Qt")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QFileDialog
 
 from fbg.core.endpoint import Endpoint
@@ -107,15 +106,10 @@ def snapshot_with_recording(
     )
 
 
-def test_панель_строится_с_4x30_выбором(panel: MeasurementPanel) -> None:
-    assert panel.trace_tree.topLevelItemCount() == 4
-    assert (
-        sum(
-            panel.trace_tree.topLevelItem(channel).childCount()  # type: ignore[union-attr]
-            for channel in range(panel.trace_tree.topLevelItemCount())
-        )
-        == 120
-    )
+def test_панель_строится_с_таблицей_120_позиций_и_lambda0(panel: MeasurementPanel) -> None:
+    assert panel.position_table.rowCount() == 120
+    assert panel.position_table.columnCount() == 5
+    assert len(panel._slot_lambda0) == 120
     selected = panel.selected_slots()
     assert selected == tuple(models.SlotRef(0, position) for position in range(4))
     assert panel.table_model.rowCount() == 30
@@ -193,9 +187,12 @@ def test_таблица_кадра_сохраняет_прокрутку_и_вы
 def test_график_держит_только_копию_а_не_кольцо(
     panel: MeasurementPanel, controller: AppController
 ) -> None:
+    panel._start_graph()
     start = time.perf_counter()
-    for index in range(10):
+    for index in range(240):
         controller.pipeline.on_telemetry(REAL_FRAME, start + index * 0.0005)
+        if index % 80 == 79:
+            controller.snapshot(include_trace_history=False, include_sensor_data=False)
     controller.pipeline.publish_now()
     panel.refresh(controller.snapshot())
 
@@ -207,18 +204,26 @@ def test_график_держит_только_копию_а_не_кольцо(
     assert not isinstance(panel.table_model.model, RingHistory)
 
 
-def test_снятие_флажка_убирает_линию(panel: MeasurementPanel, controller: AppController) -> None:
-    controller.pipeline.on_telemetry(REAL_FRAME, time.perf_counter())
+def test_снятие_флажка_убирает_линию_и_не_меняет_lambda0(
+    panel: MeasurementPanel, controller: AppController
+) -> None:
+    controller.set_measurement_lambda0(0, 0, 1545.0)
+    controller.set_measurement_lambda0(0, 1, 1546.0)
+    panel._start_graph()
+    start = time.perf_counter()
+    for index in range(240):
+        controller.pipeline.on_telemetry(REAL_FRAME, start + index * 0.0005)
+        if index % 80 == 79:
+            controller.snapshot(include_trace_history=False, include_sensor_data=False)
     controller.pipeline.publish_now()
     panel.refresh(controller.snapshot())
     assert models.SlotRef(0, 0) in panel._curves
 
-    channel = panel.trace_tree.topLevelItem(0)
-    assert channel is not None
-    first = channel.child(0)
-    first.setCheckState(0, Qt.CheckState.Unchecked)
+    panel._slot_checks[models.SlotRef(0, 0)].setChecked(False)
     panel.refresh(controller.snapshot())
     assert models.SlotRef(0, 0) not in panel._curves
+    assert controller.measurement_lambda0(0, 0) == pytest.approx(1545.0)
+    assert controller.measurement_lambda0(0, 1) == pytest.approx(1546.0)
 
 
 def test_полоса_sigma_имеет_непустой_путь_и_разрывается_на_nan(
@@ -227,32 +232,37 @@ def test_полоса_sigma_имеет_непустой_путь_и_разрыв
     controller: AppController,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Регрессия чата №18: проверяется геометрия FillBetweenItem, не visible."""
     slot = models.SlotRef(0, 0)
-    t_s = np.asarray([-6.0, -5.0, -4.0, -3.0, -2.0, -1.0, 0.0])
-    delta = np.asarray([0.0, 0.01, 0.02, np.nan, 0.03, 0.04, 0.05])
+    t_s = np.asarray([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    values = np.asarray([0.0, 0.01, 0.02, np.nan, 0.03, 0.04, 0.05])
     sigma = np.asarray([0.002, 0.002, 0.002, np.nan, 0.002, 0.002, 0.002])
-    graph = models.MeasurementGraphModel(
+    graph = models.MeasurementHistoryGraphModel(
         t_s=t_s,
         traces=(
-            models.GraphTrace(
+            models.MeasurementHistoryTrace(
                 slot=slot,
-                delta_nm=delta,
-                baseline_nm=1550.0,
-                latest_nm=1550.05,
-                valid_points=6,
+                values_nm=values,
+                min_nm=values - 0.003,
+                max_nm=values + 0.003,
                 sigma_nm=sigma,
                 n=np.asarray([10, 10, 10, 0, 10, 10, 10]),
+                latest_nm=1550.05,
+                lambda0_nm=1550.0,
             ),
         ),
         y_min_nm=-0.01,
         y_max_nm=0.06,
-        history_span_s=6.0,
-        averaging_window_s=0.05,
+        version=1,
+        running=True,
+        mode="delta",
+        averaging_window_s=0.1,
+        selected=(slot,),
+        lambda0_key=((0, 0, 1550.0),),
     )
-    monkeypatch.setattr(models, "measurement_graph_model", lambda *args, **kwargs: graph)
+    monkeypatch.setattr(models, "measurement_history_graph_model", lambda *args, **kwargs: graph)
     panel.averaging_enabled.blockSignals(True)
     panel.averaging_enabled.setChecked(True)
+    panel.averaging_window.setValue(100.0)
     panel.averaging_enabled.blockSignals(False)
 
     panel._update_graph(controller.snapshot(include_sensor_data=False))
@@ -264,12 +274,13 @@ def test_полоса_sigma_имеет_непустой_путь_и_разрыв
     assert len(polygons) > 1
 
 
-def test_глубина_истории_ограничена_кольцом_10_секунд_на_2кгц(
+def test_глубина_истории_по_умолчанию_сутки_и_оценка_подписана(
     panel: MeasurementPanel, controller: AppController
 ) -> None:
-    snapshot = controller.snapshot()
-    panel.refresh(snapshot)
-    assert panel.history_spin.maximum() == pytest.approx(10.0)
+    panel.refresh(controller.snapshot())
+    assert panel.history_spin.value() == pytest.approx(24.0)
+    assert panel.history_spin.maximum() == pytest.approx(168.0)
+    assert "Оценка" in panel.history_memory.text()
 
 
 def test_состояние_записи_управляет_кнопками(panel: MeasurementPanel, tmp_path: Path) -> None:

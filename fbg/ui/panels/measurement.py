@@ -1,10 +1,4 @@
-"""Панель измерения: λ(t), таблица слотов и управление записью.
-
-UI получает данные только через `AppSnapshot`. Историю графика копирует сам
-pipeline по запросу выбранных позиций; `RingHistory` сюда не попадает (Р36).
-Один общий таймер главного окна (по умолчанию 10 Гц) обновляет панель — никаких сигналов
-на каждый кадр и никакого файлового I/O в колбэках ядра.
-"""
+"""Панель измерения: пользовательский самописец λ(t)/Δλ(t), таблица и запись CSV."""
 
 import math
 import threading
@@ -15,6 +9,7 @@ import pyqtgraph as pg
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -26,8 +21,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QTableView,
-    QTreeWidget,
-    QTreeWidgetItem,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -37,28 +32,17 @@ from fbg.io.averaging import AveragingExportResult, average_recording
 from fbg.ui import models, texts
 from fbg.ui.app import AppController
 from fbg.ui.docking import DockTab
+from fbg.ui.graph_range import GraphRangeControls
+from fbg.ui.history import can_aggregate_exactly, history_memory_estimate_bytes
 from fbg.ui.models import AppSnapshot, MeasurementTableModel, SlotRef
 
-#: Дефолт не означает «датчики 1–4». Это четыре первых **слота** канала 1,
-#: которые прибор заполняет по мере обнаружения пиков (Р30).
 DEFAULT_SELECTED_SLOTS = 4
-
-#: Нижняя граница настройки истории. Меньше одного такта UI практического
-#: смысла не имеет, но 50 мс совпадает с периодом публикации pipeline.
-MIN_HISTORY_S = 0.05
-
-#: Ось Y сжимается раз в секунду, а расширяется на новом выбросе сразу.
-#: Это убирает дрожание масштаба без риска спрятать краткий выброс.
-Y_RANGE_RECALC_TICKS = 10
+MIN_HISTORY_HOURS = 0.01
+MAX_HISTORY_HOURS = 168.0
 
 
 class _MeasurementQtTableModel(QAbstractTableModel):
-    """Qt-обёртка над неизменяемой моделью последнего кадра.
-
-    При неизменной геометрии кадр подменяется одним ``dataChanged`` на весь
-    диапазон значений. ``modelReset`` оставлен только для реальной смены
-    числа каналов/позиций: иначе прокрутка и выделение слетали бы 10 раз/с.
-    """
+    """Qt-обёртка над последним кадром; штатный такт не сбрасывает таблицу."""
 
     def __init__(self, model: MeasurementTableModel, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -69,12 +53,6 @@ class _MeasurementQtTableModel(QAbstractTableModel):
         return self._model
 
     def replace(self, model: MeasurementTableModel) -> None:
-        """Подменяет кадр без сброса таблицы при неизменной геометрии.
-
-        ``modelReset`` десять раз в секунду сбрасывает выделение и прокрутку.
-        Геометрия 4×30 меняется только при принятии другого профиля; обычный
-        кадр поэтому обновляется одним ``dataChanged``.
-        """
         same_shape = (
             self._model.channels == model.channels and self._model.positions == model.positions
         )
@@ -92,20 +70,15 @@ class _MeasurementQtTableModel(QAbstractTableModel):
             )
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: B008, N802
-        if parent.isValid():
-            return 0
-        return self._model.positions
+        return 0 if parent.isValid() else self._model.positions
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: B008, N802
-        if parent.isValid():
-            return 0
-        return 1 + self._model.channels
+        return 0 if parent.isValid() else 1 + self._model.channels
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> object:
         if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
             return None
-        row = index.row()
-        column = index.column()
+        row, column = index.row(), index.column()
         if column == 0:
             return str(row + 1)
         channel = column - 1
@@ -124,12 +97,11 @@ class _MeasurementQtTableModel(QAbstractTableModel):
             return str(section + 1)
         if section == 0:
             return texts.TABLE_POSITION
-        channel = section - 1
-        return f"К{channel + 1} {texts.TABLE_WAVELENGTH}"
+        return f"К{section} {texts.TABLE_WAVELENGTH}"
 
 
 class MeasurementPanel(DockTab):
-    """График выбранных слотов, таблица 4×30 и запись CSV."""
+    """График с пользовательским λ₀, текущий кадр и неизменённая запись CSV."""
 
     layout_key = "measurement"
 
@@ -141,23 +113,47 @@ class MeasurementPanel(DockTab):
         self._record_settings_dirty = False
         self._curves: dict[SlotRef, pg.PlotDataItem] = {}
         self._bands: dict[SlotRef, tuple[pg.PlotDataItem, pg.PlotDataItem, pg.FillBetweenItem]] = {}
-        self._graph_model: models.MeasurementGraphModel | None = None
-        self._graph_ticks = 0
+        self._range_bands: dict[
+            SlotRef, tuple[pg.PlotDataItem, pg.PlotDataItem, pg.FillBetweenItem]
+        ] = {}
+        self._graph_model: models.MeasurementHistoryGraphModel | None = None
+        self._slot_checks: dict[SlotRef, QCheckBox] = {}
+        self._slot_current: dict[SlotRef, QTableWidgetItem] = {}
+        self._slot_lambda0: dict[SlotRef, QLineEdit] = {}
         self._average_thread: threading.Thread | None = None
         self._average_result: AveragingExportResult | None = None
         self._average_error: str | None = None
         self._average_reported = False
 
         profile = controller.config.profile
-        self.trace_tree = QTreeWidget()
-        self.trace_tree.setHeaderHidden(True)
-        self.trace_tree.setMinimumWidth(210)
+        self.position_table = QTableWidget(profile.channels * profile.fbg_per_channel, 5)
+        self.position_table.setHorizontalHeaderLabels(
+            ["Показывать", "Позиция", "Текущая λ, нм", "λ₀, нм", ""]
+        )
+        self.position_table.setAlternatingRowColors(True)
+        self.position_table.verticalHeader().setVisible(False)
+        self.position_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.position_table.setMinimumWidth(470)
+        self.set_all_lambda0_button = QPushButton(texts.BUTTON_LAMBDA0_ALL_CHECKED)
+        self.slot_warning = QLabel(texts.GRAPH_LAMBDA0_SLOT_WARNING)
+        self.slot_warning.setWordWrap(True)
+        self.slot_warning.setToolTip(texts.GRAPH_LAMBDA0_SLOT_WARNING)
+
         self.history_spin = QDoubleSpinBox()
         self.history_spin.setDecimals(2)
-        self.history_spin.setSingleStep(0.5)
-        self.history_spin.setRange(MIN_HISTORY_S, 86_400.0)
-        self.history_spin.setValue(5.0)
+        self.history_spin.setSingleStep(1.0)
+        self.history_spin.setRange(MIN_HISTORY_HOURS, MAX_HISTORY_HOURS)
+        self.history_spin.setValue(24.0)
         self.history_spin.setMaximumWidth(140)
+        self.history_memory = QLabel()
+        self.history_memory.setWordWrap(True)
+        self.graph_mode = QComboBox()
+        self.graph_mode.addItem(texts.GRAPH_MODE_DELTA, "delta")
+        self.graph_mode.addItem(texts.GRAPH_MODE_ABSOLUTE, "absolute")
+        self.start_graph_button = QPushButton(texts.BUTTON_GRAPH_START)
+        self.stop_graph_button = QPushButton(texts.BUTTON_GRAPH_STOP)
+        self.clear_graph_button = QPushButton(texts.BUTTON_GRAPH_CLEAR)
+
         self.averaging_enabled = QCheckBox()
         self.averaging_enabled.setChecked(False)
         self.averaging_window = QDoubleSpinBox()
@@ -169,19 +165,18 @@ class MeasurementPanel(DockTab):
         self.averaging_sigma = QCheckBox()
         self.averaging_sigma.setChecked(True)
         self.averaging_n = QLabel()
+        self.averaging_notice = QLabel()
+        self.averaging_notice.setWordWrap(True)
 
         self.plot = pg.PlotWidget()
-        self.plot.setMinimumHeight(220)
-        # Длинная история графика измерения прореживается **только при
-        # отрисовке**. `peak` сохраняет краткие выбросы; `mean` здесь нельзя —
-        # он усреднил бы пропавший на один кадр пик. Исходные точки остаются
-        # в копии истории и в файле без изменений (Р76).
+        self.plot.setMinimumHeight(120)
         self.plot.setDownsampling(auto=True, mode="peak")
         self.plot.setClipToView(True)
         self.plot.setLabel("bottom", texts.GRAPH_AXIS_TIME)
         self.plot.setLabel("left", texts.GRAPH_AXIS_DELTA_NM)
         self.plot.showGrid(x=True, y=True, alpha=0.2)
         self.plot.addLegend()
+        self.range_controls = GraphRangeControls(self.plot)
         self.graph_hint = QLabel(texts.GRAPH_BASELINE_HINT)
         self.graph_hint.setWordWrap(True)
         self.empty_graph_label = QLabel(texts.EMPTY_GRAPH_HINT)
@@ -229,61 +224,81 @@ class MeasurementPanel(DockTab):
         self.average_recording_state = QLabel()
         self.average_recording_state.setWordWrap(True)
 
-        self._build_trace_tree(profile.channels, profile.fbg_per_channel)
+        self._build_position_table(profile.channels, profile.fbg_per_channel)
         self._build_layout()
         self._connect_signals()
-        self._sync_trace_request()
-        self.refresh(controller.snapshot())
+        self._sync_history_request()
+        self.refresh(controller.snapshot(include_sensor_data=False))
 
-    # --- Компоновка -----------------------------------------------------------------
-
-    def _build_trace_tree(self, channels: int, positions: int) -> None:
-        """Строит дерево выбора. Данные Qt — строки, не кортежи (KB_05 №36)."""
+    def _build_position_table(self, channels: int, positions: int) -> None:
         self._selection_loading = True
         try:
-            self.trace_tree.clear()
+            row = 0
             for channel in range(channels):
-                channel_item = QTreeWidgetItem([texts.channel_label(channel)])
-                self.trace_tree.addTopLevelItem(channel_item)
                 for position in range(positions):
                     slot = SlotRef(channel, position)
-                    item = QTreeWidgetItem([f"Позиция {position + 1}"])
-                    item.setData(0, Qt.ItemDataRole.UserRole, models.slot_token(slot))
-                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                    checked = channel == 0 and position < DEFAULT_SELECTED_SLOTS
-                    item.setCheckState(
-                        0,
-                        Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked,
+                    check = QCheckBox()
+                    check.setChecked(channel == 0 and position < DEFAULT_SELECTED_SLOTS)
+                    check.toggled.connect(
+                        lambda _checked, current=slot: self._on_slot_checked(current)
                     )
-                    channel_item.addChild(item)
-                channel_item.setExpanded(channel == 0)
+                    self.position_table.setCellWidget(row, 0, check)
+                    label = QTableWidgetItem(texts.slot_label(channel, position))
+                    label.setFlags(label.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    self.position_table.setItem(row, 1, label)
+                    current = QTableWidgetItem(texts.UNKNOWN)
+                    current.setFlags(current.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    self.position_table.setItem(row, 2, current)
+                    edit = QLineEdit()
+                    edit.setPlaceholderText("нет λ₀ — Δλ скрыта")
+                    edit.setToolTip(texts.GRAPH_LAMBDA0_SLOT_WARNING)
+                    edit.editingFinished.connect(lambda current=slot: self._lambda0_edited(current))
+                    self.position_table.setCellWidget(row, 3, edit)
+                    button = QPushButton(texts.BUTTON_LAMBDA0_CURRENT)
+                    button.clicked.connect(
+                        lambda _checked=False, current=slot: self._take_lambda0(current)
+                    )
+                    self.position_table.setCellWidget(row, 4, button)
+                    self._slot_checks[slot] = check
+                    self._slot_current[slot] = current
+                    self._slot_lambda0[slot] = edit
+                    row += 1
         finally:
             self._selection_loading = False
 
     def _build_layout(self) -> None:
-        selection_controls = QGridLayout()
-        selection_controls.addWidget(QLabel(texts.LABEL_GRAPH_HISTORY), 0, 0)
-        selection_controls.addWidget(self.history_spin, 0, 1)
-        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_ENABLED), 0, 2)
-        selection_controls.addWidget(self.averaging_enabled, 0, 3)
-        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_WINDOW), 1, 0)
-        selection_controls.addWidget(self.averaging_window, 1, 1)
-        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_FRAMES), 1, 2)
-        selection_controls.addWidget(self.averaging_frames, 1, 3)
-        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_SIGMA), 2, 0)
-        selection_controls.addWidget(self.averaging_sigma, 2, 1)
-        selection_controls.addWidget(QLabel(texts.LABEL_AVERAGING_N), 2, 2)
-        selection_controls.addWidget(self.averaging_n, 2, 3)
-        selection_controls.setColumnStretch(3, 1)
-        selection_controls.setVerticalSpacing(0)
+        controls = QGridLayout()
+        controls.addWidget(QLabel(texts.LABEL_GRAPH_HISTORY), 0, 0)
+        controls.addWidget(self.history_spin, 0, 1)
+        controls.addWidget(self.history_memory, 0, 2, 1, 4)
+        controls.addWidget(QLabel(texts.LABEL_GRAPH_MODE), 1, 0)
+        controls.addWidget(self.graph_mode, 1, 1)
+        controls.addWidget(self.start_graph_button, 1, 2)
+        controls.addWidget(self.stop_graph_button, 1, 3)
+        controls.addWidget(self.clear_graph_button, 1, 4)
+        controls.addWidget(QLabel(texts.LABEL_AVERAGING_ENABLED), 2, 0)
+        controls.addWidget(self.averaging_enabled, 2, 1)
+        controls.addWidget(QLabel(texts.LABEL_AVERAGING_WINDOW), 2, 2)
+        controls.addWidget(self.averaging_window, 2, 3)
+        controls.addWidget(QLabel(texts.LABEL_AVERAGING_FRAMES), 3, 0)
+        controls.addWidget(self.averaging_frames, 3, 1)
+        controls.addWidget(QLabel(texts.LABEL_AVERAGING_SIGMA), 3, 2)
+        controls.addWidget(self.averaging_sigma, 3, 3)
+        controls.addWidget(QLabel(texts.LABEL_AVERAGING_N), 4, 0)
+        controls.addWidget(self.averaging_n, 4, 1)
+        controls.addWidget(self.averaging_notice, 4, 2, 1, 4)
+        controls.setColumnStretch(5, 1)
         selection_layout = QVBoxLayout()
-        selection_layout.addLayout(selection_controls)
-        selection_layout.addWidget(self.trace_tree, 1)
+        selection_layout.addLayout(controls)
+        selection_layout.addWidget(self.set_all_lambda0_button)
+        selection_layout.addWidget(self.slot_warning)
+        selection_layout.addWidget(self.position_table, 1)
         selection_box = QWidget()
         selection_box.setLayout(selection_layout)
 
         graph_layout = QVBoxLayout()
         graph_layout.addWidget(self.quality_label)
+        graph_layout.addWidget(self.range_controls)
         graph_layout.addWidget(self.empty_graph_label, 1)
         graph_layout.addWidget(self.plot, 1)
         graph_layout.addWidget(self.graph_hint)
@@ -347,33 +362,23 @@ class MeasurementPanel(DockTab):
         self.reset_layout()
 
     def _apply_default_splits(self) -> None:
-        self.splitDockWidget(
-            self.selection_dock,
-            self.table_dock,
-            Qt.Orientation.Vertical,
-        )
-        self.splitDockWidget(
-            self.graph_dock,
-            self.record_dock,
-            Qt.Orientation.Vertical,
-        )
+        self.splitDockWidget(self.selection_dock, self.table_dock, Qt.Orientation.Vertical)
+        self.splitDockWidget(self.graph_dock, self.record_dock, Qt.Orientation.Vertical)
         self.resizeDocks(
-            [self.selection_dock, self.graph_dock],
-            [270, 780],
-            Qt.Orientation.Horizontal,
+            [self.selection_dock, self.graph_dock], [400, 700], Qt.Orientation.Horizontal
         )
-        self.resizeDocks(
-            [self.graph_dock, self.record_dock],
-            [430, 250],
-            Qt.Orientation.Vertical,
-        )
+        self.resizeDocks([self.graph_dock, self.record_dock], [430, 250], Qt.Orientation.Vertical)
 
     def _connect_signals(self) -> None:
-        self.trace_tree.itemChanged.connect(self._on_trace_changed)
         self.history_spin.valueChanged.connect(self._on_history_changed)
+        self.graph_mode.currentIndexChanged.connect(self._on_graph_mode_changed)
         self.averaging_enabled.toggled.connect(self._on_averaging_changed)
         self.averaging_window.valueChanged.connect(self._on_averaging_changed)
         self.averaging_sigma.toggled.connect(lambda _checked: self._refresh_from_controller())
+        self.start_graph_button.clicked.connect(self._start_graph)
+        self.stop_graph_button.clicked.connect(self._stop_graph)
+        self.clear_graph_button.clicked.connect(self._clear_graph)
+        self.set_all_lambda0_button.clicked.connect(self._take_lambda0_for_checked)
         self.record_directory.textEdited.connect(self._on_record_setting_changed)
         self.record_decimation.valueChanged.connect(self._on_record_setting_changed)
         self.record_limit.valueChanged.connect(self._on_record_setting_changed)
@@ -382,92 +387,197 @@ class MeasurementPanel(DockTab):
         self.stop_record_button.clicked.connect(self._stop_recording)
         self.average_recording_button.clicked.connect(self._start_average_export)
 
-    # --- Выбор графика ---------------------------------------------------------------
-
     def selected_slots(self) -> tuple[SlotRef, ...]:
-        """Текущий пользовательский выбор в порядке дерева."""
-        selected: list[SlotRef] = []
-        for channel_index in range(self.trace_tree.topLevelItemCount()):
-            channel_item = self.trace_tree.topLevelItem(channel_index)
-            if channel_item is None:
-                continue
-            for position_index in range(channel_item.childCount()):
-                item = channel_item.child(position_index)
-                if item.checkState(0) != Qt.CheckState.Checked:
-                    continue
-                token = str(item.data(0, Qt.ItemDataRole.UserRole))
-                selected.append(models.parse_slot_token(token))
-        return tuple(selected)
+        return tuple(slot for slot, check in self._slot_checks.items() if check.isChecked())
 
-    def _sync_trace_request(self) -> None:
-        history_s = self.history_spin.value()
-        averaging_s = self._averaging_window_s()
-        if averaging_s is not None:
-            history_s = max(history_s, averaging_s)
-        self._controller.set_measurement_trace_request(
+    def _history_depth_s(self) -> float:
+        return self.history_spin.value() * 3600.0
+
+    def _sync_history_request(self) -> None:
+        self._controller.set_measurement_history_request(
             [(slot.channel, slot.position) for slot in self.selected_slots()],
-            history_s,
+            self._history_depth_s(),
         )
 
-    def _on_trace_changed(self, _item: QTreeWidgetItem, _column: int) -> None:
+    def _on_slot_checked(self, _slot: SlotRef) -> None:
         if self._selection_loading:
             return
-        self._sync_trace_request()
-
-    def _on_history_changed(self, _value: float) -> None:
-        if not self._selection_loading:
-            self._sync_trace_request()
-
-    def _on_averaging_changed(self, _value: object = None) -> None:
         self._graph_model = None
-        self._sync_trace_request()
+        self._sync_history_request()
         self._refresh_from_controller()
 
-    def _refresh_from_controller(self) -> None:
-        self.refresh(self._controller.snapshot(include_sensor_data=False))
+    def _on_history_changed(self, _value: float) -> None:
+        if self._selection_loading:
+            return
+        self._sync_history_request()
+        self._graph_model = None
+        self._refresh_from_controller()
+
+    def _on_graph_mode_changed(self, _index: int) -> None:
+        self._graph_model = None
+        self.plot.setLabel(
+            "left",
+            texts.GRAPH_AXIS_DELTA_NM if self.graph_mode.currentData() == "delta" else "λ, нм",
+        )
+        self._refresh_from_controller()
 
     def _averaging_window_s(self) -> float | None:
         if not self.averaging_enabled.isChecked():
             return None
         return self.averaging_window.value() / 1000.0
 
+    def _averaging_available(self) -> bool:
+        window = self._averaging_window_s()
+        return window is None or can_aggregate_exactly(window)
+
+    def _on_averaging_changed(self, _value: object = None) -> None:
+        self._graph_model = None
+        self._refresh_from_controller()
+
+    def _refresh_from_controller(self) -> None:
+        self.refresh(self._controller.snapshot(include_sensor_data=False))
+
+    def _start_graph(self) -> None:
+        if not self._averaging_available():
+            self._controller.note(texts.GRAPH_AVERAGING_TOO_SHORT)
+            return
+        self._controller.start_measurement_history(averaging_window_s=self._averaging_window_s())
+        self._refresh_from_controller()
+
+    def _stop_graph(self) -> None:
+        self._controller.stop_measurement_history()
+        self._refresh_from_controller()
+
+    def _clear_graph(self) -> None:
+        self._controller.clear_measurement_history(averaging_window_s=self._averaging_window_s())
+        self._graph_model = None
+        self._refresh_from_controller()
+
+    def _lambda0_edited(self, slot: SlotRef) -> None:
+        edit = self._slot_lambda0[slot]
+        text = edit.text().strip().replace(",", ".")
+        if not text:
+            self._controller.set_measurement_lambda0(slot.channel, slot.position, None)
+            self._graph_model = None
+            return
+        try:
+            value = float(text)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError
+        except ValueError:
+            self._controller.note(
+                f"{texts.slot_label(slot.channel, slot.position)}: "
+                "λ₀ должна быть положительным числом"
+            )
+            current = self._controller.measurement_lambda0(slot.channel, slot.position)
+            edit.setText("" if current is None else f"{current:.6f}")
+            return
+        self._controller.set_measurement_lambda0(slot.channel, slot.position, value)
+        self._graph_model = None
+
+    def _take_lambda0(self, slot: SlotRef) -> bool:
+        if not self._averaging_available():
+            self._controller.note(texts.GRAPH_AVERAGING_TOO_SHORT)
+            return False
+        try:
+            value = self._controller.current_measurement_wavelength(
+                slot.channel,
+                slot.position,
+                averaging_window_s=self._averaging_window_s(),
+            )
+        except ValueError as exc:
+            self._controller.note(str(exc))
+            return False
+        if value is None:
+            self._controller.note(
+                f"{texts.slot_label(slot.channel, slot.position)}: нет текущего валидного λ"
+            )
+            return False
+        self._controller.set_measurement_lambda0(slot.channel, slot.position, value)
+        self._slot_lambda0[slot].setText(f"{value:.6f}")
+        self._graph_model = None
+        return True
+
+    def _take_lambda0_for_checked(self) -> None:
+        for slot in self.selected_slots():
+            self._take_lambda0(slot)
+        self._refresh_from_controller()
+
+    def _update_lambda0_table(self, snapshot: AppSnapshot) -> None:
+        current = models.measurement_table_model(snapshot)
+        lambda0 = {
+            (channel, position): value
+            for channel, position, value in snapshot.measurement_lambda0_nm
+        }
+        for slot, item in self._slot_current.items():
+            value = float(current.wavelength_nm[slot.channel, slot.position])
+            item.setText(texts.UNKNOWN if not math.isfinite(value) else f"{value:.6f}")
+            edit = self._slot_lambda0[slot]
+            reference = lambda0.get((slot.channel, slot.position))
+            if not edit.hasFocus():
+                edit.setText("" if reference is None else f"{reference:.6f}")
+            missing = self.graph_mode.currentData() == "delta" and reference is None
+            edit.setToolTip(
+                "Нет λ₀: линия Δλ не рисуется. " + texts.GRAPH_LAMBDA0_SLOT_WARNING
+                if missing
+                else texts.GRAPH_LAMBDA0_SLOT_WARNING
+            )
+
     def _update_averaging_controls(self, snapshot: AppSnapshot) -> None:
         enabled = self.averaging_enabled.isChecked()
-        # Окно остаётся редактируемым и при выключенном live-усреднении:
-        # то же поле задаёт окно офлайн-экспорта готовой записи. На график
-        # оно не влияет, пока флажок ``averaging_enabled`` снят.
-        self.averaging_window.setEnabled(True)
         self.averaging_sigma.setEnabled(enabled)
         frames = models.expected_averaging_frames(snapshot, self.averaging_window.value())
         self.averaging_frames.setText("—" if frames <= 0 else f"≈ {frames} кадров")
+        self.averaging_notice.setText(
+            "" if self._averaging_available() else texts.GRAPH_AVERAGING_TOO_SHORT
+        )
 
-    def _update_history_limit(self, snapshot: AppSnapshot) -> None:
-        metrics = snapshot.metrics
-        if metrics is None:
-            return
-        rate = metrics.expected_rate_hz or snapshot.profile.sweep_speed_hz
-        if rate <= 0:
-            return
-        maximum = max(MIN_HISTORY_S, metrics.history_frames / rate)
-        current = self.history_spin.value()
-        if abs(self.history_spin.maximum() - maximum) > 1e-9:
-            self._selection_loading = True
-            try:
-                self.history_spin.setMaximum(maximum)
-                if current > maximum:
-                    self.history_spin.setValue(maximum)
-            finally:
-                self._selection_loading = False
-            self._sync_trace_request()
+    def _update_history_estimate(self, snapshot: AppSnapshot) -> None:
+        positions = snapshot.profile.channels * snapshot.profile.fbg_per_channel
+        estimate = history_memory_estimate_bytes(self._history_depth_s(), positions)
+        self.history_memory.setText(
+            f"Оценка максимума памяти для {positions} активных позиций: "
+            f"{self._format_bytes(estimate)}; не найденные позиции массивы не выделяют."
+        )
+
+    def _new_band(
+        self, color: object, *, alpha: int
+    ) -> tuple[pg.PlotDataItem, pg.PlotDataItem, pg.FillBetweenItem]:
+        transparent_pen = pg.mkPen(0, 0, 0, 0)
+        upper = pg.PlotDataItem(pen=transparent_pen)
+        lower = pg.PlotDataItem(pen=transparent_pen)
+        red, green, blue, _alpha = color.getRgb()
+        fill = pg.FillBetweenItem(upper, lower, brush=pg.mkBrush(red, green, blue, alpha))
+        fill.setZValue(-10)
+        self.plot.addItem(upper)
+        self.plot.addItem(lower)
+        self.plot.addItem(fill)
+        return upper, lower, fill
+
+    def _remove_trace(self, slot: SlotRef) -> None:
+        curve = self._curves.pop(slot, None)
+        if curve is not None:
+            self.plot.removeItem(curve)
+        for collection in (self._bands, self._range_bands):
+            band = collection.pop(slot, None)
+            if band is not None:
+                for item in band:
+                    self.plot.removeItem(item)
 
     def _update_graph(self, snapshot: AppSnapshot) -> None:
         selected = self.selected_slots()
-        self._graph_ticks += 1
-        model = models.measurement_graph_model(
+        if not self._averaging_available():
+            for slot in tuple(self._curves):
+                self._remove_trace(slot)
+            self.plot.hide()
+            self.empty_graph_label.show()
+            self.averaging_n.setText(texts.UNKNOWN)
+            return
+        model = models.measurement_history_graph_model(
             snapshot,
             selected,
             self._graph_model,
-            recalculate_y=self._graph_ticks % Y_RANGE_RECALC_TICKS == 0,
+            mode=str(self.graph_mode.currentData()),
             averaging_window_s=self._averaging_window_s(),
         )
         unchanged = model is self._graph_model
@@ -475,79 +585,69 @@ class MeasurementPanel(DockTab):
         selected_set = set(selected)
         for slot in tuple(self._curves):
             if slot not in selected_set:
-                self.plot.removeItem(self._curves.pop(slot))
-                band = self._bands.pop(slot, None)
-                if band is not None:
-                    for item in band:
-                        self.plot.removeItem(item)
+                self._remove_trace(slot)
 
         for index, trace in enumerate(model.traces):
             curve = self._curves.get(trace.slot)
             if curve is None:
                 color = pg.intColor(index, hues=max(1, len(selected)))
-                pen = pg.mkPen(color)
                 curve = self.plot.plot(
-                    pen=pen, name=texts.slot_label(trace.slot.channel, trace.slot.position)
+                    pen=pg.mkPen(color),
+                    name=texts.slot_label(trace.slot.channel, trace.slot.position),
                 )
                 self._curves[trace.slot] = curve
-                transparent_pen = pg.mkPen(0, 0, 0, 0)
-                upper = pg.PlotDataItem(pen=transparent_pen)
-                lower = pg.PlotDataItem(pen=transparent_pen)
-                red, green, blue, _alpha = color.getRgb()
-                fill = pg.FillBetweenItem(
-                    upper,
-                    lower,
-                    brush=pg.mkBrush(red, green, blue, 45),
-                )
-                fill.setZValue(-10)
-                self.plot.addItem(upper)
-                self.plot.addItem(lower)
-                self.plot.addItem(fill)
-                self._bands[trace.slot] = (upper, lower, fill)
-            # `connect="finite"` — принципиальная часть отображения: NaN
-            # разрывает линию и никогда не соединяется через пропавший пик.
+                self._range_bands[trace.slot] = self._new_band(color, alpha=24)
+                self._bands[trace.slot] = self._new_band(color, alpha=45)
             if not unchanged:
-                curve.setData(model.t_s, trace.delta_nm, connect="finite")
-                band = self._bands[trace.slot]
-                sigma = trace.sigma_nm
-                if sigma is not None:
-                    band[0].setData(model.t_s, trace.delta_nm + sigma, connect="finite")
-                    band[1].setData(model.t_s, trace.delta_nm - sigma, connect="finite")
-            band = self._bands[trace.slot]
-            band_visible = (
-                self.averaging_enabled.isChecked()
-                and self.averaging_sigma.isChecked()
-                and trace.sigma_nm is not None
-            )
-            for item in band:
-                item.setVisible(band_visible)
+                curve.setData(model.t_s, trace.values_nm, connect="finite")
+                extrema = self._range_bands[trace.slot]
+                extrema[0].setData(model.t_s, trace.max_nm, connect="finite")
+                extrema[1].setData(model.t_s, trace.min_nm, connect="finite")
+                sigma_band = self._bands[trace.slot]
+                sigma_band[0].setData(model.t_s, trace.values_nm + trace.sigma_nm, connect="finite")
+                sigma_band[1].setData(model.t_s, trace.values_nm - trace.sigma_nm, connect="finite")
+            for item in self._range_bands[trace.slot]:
+                item.setVisible(True)
+            for item in self._bands[trace.slot]:
+                item.setVisible(
+                    self.averaging_enabled.isChecked() and self.averaging_sigma.isChecked()
+                )
 
         counts: list[int] = []
         for trace in model.traces:
-            if trace.n is not None and trace.n.size:
-                counts.append(int(trace.n[-1]))
+            valid = trace.n[trace.n > 0]
+            if valid.size:
+                counts.append(int(valid[-1]))
         if self.averaging_enabled.isChecked() and counts:
             low, high = min(counts), max(counts)
             self.averaging_n.setText(str(low) if low == high else f"{low}…{high}")
         else:
             self.averaging_n.setText(texts.UNKNOWN)
 
-        self.plot.setXRange(-self.history_spin.value(), 0.0, padding=0.0)
-        if not unchanged:
-            self.plot.setYRange(model.y_min_nm, model.y_max_nm, padding=0.0)
-        if not selected:
-            self.graph_hint.setText(texts.GRAPH_NO_SELECTION + "\n" + texts.GRAPH_BASELINE_HINT)
-        else:
-            self.graph_hint.setText(texts.GRAPH_BASELINE_HINT)
+        self.range_controls.apply_time_axis(model.t_s)
+        missing = [
+            trace.slot
+            for trace in model.traces
+            if model.mode == "delta" and trace.lambda0_nm is None
+        ]
+        hint = texts.GRAPH_BASELINE_HINT
+        if missing:
+            labels = ", ".join(texts.slot_label(slot.channel, slot.position) for slot in missing)
+            hint += f" Нет λ₀ — линия Δλ скрыта: {labels}."
+        self.graph_hint.setText(hint)
         has_data = (
             bool(selected)
             and model.t_s.size > 0
-            and any(trace.valid_points > 0 for trace in model.traces)
+            and any(
+                trace.valid_points > 0
+                and (model.mode == "absolute" or trace.lambda0_nm is not None)
+                for trace in model.traces
+            )
         )
         self.plot.setVisible(has_data)
         self.empty_graph_label.setVisible(not has_data)
-
-    # --- Таблица ---------------------------------------------------------------------
+        self.start_graph_button.setEnabled(not model.running)
+        self.stop_graph_button.setEnabled(model.running)
 
     def _update_table(self, snapshot: AppSnapshot) -> None:
         model = models.measurement_table_model(snapshot)
@@ -753,16 +853,16 @@ class MeasurementPanel(DockTab):
     # --- Общий такт ------------------------------------------------------------------
 
     def refresh(self, snapshot: AppSnapshot) -> None:
-        """Один UI-такт: график, таблица и состояние записи целиком."""
-        self._update_history_limit(snapshot)
+        """Один UI-такт; ручной диапазон графика здесь никогда не перезаписывается."""
         self._update_averaging_controls(snapshot)
+        self._update_history_estimate(snapshot)
+        self._update_lambda0_table(snapshot)
         self._update_graph(snapshot)
         self._update_table(snapshot)
         self._update_recording(snapshot)
         self._update_quality(snapshot)
 
     def wait_for_background_work(self) -> None:
-        """Дожидается собственного офлайн-потока перед закрытием приложения."""
         thread = self._average_thread
         if thread is not None and thread.is_alive():
             thread.join()

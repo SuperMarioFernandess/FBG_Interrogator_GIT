@@ -222,9 +222,11 @@ def test_датчики_считаются_только_когда_их_прос
         visible = stand.controller.snapshot(include_sensor_data=True)
         assert len(visible.sensor_readings) == 1
         assert visible.sensor_readings[0].value == pytest.approx(25.0, abs=0.5)
-        assert visible.sensor_history is not None and visible.sensor_history.frames == 1
+        # Долгая история датчиков теперь хранится только как первичная λ;
+        # старого минутного кэша уже рассчитанных величин больше нет.
+        assert visible.sensor_history is None
         same = stand.controller.snapshot(include_sensor_data=True)
-        assert same.sensor_history is not None and same.sensor_history.frames == 1
+        assert same.sensor_history is None
     finally:
         stand.close()
 

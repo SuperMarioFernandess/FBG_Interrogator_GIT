@@ -79,6 +79,7 @@ D8 сдвинул базу развёртки, D1 зафиксировал де�
 
 import dataclasses
 import json
+import math
 import os
 import sys
 import types
@@ -255,6 +256,43 @@ class AppConfig:
     firmware: str | None = None
     """Идентификация прибора: кэш последнего успешного `Probing`, нужный
     шапкам файлов до того, как прибор ответит (см. докстринг модуля)."""
+
+    measurement_lambda0_nm: tuple[tuple[int, int, float], ...] = ()
+    """Пользовательские λ₀ графика Δλ: ``(channel, position, nm)``.
+
+    Значения принадлежат оператору и живут в основном ``fbg_config.json``.
+    Отсутствующая позиция означает пустое поле, а не нулевую длину волны.
+    """
+
+    def measurement_lambda0(self, channel: int, position: int) -> float | None:
+        """λ₀ позиции либо ``None``, если пользователь её ещё не задал."""
+        for item_channel, item_position, value in self.measurement_lambda0_nm:
+            if item_channel == channel and item_position == position:
+                return value
+        return None
+
+    def with_measurement_lambda0(
+        self, channel: int, position: int, value: float | None
+    ) -> "AppConfig":
+        """Возвращает конфигурацию с явно заданной либо очищенной λ₀."""
+        if channel < 0 or position < 0:
+            raise ValueError("индексы λ₀ не могут быть отрицательными")
+        if value is not None and (not isinstance(value, int | float) or not math.isfinite(value)):
+            raise ValueError("λ₀ должна быть конечным числом либо None")
+        mapping = {
+            (item_channel, item_position): item_value
+            for item_channel, item_position, item_value in self.measurement_lambda0_nm
+        }
+        key = (channel, position)
+        if value is None:
+            mapping.pop(key, None)
+        else:
+            mapping[key] = float(value)
+        ordered = tuple(
+            (item_channel, item_position, item_value)
+            for (item_channel, item_position), item_value in sorted(mapping.items())
+        )
+        return replace(self, measurement_lambda0_nm=ordered)
 
     def recorder_config(self) -> RecorderConfig:
         """`RecorderConfig` с подставленной идентификацией прибора."""
@@ -526,6 +564,10 @@ def to_json(config: AppConfig) -> dict[str, object]:
         "serial": config.serial,
         "firmware": config.firmware,
         "calibration_path": str(config.calibration_path),
+        "measurement_lambda0_nm": {
+            f"{channel + 1}:{position + 1}": value
+            for channel, position, value in config.measurement_lambda0_nm
+        },
         "endpoint": _section_to_json(config.endpoint),
         "profile": {
             name: getattr(config.profile, name)
@@ -546,6 +588,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "serial",
         "firmware",
         "calibration_path",
+        "measurement_lambda0_nm",
         "endpoint",
         "profile",
         "session",
@@ -554,6 +597,68 @@ _TOP_LEVEL_KEYS = frozenset(
         "packet_log",
     }
 )
+
+
+def _measurement_lambda0_from_json(
+    raw: object, issues: list[ConfigIssue]
+) -> tuple[tuple[int, int, float], ...]:
+    """Читает λ₀ по позициям, отвергая каждую испорченную запись отдельно."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, Mapping):
+        issues.append(
+            ConfigIssue(
+                IssueKind.WRONG_TYPE,
+                "measurement_lambda0_nm",
+                f"ожидался объект, получено {raw!r}; оставлено пустым",
+            )
+        )
+        return ()
+    accepted: list[tuple[int, int, float]] = []
+    for key, value in raw.items():
+        location = f"measurement_lambda0_nm.{key}"
+        if not isinstance(key, str):
+            issues.append(
+                ConfigIssue(IssueKind.WRONG_TYPE, location, "ключ позиции должен быть строкой")
+            )
+            continue
+        try:
+            channel_text, position_text = key.split(":", 1)
+            channel = int(channel_text) - 1
+            position = int(position_text) - 1
+            if channel < 0 or position < 0:
+                raise ValueError
+        except ValueError:
+            issues.append(
+                ConfigIssue(
+                    IssueKind.REJECTED_VALUE,
+                    location,
+                    "позиция должна иметь вид 'канал:позиция' с номерами от 1",
+                )
+            )
+            continue
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            issues.append(
+                ConfigIssue(
+                    IssueKind.WRONG_TYPE,
+                    location,
+                    "ожидалось конечное число; поле пропущено",
+                )
+            )
+            continue
+        number = float(value)
+        if not math.isfinite(number):
+            issues.append(
+                ConfigIssue(
+                    IssueKind.REJECTED_VALUE,
+                    location,
+                    "ожидалось конечное число; поле пропущено",
+                )
+            )
+            continue
+        accepted.append((channel, position, number))
+    accepted.sort()
+    return tuple(accepted)
 
 
 def from_json(raw: Mapping[str, object]) -> tuple[AppConfig, list[ConfigIssue]]:
@@ -607,7 +712,24 @@ def from_json(raw: Mapping[str, object]) -> tuple[AppConfig, list[ConfigIssue]]:
         device_model=typing.cast(str, scalar("device_model", str, defaults.device_model)),
         serial=typing.cast(int | None, scalar("serial", int | None, defaults.serial)),
         firmware=typing.cast(str | None, scalar("firmware", str | None, defaults.firmware)),
+        measurement_lambda0_nm=_measurement_lambda0_from_json(
+            raw.get("measurement_lambda0_nm"), issues
+        ),
     )
+    valid_lambda0: list[tuple[int, int, float]] = []
+    for channel, position, value in config.measurement_lambda0_nm:
+        if channel >= config.profile.channels or position >= config.profile.fbg_per_channel:
+            issues.append(
+                ConfigIssue(
+                    IssueKind.REJECTED_VALUE,
+                    f"measurement_lambda0_nm.{channel + 1}:{position + 1}",
+                    "позиция вне геометрии текущего профиля; поле пропущено",
+                )
+            )
+            continue
+        valid_lambda0.append((channel, position, value))
+    if len(valid_lambda0) != len(config.measurement_lambda0_nm):
+        config = replace(config, measurement_lambda0_nm=tuple(valid_lambda0))
     return config, issues
 
 

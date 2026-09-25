@@ -40,6 +40,11 @@ from fbg.core.transport import TransportStats
 from fbg.io.packet_log import Direction, PacketLogStats, PacketRecord, format_hex, format_id_fc
 from fbg.io.recorder import RecorderConfig, RecorderStats, format_rows, row_format
 from fbg.ui import texts
+from fbg.ui.history import (
+    CompressedHistorySnapshot,
+    HistoryAggregate,
+    aggregate_history,
+)
 from fbg.ui.texts import Tone
 
 #: Сколько байт датаграммы показывать в ячейке hex. Обрезается только показ.
@@ -118,6 +123,8 @@ class AppSnapshot:
     metrics: PipelineMetrics | None = None
     ui: UiSnapshot | None = None
     trace_history: TraceHistorySnapshot | None = None
+    measurement_history: CompressedHistorySnapshot | None = None
+    measurement_lambda0_nm: tuple[tuple[int, int, float], ...] = ()
     stream_gaps: tuple[tuple[float, float], ...] = ()
     log: PacketLogStats | None = None
     recorder_config: RecorderConfig | None = None
@@ -145,6 +152,7 @@ class AppSnapshot:
     sensor_readings: tuple[SensorReading, ...] = ()
     sensor_history: "SensorHistorySnapshot | None" = None
     sensor_trace_history: TraceHistorySnapshot | None = None
+    sensor_wavelength_history: CompressedHistorySnapshot | None = None
     sensor_version: int = 0
     """Версия набора датчиков; меняется при сохранённой правке конфигурации."""
 
@@ -705,6 +713,299 @@ def measurement_graph_model(
 
 
 @dataclass(frozen=True)
+class MeasurementHistoryTrace:
+    """Одна линия нового самописца в абсолютной λ либо Δλ."""
+
+    slot: SlotRef
+    values_nm: np.ndarray
+    min_nm: np.ndarray
+    max_nm: np.ndarray
+    sigma_nm: np.ndarray
+    n: np.ndarray
+    latest_nm: float | None
+    lambda0_nm: float | None
+
+    @property
+    def valid_points(self) -> int:
+        return int(np.count_nonzero(np.isfinite(self.values_nm)))
+
+
+@dataclass(frozen=True)
+class MeasurementHistoryGraphModel:
+    """Готовая к отрисовке сжатая история измерения."""
+
+    t_s: np.ndarray
+    traces: tuple[MeasurementHistoryTrace, ...]
+    y_min_nm: float
+    y_max_nm: float
+    version: int
+    running: bool
+    mode: str
+    averaging_window_s: float | None
+    selected: tuple[SlotRef, ...]
+    lambda0_key: tuple[tuple[int, int, float], ...]
+
+
+@dataclass(frozen=True)
+class _CompressedView:
+    start_mono: np.ndarray
+    stop_mono: np.ndarray
+    segment: np.ndarray
+    mean_nm: np.ndarray
+    min_nm: np.ndarray
+    max_nm: np.ndarray
+    sigma_nm: np.ndarray
+    n: np.ndarray
+
+
+def _compressed_view(
+    history: CompressedHistorySnapshot,
+    averaging_window_s: float | None,
+) -> _CompressedView:
+    if averaging_window_s is None:
+        return _CompressedView(
+            history.start_mono,
+            history.stop_mono,
+            history.segment,
+            history.mean_nm,
+            history.min_nm,
+            history.max_nm,
+            history.sigma_nm,
+            history.n,
+        )
+    averaged: HistoryAggregate = aggregate_history(history, averaging_window_s)
+    return _CompressedView(
+        averaged.start_mono,
+        averaged.stop_mono,
+        averaged.segment,
+        averaged.mean_nm,
+        averaged.min_nm,
+        averaged.max_nm,
+        averaged.sigma_nm,
+        averaged.n,
+    )
+
+
+def _history_axis(
+    start_mono: np.ndarray,
+    stop_mono: np.ndarray,
+    segment: np.ndarray,
+    origin_mono: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Добавляет строку-разрыв между сегментами и возвращает карту исходных строк."""
+    rows = int(start_mono.size)
+    if rows == 0:
+        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.int64)
+    centers = (start_mono + stop_mono) / 2.0 - origin_mono
+    transitions = np.flatnonzero(segment[1:] != segment[:-1]) if rows > 1 else np.empty(0, int)
+    if transitions.size == 0:
+        return centers, np.arange(rows, dtype=np.int64)
+    transition_set = {int(value) for value in transitions}
+    expanded_t: list[float] = []
+    mapping: list[int] = []
+    for index in range(rows):
+        expanded_t.append(float(centers[index]))
+        mapping.append(index)
+        if index in transition_set:
+            gap_t = (float(stop_mono[index]) + float(start_mono[index + 1])) / 2.0 - origin_mono
+            expanded_t.append(gap_t)
+            mapping.append(-1)
+    return np.asarray(expanded_t, dtype=np.float64), np.asarray(mapping, dtype=np.int64)
+
+
+def _expand_float(values: np.ndarray, mapping: np.ndarray) -> np.ndarray:
+    result = np.full(mapping.size, np.nan, dtype=np.float64)
+    valid = mapping >= 0
+    result[valid] = values[mapping[valid]]
+    return result
+
+
+def _expand_int(values: np.ndarray, mapping: np.ndarray) -> np.ndarray:
+    result = np.zeros(mapping.size, dtype=np.int64)
+    valid = mapping >= 0
+    result[valid] = values[mapping[valid]]
+    return result
+
+
+def measurement_history_graph_model(
+    snapshot: AppSnapshot,
+    selected: Sequence[SlotRef],
+    previous: MeasurementHistoryGraphModel | None = None,
+    *,
+    mode: str = "delta",
+    averaging_window_s: float | None = None,
+) -> MeasurementHistoryGraphModel:
+    """Строит λ(t)/Δλ(t) только из пользовательского самописца.
+
+    λ₀ берётся исключительно из ``AppConfig``. Полный перестрой графика,
+    изменение выбора или глубины истории поэтому физически не способны
+    изменить опорное значение линии.
+    """
+    if mode not in {"absolute", "delta"}:
+        raise ValueError("mode должен быть 'absolute' либо 'delta'")
+    selected_tuple = tuple(selected)
+    lambda0_key = snapshot.measurement_lambda0_nm
+    history = snapshot.measurement_history
+    version = -1 if history is None else history.version
+    running = False if history is None else history.running
+    if (
+        previous is not None
+        and previous.version == version
+        and previous.running == running
+        and previous.mode == mode
+        and previous.averaging_window_s == averaging_window_s
+        and previous.selected == selected_tuple
+        and previous.lambda0_key == lambda0_key
+    ):
+        return previous
+    if history is None or history.windows == 0:
+        low, high = _visible_y_range(())
+        return MeasurementHistoryGraphModel(
+            np.empty(0),
+            (),
+            low,
+            high,
+            version,
+            running,
+            mode,
+            averaging_window_s,
+            selected_tuple,
+            lambda0_key,
+        )
+
+    view = _compressed_view(history, averaging_window_s)
+    origin = history.origin_mono
+    if origin is None:
+        origin = float(view.start_mono[0]) if view.start_mono.size else 0.0
+    t_s, mapping = _history_axis(view.start_mono, view.stop_mono, view.segment, origin)
+    columns = {SlotRef(*slot): index for index, slot in enumerate(history.positions)}
+    lambda0 = {(channel, position): value for channel, position, value in lambda0_key}
+    traces: list[MeasurementHistoryTrace] = []
+    range_values: list[np.ndarray] = []
+    for slot in selected_tuple:
+        column = columns.get(slot)
+        if column is None:
+            continue
+        absolute = view.mean_nm[:, column]
+        minimum = view.min_nm[:, column]
+        maximum = view.max_nm[:, column]
+        sigma = view.sigma_nm[:, column]
+        reference = lambda0.get((slot.channel, slot.position))
+        if mode == "delta":
+            if reference is None:
+                values = np.full(absolute.shape, np.nan, dtype=np.float64)
+                low_values = values.copy()
+                high_values = values.copy()
+            else:
+                values = absolute - reference
+                low_values = minimum - reference
+                high_values = maximum - reference
+        else:
+            values = absolute
+            low_values = minimum
+            high_values = maximum
+        finite = np.flatnonzero(np.isfinite(absolute))
+        latest = float(absolute[int(finite[-1])]) if finite.size else None
+        expanded = _expand_float(values, mapping)
+        expanded_min = _expand_float(low_values, mapping)
+        expanded_max = _expand_float(high_values, mapping)
+        expanded_sigma = _expand_float(sigma, mapping)
+        expanded_n = _expand_int(view.n[:, column], mapping)
+        traces.append(
+            MeasurementHistoryTrace(
+                slot=slot,
+                values_nm=expanded,
+                min_nm=expanded_min,
+                max_nm=expanded_max,
+                sigma_nm=expanded_sigma,
+                n=expanded_n,
+                latest_nm=latest,
+                lambda0_nm=reference,
+            )
+        )
+        range_values.extend((expanded_min, expanded_max))
+    low, high = _visible_y_range(range_values)
+    return MeasurementHistoryGraphModel(
+        t_s,
+        tuple(traces),
+        low,
+        high,
+        version,
+        running,
+        mode,
+        averaging_window_s,
+        selected_tuple,
+        lambda0_key,
+    )
+
+
+def averaged_slot_wavelength(
+    history: TraceHistorySnapshot,
+    slot: SlotRef,
+    window_s: float,
+    *,
+    gaps: Sequence[tuple[float, float]] = (),
+) -> float | None:
+    """Последняя завершённая средняя абсолютная λ конкретного слота.
+
+    Это тот же контракт фиксированного окна Р81/Р83, только без поиска
+    датчика по λ-окну: слот уже выбран оператором явно.
+    """
+    if window_s <= 0.0:
+        raise ValueError("window_s должен быть положительным")
+    try:
+        column = history.positions.index((slot.channel, slot.position))
+    except ValueError:
+        return None
+    if history.frames == 0:
+        return None
+    averaged = fixed_window_average(
+        history.t_mono,
+        history.wavelength_nm[:, column : column + 1],
+        window_s,
+        gaps=_relevant_stream_gaps(gaps, history.t_mono, window_s),
+    )
+    valid = np.flatnonzero(averaged.complete & (averaged.n[:, 0] > 0))
+    if valid.size == 0:
+        return None
+    return float(averaged.mean[int(valid[-1]), 0])
+
+
+def measurement_current_wavelengths(
+    snapshot: AppSnapshot,
+    *,
+    averaging_window_s: float | None = None,
+) -> dict[SlotRef, float]:
+    """Текущее λ для кнопки ``текущее → λ₀``.
+
+    Без усреднения это последний опубликованный raw-кадр. С усреднением —
+    последнее завершённое окно самописца, то есть не одиночный шумный кадр.
+    """
+    if averaging_window_s is None:
+        ui = snapshot.ui
+        if ui is None:
+            return {}
+        result: dict[SlotRef, float] = {}
+        wavelengths = ui.wavelength_nm
+        for channel in range(wavelengths.shape[0]):
+            for position in range(wavelengths.shape[1]):
+                value = float(wavelengths[channel, position])
+                if math.isfinite(value):
+                    result[SlotRef(channel, position)] = value
+        return result
+    history = snapshot.measurement_history
+    if history is None or history.windows == 0:
+        return {}
+    view = _compressed_view(history, averaging_window_s)
+    result = {}
+    for column, pair in enumerate(history.positions):
+        finite = np.flatnonzero(view.n[:, column] > 0)
+        if finite.size:
+            result[SlotRef(*pair)] = float(view.mean_nm[int(finite[-1]), column])
+    return result
+
+
+@dataclass(frozen=True)
 class MeasurementTableModel:
     """Последний кадр как таблица канал × позиция, без привязки к датчикам."""
 
@@ -1044,6 +1345,226 @@ def sensor_graph_model(
         t_end_mono=t_end,
         averaging_window_s=averaging_window_s,
         averaged=averaged,
+    )
+
+
+@dataclass(frozen=True)
+class SensorHistoryGraphTrace:
+    """Физическая величина, вычисленная из сохранённой истории λ."""
+
+    sensor_id: str
+    values: np.ndarray
+    min_values: np.ndarray
+    max_values: np.ndarray
+    n: np.ndarray
+
+
+@dataclass(frozen=True)
+class SensorHistoryGraphModel:
+    """График датчиков из сжатой первичной истории длин волн."""
+
+    t_s: np.ndarray
+    traces: tuple[SensorHistoryGraphTrace, ...]
+    version: int
+    sensor_version: int
+    running: bool
+    averaging_window_s: float | None
+    selected: tuple[str, ...]
+
+
+def _sensor_polynomial(sensor: Sensor, wavelength_nm: np.ndarray) -> np.ndarray:
+    delta = wavelength_nm - sensor.expected_nm
+    return sensor.value0 + sensor.k1 * delta + sensor.k2 * delta * delta
+
+
+def _sensor_wavelength_series(
+    sensor: Sensor,
+    history: CompressedHistorySnapshot,
+    view: _CompressedView,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Находит ровно один слот в окне датчика для каждого интервала истории."""
+    columns = [
+        column
+        for column, (channel, _position) in enumerate(history.positions)
+        if channel == sensor.channel
+    ]
+    rows = view.mean_nm.shape[0]
+    mean = np.full(rows, np.nan, dtype=np.float64)
+    minimum = np.full(rows, np.nan, dtype=np.float64)
+    maximum = np.full(rows, np.nan, dtype=np.float64)
+    sigma = np.full(rows, np.nan, dtype=np.float64)
+    count = np.zeros(rows, dtype=np.int64)
+    if not columns or rows == 0:
+        return mean, minimum, maximum, sigma, count
+    selected = np.asarray(columns, dtype=np.intp)
+    wavelengths = view.mean_nm[:, selected]
+    inside = np.isfinite(wavelengths) & (
+        np.abs(wavelengths - sensor.expected_nm) <= sensor.window_nm
+    )
+    candidates = np.count_nonzero(inside, axis=1)
+    chosen = np.argmax(inside, axis=1)
+    ok = candidates == 1
+    if not np.any(ok):
+        return mean, minimum, maximum, sigma, count
+    rows_idx = np.flatnonzero(ok)
+    cols_idx = selected[chosen[ok]]
+    mean[rows_idx] = view.mean_nm[rows_idx, cols_idx]
+    minimum[rows_idx] = view.min_nm[rows_idx, cols_idx]
+    maximum[rows_idx] = view.max_nm[rows_idx, cols_idx]
+    sigma[rows_idx] = view.sigma_nm[rows_idx, cols_idx]
+    count[rows_idx] = view.n[rows_idx, cols_idx]
+    return mean, minimum, maximum, sigma, count
+
+
+def _sensor_mean_from_wavelength_stats(
+    sensor: Sensor,
+    mean_nm: np.ndarray,
+    sigma_nm: np.ndarray,
+) -> np.ndarray:
+    """Точное среднее калибровочного полинома по сохранённым ``mean`` и σ.
+
+    Для квадратичной калибровки ``E[x²] = E[x]² + Var(x)``. Поэтому простое
+    применение полинома к средней λ потеряло бы член ``k₂·σ²`` и нарушило бы
+    требование точного взвешенного среднего после сжатия истории.
+    """
+    delta = mean_nm - sensor.expected_nm
+    return sensor.value0 + sensor.k1 * delta + sensor.k2 * (delta * delta + sigma_nm * sigma_nm)
+
+
+def _calibrated_extrema(
+    sensor: Sensor,
+    minimum_nm: np.ndarray,
+    maximum_nm: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Экстремумы полинома на сохранённом диапазоне λ без raw-кадров."""
+    low = _sensor_polynomial(sensor, minimum_nm)
+    high = _sensor_polynomial(sensor, maximum_nm)
+    result_min = np.minimum(low, high)
+    result_max = np.maximum(low, high)
+    if sensor.k2 != 0.0:
+        vertex_nm = sensor.expected_nm - sensor.k1 / (2.0 * sensor.k2)
+        inside = np.isfinite(minimum_nm) & (vertex_nm >= minimum_nm) & (vertex_nm <= maximum_nm)
+        if np.any(inside):
+            vertex = np.full(minimum_nm.shape, vertex_nm, dtype=np.float64)
+            value = _sensor_polynomial(sensor, vertex)
+            result_min[inside] = np.minimum(result_min[inside], value[inside])
+            result_max[inside] = np.maximum(result_max[inside], value[inside])
+    return result_min, result_max
+
+
+def sensor_history_graph_model(
+    snapshot: AppSnapshot,
+    selected_ids: Sequence[str],
+    previous: SensorHistoryGraphModel | None = None,
+    *,
+    averaging_window_s: float | None = None,
+) -> SensorHistoryGraphModel:
+    """Строит историю датчиков, применяя **текущую** калибровку к истории λ.
+
+    Поэтому изменение имени вообще не затрагивает данные, а изменение
+    коэффициентов или окна поиска пересчитывает всю видимую историю без её
+    очистки. Адресация остаётся по окну λ, а не по номеру слота (Р30).
+    """
+    selected = tuple(selected_ids)
+    history = snapshot.sensor_wavelength_history
+    version = -1 if history is None else history.version
+    running = False if history is None else history.running
+    if (
+        previous is not None
+        and previous.version == version
+        and previous.sensor_version == snapshot.sensor_version
+        and previous.running == running
+        and previous.averaging_window_s == averaging_window_s
+        and previous.selected == selected
+    ):
+        return previous
+    if history is None or history.windows == 0:
+        return SensorHistoryGraphModel(
+            np.empty(0), (), version, snapshot.sensor_version, running, averaging_window_s, selected
+        )
+
+    view = _compressed_view(history, averaging_window_s)
+    origin = history.origin_mono
+    if origin is None:
+        origin = float(view.start_mono[0]) if view.start_mono.size else 0.0
+    t_s, mapping = _history_axis(view.start_mono, view.stop_mono, view.segment, origin)
+    by_id = {sensor.id: sensor for sensor in snapshot.sensors}
+    needed: list[str] = [sensor_id for sensor_id in selected if sensor_id in by_id]
+    for sensor_id in tuple(needed):
+        compensation = by_id[sensor_id].compensation
+        if (
+            compensation is not None
+            and compensation.reference in by_id
+            and compensation.reference not in needed
+        ):
+            needed.append(compensation.reference)
+
+    calculated: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+
+    def calculate(sensor: Sensor) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        wavelength, minimum_nm, maximum_nm, sigma_nm, count = _sensor_wavelength_series(
+            sensor, history, view
+        )
+        value = _sensor_mean_from_wavelength_stats(sensor, wavelength, sigma_nm)
+        minimum, maximum = _calibrated_extrema(sensor, minimum_nm, maximum_nm)
+        if sensor.compensation is not None:
+            reference = calculated.get(sensor.compensation.reference)
+            if reference is None:
+                value[:] = np.nan
+                minimum[:] = np.nan
+                maximum[:] = np.nan
+                count[:] = 0
+            else:
+                ref_value, ref_min, ref_max, ref_count = reference
+                coeff = sensor.compensation.coeff
+                correction = coeff * (ref_value - sensor.compensation.base)
+                value = value + correction
+                if coeff >= 0.0:
+                    minimum = minimum + coeff * (ref_min - sensor.compensation.base)
+                    maximum = maximum + coeff * (ref_max - sensor.compensation.base)
+                else:
+                    minimum = minimum + coeff * (ref_max - sensor.compensation.base)
+                    maximum = maximum + coeff * (ref_min - sensor.compensation.base)
+                valid = np.isfinite(ref_value) & (ref_count > 0)
+                value[~valid] = np.nan
+                minimum[~valid] = np.nan
+                maximum[~valid] = np.nan
+                count[~valid] = 0
+                count[valid] = np.minimum(count[valid], ref_count[valid])
+        return value, minimum, maximum, count
+
+    for sensor_id in needed:
+        sensor = by_id[sensor_id]
+        if sensor.compensation is None:
+            calculated[sensor_id] = calculate(sensor)
+    for sensor_id in needed:
+        sensor = by_id[sensor_id]
+        if sensor.compensation is not None:
+            calculated[sensor_id] = calculate(sensor)
+
+    traces: list[SensorHistoryGraphTrace] = []
+    for sensor_id in selected:
+        values = calculated.get(sensor_id)
+        if values is None:
+            continue
+        mean, minimum, maximum, count = values
+        traces.append(
+            SensorHistoryGraphTrace(
+                sensor_id,
+                _expand_float(mean, mapping),
+                _expand_float(minimum, mapping),
+                _expand_float(maximum, mapping),
+                _expand_int(count, mapping),
+            )
+        )
+    return SensorHistoryGraphModel(
+        t_s,
+        tuple(traces),
+        version,
+        snapshot.sensor_version,
+        running,
+        averaging_window_s,
+        selected,
     )
 
 

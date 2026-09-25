@@ -807,3 +807,40 @@ def test_сохранение_старой_формы_не_затирает_пр
 
     assert first_bad.read_text(encoding="utf-8") == "previous backup\n"
     assert (tmp_path / "sensors.json.bad.2").read_text(encoding="utf-8") == old
+
+
+def test_lambda0_измерения_сохраняется_между_запусками(tmp_path: Path) -> None:
+    path = tmp_path / "fbg_config.json"
+    config = AppConfig().with_measurement_lambda0(0, 0, 1545.1234)
+    config = config.with_measurement_lambda0(2, 4, 1551.5678)
+
+    save(config, path)
+    loaded = load(path)
+
+    assert loaded.config.measurement_lambda0(0, 0) == pytest.approx(1545.1234)
+    assert loaded.config.measurement_lambda0(2, 4) == pytest.approx(1551.5678)
+    assert loaded.config.measurement_lambda0(1, 1) is None
+
+
+def test_испорченное_поле_lambda0_не_роняет_и_не_стирает_соседнее(tmp_path: Path) -> None:
+    path = tmp_path / "fbg_config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "measurement_lambda0_nm": {
+                    "1:1": 1545.0,
+                    "1:2": "oops",
+                    "2:1": 1560.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load(path)
+
+    assert loaded.config.measurement_lambda0(0, 0) == 1545.0
+    assert loaded.config.measurement_lambda0(0, 1) is None
+    assert loaded.config.measurement_lambda0(1, 0) == 1560.0
+    assert any(issue.location == "measurement_lambda0_nm.1:2" for issue in loaded.issues)

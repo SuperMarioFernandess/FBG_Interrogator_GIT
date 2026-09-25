@@ -1,9 +1,10 @@
 """Панель датчиков: калибровка, карта пиков и постобработка записи.
 
 Датчик адресуется длиной волны и окном поиска (Р30), никогда номером слота.
-При обычном показе калибровка приходит готовой в `AppSnapshot` на частоте UI
-(Р75). При включённом усреднении Qt-свободная модель использует raw-снимок
-выбранных каналов; виджет сам кольцо pipeline не читает.
+Текущие показания калибруются в `AppSnapshot` на частоте UI (Р75), а график
+хранит сжатую первичную историю λ и применяет к ней текущие коэффициенты.
+Raw-снимок выбранных каналов остаётся только источником усреднённой
+калибровочной точки Р83; виджет сам кольцо pipeline не читает.
 """
 
 from __future__ import annotations
@@ -48,6 +49,8 @@ from fbg.io.recalibrate import RecalibrationResult, recalibrate_recording
 from fbg.ui import models, texts
 from fbg.ui.app import AppController
 from fbg.ui.docking import MAX_UI_PERIOD_MS, DockTab, scrollable
+from fbg.ui.graph_range import GraphRangeControls
+from fbg.ui.history import can_aggregate_exactly, history_memory_estimate_bytes
 from fbg.ui.models import AppSnapshot, SensorPanelModel
 
 _SENSOR_ID_ROLE = Qt.ItemDataRole.UserRole
@@ -68,7 +71,7 @@ class SensorsPanel(DockTab):
         self._items: dict[str, QTreeWidgetItem] = {}
         self._curves: dict[str, pg.PlotDataItem] = {}
         self._bands: dict[str, tuple[pg.PlotDataItem, pg.PlotDataItem, pg.FillBetweenItem]] = {}
-        self._graph_model: models.SensorGraphModel | None = None
+        self._graph_model: models.SensorHistoryGraphModel | None = None
         self._map_regions: list[pg.LinearRegionItem] = []
         self._shown_sensor_version = -1
         self._shown_filter = ""
@@ -142,7 +145,7 @@ class SensorsPanel(DockTab):
         self.fit_residual = QLabel(texts.UNKNOWN)
 
         self.value_plot = pg.PlotWidget()
-        self.value_plot.setMinimumHeight(220)
+        self.value_plot.setMinimumHeight(120)
         self.value_plot.hide()
         self.value_plot.setLabel("bottom", "Время, с")
         self.value_plot.showGrid(x=True, y=True, alpha=0.2)
@@ -162,6 +165,19 @@ class SensorsPanel(DockTab):
         self.averaging_sigma = QCheckBox()
         self.averaging_sigma.setChecked(True)
         self.averaging_n = QLabel()
+        self.averaging_notice = QLabel()
+        self.averaging_notice.setWordWrap(True)
+        self.history_spin = QDoubleSpinBox()
+        self.history_spin.setDecimals(2)
+        self.history_spin.setRange(0.01, 168.0)
+        self.history_spin.setValue(24.0)
+        self.history_spin.setMaximumWidth(140)
+        self.history_memory = QLabel()
+        self.history_memory.setWordWrap(True)
+        self.start_graph_button = QPushButton(texts.BUTTON_GRAPH_START)
+        self.stop_graph_button = QPushButton(texts.BUTTON_GRAPH_STOP)
+        self.clear_graph_button = QPushButton(texts.BUTTON_GRAPH_CLEAR)
+        self.range_controls = GraphRangeControls(self.value_plot)
 
         self.map_channel = QComboBox()
         for channel in range(profile.channels):
@@ -182,6 +198,7 @@ class SensorsPanel(DockTab):
         self._build_layout()
         self._connect_signals()
         self._new_sensor()
+        self._sync_sensor_history_request()
         self.refresh(controller.snapshot(include_trace_history=False, include_sensor_data=True))
 
     @staticmethod
@@ -281,20 +298,28 @@ class SensorsPanel(DockTab):
         editor_layout.addWidget(cal_box, 1)
 
         graph_controls = QGridLayout()
-        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_ENABLED), 0, 0)
-        graph_controls.addWidget(self.averaging_enabled, 0, 1)
-        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_WINDOW), 0, 2)
-        graph_controls.addWidget(self.averaging_window, 0, 3)
-        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_FRAMES), 0, 4)
-        graph_controls.addWidget(self.averaging_frames, 0, 5)
-        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_SIGMA), 1, 0)
-        graph_controls.addWidget(self.averaging_sigma, 1, 1)
-        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_N), 1, 2)
-        graph_controls.addWidget(self.averaging_n, 1, 3)
+        graph_controls.addWidget(QLabel(texts.LABEL_GRAPH_HISTORY), 0, 0)
+        graph_controls.addWidget(self.history_spin, 0, 1)
+        graph_controls.addWidget(self.history_memory, 0, 2, 1, 4)
+        graph_controls.addWidget(self.start_graph_button, 1, 0)
+        graph_controls.addWidget(self.stop_graph_button, 1, 1)
+        graph_controls.addWidget(self.clear_graph_button, 1, 2)
+        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_ENABLED), 2, 0)
+        graph_controls.addWidget(self.averaging_enabled, 2, 1)
+        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_WINDOW), 2, 2)
+        graph_controls.addWidget(self.averaging_window, 2, 3)
+        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_FRAMES), 3, 0)
+        graph_controls.addWidget(self.averaging_frames, 3, 1)
+        graph_controls.addWidget(QLabel("Диапазон min…max"), 3, 2)
+        graph_controls.addWidget(self.averaging_sigma, 3, 3)
+        graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_N), 4, 0)
+        graph_controls.addWidget(self.averaging_n, 4, 1)
+        graph_controls.addWidget(self.averaging_notice, 4, 2, 1, 4)
         graph_controls.setColumnStretch(5, 1)
         graph_controls.setVerticalSpacing(0)
         graph_layout = QVBoxLayout()
         graph_layout.addLayout(graph_controls)
+        graph_layout.addWidget(self.range_controls)
         graph_layout.addWidget(self.empty_graph_label, 1)
         graph_layout.addWidget(self.value_plot)
         graph_box = QWidget()
@@ -367,6 +392,10 @@ class SensorsPanel(DockTab):
         self.averaging_enabled.toggled.connect(self._on_averaging_changed)
         self.averaging_window.valueChanged.connect(self._on_averaging_changed)
         self.averaging_sigma.toggled.connect(lambda _checked: self._refresh_from_controller())
+        self.history_spin.valueChanged.connect(self._on_history_changed)
+        self.start_graph_button.clicked.connect(self._start_graph)
+        self.stop_graph_button.clicked.connect(self._stop_graph)
+        self.clear_graph_button.clicked.connect(self._clear_graph)
         self.new_button.clicked.connect(self._new_sensor)
         self.save_button.clicked.connect(self._save_sensor)
         self.delete_button.clicked.connect(self._delete_sensor)
@@ -409,6 +438,33 @@ class SensorsPanel(DockTab):
     def _on_graph_selection_changed(self) -> None:
         self._graph_model = None
         self._sync_sensor_trace_request()
+        self._sync_sensor_history_request()
+        self._refresh_from_controller()
+
+    def _history_depth_s(self) -> float:
+        return self.history_spin.value() * 3600.0
+
+    def _sync_sensor_history_request(self) -> None:
+        self._controller.set_sensor_history_request(
+            self._checked_sensor_ids(), self._history_depth_s()
+        )
+
+    def _on_history_changed(self, _value: float) -> None:
+        self._graph_model = None
+        self._sync_sensor_history_request()
+        self._refresh_from_controller()
+
+    def _start_graph(self) -> None:
+        self._controller.start_sensor_history()
+        self._refresh_from_controller()
+
+    def _stop_graph(self) -> None:
+        self._controller.stop_sensor_history()
+        self._refresh_from_controller()
+
+    def _clear_graph(self) -> None:
+        self._controller.clear_sensor_history()
+        self._graph_model = None
         self._refresh_from_controller()
 
     def _on_averaging_changed(self, _value: object = None) -> None:
@@ -422,11 +478,13 @@ class SensorsPanel(DockTab):
         return self.averaging_window.value() / 1000.0
 
     def _update_averaging_controls(self, snapshot: AppSnapshot) -> None:
-        enabled = self.averaging_enabled.isChecked()
         self.averaging_window.setEnabled(True)
-        self.averaging_sigma.setEnabled(enabled)
+        self.averaging_sigma.setEnabled(True)
         frames = models.expected_averaging_frames(snapshot, self.averaging_window.value())
         self.averaging_frames.setText("—" if frames <= 0 else f"≈ {frames} кадров")
+        window = self._averaging_window_s()
+        available = window is None or can_aggregate_exactly(window)
+        self.averaging_notice.setText("" if available else texts.GRAPH_AVERAGING_TOO_SHORT)
 
     @staticmethod
     def _finite(value: float, digits: int = 4) -> str:
@@ -822,11 +880,17 @@ class SensorsPanel(DockTab):
         if snapshot is None:
             return
         selected = self._checked_sensor_ids()
-        graph = models.sensor_graph_model(
+        window = self._averaging_window_s()
+        if window is not None and not can_aggregate_exactly(window):
+            self.value_plot.hide()
+            self.empty_graph_label.show()
+            self.averaging_n.setText(texts.UNKNOWN)
+            return
+        graph = models.sensor_history_graph_model(
             snapshot,
             selected,
             self._graph_model,
-            averaging_window_s=self._averaging_window_s(),
+            averaging_window_s=window,
         )
         unchanged = graph is self._graph_model
         self._graph_model = graph
@@ -838,11 +902,6 @@ class SensorsPanel(DockTab):
                 if band is not None:
                     for item in band:
                         self.value_plot.removeItem(item)
-        if graph.t_s.size == 0:
-            self.value_plot.hide()
-            self.empty_graph_label.show()
-            self.averaging_n.setText("—")
-            return
         trace_by_id = {trace.sensor_id: trace for trace in graph.traces}
         latest_counts: list[int] = []
         for index, sensor_id in enumerate(selected):
@@ -861,7 +920,7 @@ class SensorsPanel(DockTab):
                 fill = pg.FillBetweenItem(
                     upper,
                     lower,
-                    brush=pg.mkBrush(red, green, blue, 45),
+                    brush=pg.mkBrush(red, green, blue, 35),
                 )
                 fill.setZValue(-10)
                 self.value_plot.addItem(upper)
@@ -870,30 +929,46 @@ class SensorsPanel(DockTab):
                 self._bands[sensor_id] = (upper, lower, fill)
             if not unchanged:
                 curve.setData(graph.t_s, trace.values, connect="finite")
-                if trace.sigma is not None:
-                    band = self._bands[sensor_id]
-                    band[0].setData(graph.t_s, trace.values + trace.sigma, connect="finite")
-                    band[1].setData(graph.t_s, trace.values - trace.sigma, connect="finite")
-            band = self._bands[sensor_id]
-            band_visible = (
-                self.averaging_enabled.isChecked()
-                and self.averaging_sigma.isChecked()
-                and trace.sigma is not None
-            )
-            for item in band:
-                item.setVisible(band_visible)
-            if trace.n is not None and trace.n.size:
-                latest_counts.append(int(trace.n[-1]))
-        has_data = bool(selected) and any(
-            np.any(np.isfinite(trace.values)) for trace in graph.traces
-        )
-        if latest_counts:
+                band = self._bands[sensor_id]
+                band[0].setData(graph.t_s, trace.max_values, connect="finite")
+                band[1].setData(graph.t_s, trace.min_values, connect="finite")
+            for item in self._bands[sensor_id]:
+                item.setVisible(self.averaging_sigma.isChecked())
+            valid = trace.n[trace.n > 0]
+            if valid.size:
+                latest_counts.append(int(valid[-1]))
+        if self.averaging_enabled.isChecked() and latest_counts:
             low, high = min(latest_counts), max(latest_counts)
             self.averaging_n.setText(str(low) if low == high else f"{low}…{high}")
         else:
-            self.averaging_n.setText("—")
+            self.averaging_n.setText(texts.UNKNOWN)
+        has_data = (
+            bool(selected)
+            and graph.t_s.size > 0
+            and any(np.any(np.isfinite(trace.values)) for trace in graph.traces)
+        )
         self.value_plot.setVisible(has_data)
         self.empty_graph_label.setVisible(not has_data)
+        self.range_controls.apply_time_axis(graph.t_s)
+        self.start_graph_button.setEnabled(not graph.running)
+        self.stop_graph_button.setEnabled(graph.running)
+
+    def _update_history_estimate(self, snapshot: AppSnapshot) -> None:
+        positions = snapshot.profile.channels * snapshot.profile.fbg_per_channel
+        estimate = history_memory_estimate_bytes(self._history_depth_s(), positions)
+        self.history_memory.setText(
+            f"Оценка максимума памяти для {positions} активных позиций: "
+            f"{self._format_bytes(estimate)}; не найденные позиции массивы не выделяют."
+        )
+
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        size = float(max(0, value))
+        for unit in ("Б", "КиБ", "МиБ", "ГиБ"):
+            if size < 1024.0 or unit == "ГиБ":
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} ГиБ"
 
     def _update_peak_map(self, *, force: bool = False) -> None:
         model = self._last_model
@@ -978,14 +1053,16 @@ class SensorsPanel(DockTab):
             self._shown_filter = filter_text
             self._shown_map_channel = -1
             if sensor_changed:
-                # Калибровка/канал могли измениться при том же ID. Старые
-                # завершённые окна физических величин переиспользовать нельзя.
+                # История остаётся в λ: новая калибровка пересчитает её при
+                # следующей модели, но сами накопленные интервалы не очищаются.
                 self._graph_model = None
                 self._sync_sensor_trace_request()
+                self._sync_sensor_history_request()
         else:
             self._update_tree_values(model)
         self._update_peak_combo()
         self._update_averaging_controls(snapshot)
+        self._update_history_estimate(snapshot)
         self._update_graph()
         self._update_peak_map()
         self._poll_recalibration()

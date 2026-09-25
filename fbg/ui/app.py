@@ -52,7 +52,7 @@ from fbg.core import calibration
 from fbg.core.calibration import Sensor, SensorReading
 from fbg.core.endpoint import Endpoint
 from fbg.core.frames import ChannelSetup, GainSetting, SweepConfig
-from fbg.core.pipeline import Pipeline, UiSnapshot
+from fbg.core.pipeline import FrameCursor, Pipeline, UiSnapshot
 from fbg.core.session import (
     DeviceConfig,
     Result,
@@ -67,21 +67,22 @@ from fbg.io.config import PROFILE_DEVICE_FIELDS, AppConfig
 from fbg.io.packet_log import Direction, PacketLog, PacketRecord, filter_records
 from fbg.io.recorder import Recorder, RecorderConfig, RecorderStats
 from fbg.ui import texts
+from fbg.ui.history import (
+    CompressedHistoryRecorder,
+    aggregate_history,
+)
 from fbg.ui.models import (
     AppSnapshot,
     ProfileDifference,
-    SensorHistorySnapshot,
+    SlotRef,
     SpectrumModel,
+    averaged_slot_wavelength,
     spectrum_model,
 )
 
 #: Сколько сообщений держать для панели. Ограничение обязательно: колбэки
 #: сессии приходят из чужих потоков, и неограниченный список рос бы вечно.
 NOTICE_LIMIT = 50
-
-#: История графика физических величин считается на частоте UI. Минуты
-#: достаточно для оперативной диагностики и это всего 600×120 чисел при 10 Гц.
-SENSOR_HISTORY_POINTS = 600
 
 # Разрывы нужны модели усреднения только пока они попадают в видимую историю.
 # Сотни записей здесь означают уже аварийную сеть, но память остаётся ограниченной.
@@ -138,8 +139,6 @@ class AppController:
         self._sensor_version = 0
         self._sensor_readings: dict[str, SensorReading] = {}
         self._sensor_last_ui_seq: int | None = None
-        self._sensor_history_t: deque[float] = deque(maxlen=SENSOR_HISTORY_POINTS)
-        self._sensor_history_values: deque[tuple[float, ...]] = deque(maxlen=SENSOR_HISTORY_POINTS)
         self._sensor_trace_positions: tuple[tuple[int, int], ...] = ()
         self._sensor_trace_history_s = 5.0
         self._stream_gaps: deque[tuple[float, float]] = deque(maxlen=STREAM_GAP_HISTORY)
@@ -157,6 +156,22 @@ class AppController:
         self._last_recording_elapsed_s = 0.0
         self._trace_positions: tuple[tuple[int, int], ...] = ()
         self._trace_history_s = 5.0
+
+        profile = config.profile
+        self._measurement_history = CompressedHistoryRecorder(
+            profile.channels, profile.fbg_per_channel
+        )
+        self._sensor_graph_history = CompressedHistoryRecorder(
+            profile.channels, profile.fbg_per_channel
+        )
+        self._measurement_history_cursor: FrameCursor | None = None
+        self._sensor_history_cursor: FrameCursor | None = None
+        self._measurement_history_positions: tuple[tuple[int, int], ...] = ()
+        self._sensor_graph_ids: tuple[str, ...] = ()
+        self._lambda0_autofill_pending: set[tuple[int, int]] = set()
+        self._lambda0_autofill_window_s: float | None = None
+        self._lambda0_autofill_segment: int | None = None
+
         self._last_device: DeviceConfig | None = None
         self._last_error: SessionError | None = None
         self._last_spectrum: SpectrumModel | None = None
@@ -261,8 +276,6 @@ class AppController:
         self._sensor_version += 1
         self._sensor_readings = {}
         self._sensor_last_ui_seq = None
-        self._sensor_history_t.clear()
-        self._sensor_history_values.clear()
         self._sensor_trace_positions = ()
 
     def upsert_sensor(self, sensor: Sensor, *, previous_id: str | None = None) -> None:
@@ -798,6 +811,208 @@ class AppController:
         self._save()
         return recorder
 
+    # --- Самописцы графиков -------------------------------------------------------------
+
+    @property
+    def measurement_history_running(self) -> bool:
+        return self._measurement_history.running
+
+    @property
+    def sensor_history_running(self) -> bool:
+        return self._sensor_graph_history.running
+
+    def measurement_lambda0(self, channel: int, position: int) -> float | None:
+        """Пользовательская λ₀ позиции; чтение не меняет конфигурацию."""
+        return self._config.measurement_lambda0(channel, position)
+
+    def set_measurement_lambda0(self, channel: int, position: int, value: float | None) -> None:
+        """Явно задаёт/очищает λ₀ и сразу сохраняет её между запусками."""
+        if not 0 <= channel < self._config.profile.channels:
+            raise ValueError("канал λ₀ вне профиля")
+        if not 0 <= position < self._config.profile.fbg_per_channel:
+            raise ValueError("позиция λ₀ вне профиля")
+        self._config = self._config.with_measurement_lambda0(channel, position, value)
+        self._lambda0_autofill_pending.discard((channel, position))
+        self._save()
+
+    def current_measurement_wavelength(
+        self,
+        channel: int,
+        position: int,
+        *,
+        averaging_window_s: float | None = None,
+    ) -> float | None:
+        """Текущее λ для явной команды ``текущее → λ₀``.
+
+        При усреднении возвращается только последнее завершённое окно
+        сжатой истории; одиночный текущий кадр не подменяет его.
+        """
+        slot = (channel, position)
+        if averaging_window_s is None:
+            ui = self._pipeline.snapshot()
+            if ui is None:
+                return None
+            value = float(ui.wavelength_nm[channel, position])
+            return value if np.isfinite(value) else None
+        # Для явной кнопки «текущее → λ₀» усреднение должно работать даже
+        # при остановленном самописце. Поэтому, как калибровочная точка Р83,
+        # берём короткую raw-копию из pipeline и общее fixed-window ядро.
+        # Запрос двух окон нужен, чтобы предыдущий завершённый bin целиком
+        # помещался в снимок при любой фазе неподвижной сетки; ring сам
+        # ограничит запрос своей фактической глубиной.
+        history = self._pipeline.trace_history(
+            (slot,),
+            2.0 * averaging_window_s + 0.1,
+        )
+        return averaged_slot_wavelength(
+            history,
+            SlotRef(channel, position),
+            averaging_window_s,
+            gaps=self._stream_gap_snapshot(),
+        )
+
+    def set_measurement_history_request(
+        self, positions: Sequence[tuple[int, int]], depth_s: float
+    ) -> None:
+        """Выбор линий влияет только на копию для UI, а не на накопление."""
+        selected = tuple(positions)
+        for channel, position in selected:
+            if not 0 <= channel < self._config.profile.channels:
+                raise ValueError("канал истории вне профиля")
+            if not 0 <= position < self._config.profile.fbg_per_channel:
+                raise ValueError("позиция истории вне профиля")
+        self._measurement_history_positions = selected
+        self._measurement_history.set_depth(depth_s)
+
+    def set_sensor_history_request(self, sensor_ids: Sequence[str], depth_s: float) -> None:
+        """Выбор датчиков задаёт только материализацию; λ копится для всех слотов."""
+        self._sensor_graph_ids = tuple(sensor_ids)
+        self._sensor_graph_history.set_depth(depth_s)
+
+    def start_measurement_history(self, *, averaging_window_s: float | None = None) -> None:
+        """Запускает/возобновляет самописец измерения без очистки прежней истории."""
+        if self._measurement_history.running:
+            return
+        self._measurement_history.start()
+        self._measurement_history_cursor = self._pipeline.cursor()
+        self._lambda0_autofill_pending = {
+            (channel, position)
+            for channel in range(self._config.profile.channels)
+            for position in range(self._config.profile.fbg_per_channel)
+            if self._config.measurement_lambda0(channel, position) is None
+        }
+        self._lambda0_autofill_window_s = averaging_window_s
+        self._lambda0_autofill_segment = self._measurement_history.segment
+
+    def stop_measurement_history(self) -> None:
+        """Замораживает график; повторный Start создаст новый видимый сегмент."""
+        self._drain_one_history(self._measurement_history_cursor, self._measurement_history)
+        self._measurement_history.stop()
+        self._measurement_history_cursor = None
+        self._lambda0_autofill_pending.clear()
+
+    def clear_measurement_history(self, *, averaging_window_s: float | None = None) -> None:
+        """Сбрасывает историю, не меняя пользовательские λ₀ и состояние Start/Stop."""
+        self._measurement_history.clear()
+        if self._measurement_history.running:
+            self._measurement_history_cursor = self._pipeline.cursor()
+            self._lambda0_autofill_pending = {
+                (channel, position)
+                for channel in range(self._config.profile.channels)
+                for position in range(self._config.profile.fbg_per_channel)
+                if self._config.measurement_lambda0(channel, position) is None
+            }
+            self._lambda0_autofill_window_s = averaging_window_s
+            self._lambda0_autofill_segment = self._measurement_history.segment
+
+    def start_sensor_history(self) -> None:
+        """Запускает/возобновляет λ-самописец вкладки датчиков."""
+        if self._sensor_graph_history.running:
+            return
+        self._sensor_graph_history.start()
+        self._sensor_history_cursor = self._pipeline.cursor()
+
+    def stop_sensor_history(self) -> None:
+        self._drain_one_history(self._sensor_history_cursor, self._sensor_graph_history)
+        self._sensor_graph_history.stop()
+        self._sensor_history_cursor = None
+
+    def clear_sensor_history(self) -> None:
+        self._sensor_graph_history.clear()
+        if self._sensor_graph_history.running:
+            self._sensor_history_cursor = self._pipeline.cursor()
+
+    @staticmethod
+    def _drain_one_history(cursor: FrameCursor | None, recorder: CompressedHistoryRecorder) -> None:
+        if cursor is None or not recorder.running:
+            return
+        while True:
+            batch = cursor.take(limit=5_000)
+            if batch is None:
+                return
+            recorder.ingest_batch(batch)
+
+    def _autofill_measurement_lambda0(self) -> None:
+        pending = self._lambda0_autofill_pending
+        if not pending:
+            return
+        target_segment = self._lambda0_autofill_segment
+        if target_segment is None:
+            return
+        changed = False
+        window_s = self._lambda0_autofill_window_s
+        if window_s is None:
+            for slot in tuple(pending):
+                value = self._measurement_history.first_valid_nm(slot, segment=target_segment)
+                if value is None:
+                    continue
+                self._config = self._config.with_measurement_lambda0(*slot, value)
+                pending.remove(slot)
+                changed = True
+        else:
+            history = self._measurement_history.snapshot(tuple(pending))
+            if history.windows:
+                try:
+                    averaged = aggregate_history(history, window_s)
+                except ValueError:
+                    return
+                for column, slot in enumerate(history.positions):
+                    candidates = np.flatnonzero(
+                        (averaged.segment == target_segment) & (averaged.n[:, column] > 0)
+                    )
+                    if candidates.size == 0:
+                        continue
+                    value = float(averaged.mean_nm[int(candidates[0]), column])
+                    self._config = self._config.with_measurement_lambda0(*slot, value)
+                    pending.discard(slot)
+                    changed = True
+        if changed:
+            self._save()
+
+    def _advance_graph_histories(self) -> None:
+        """Дренирует курсоры на пути AppSnapshot, независимо от видимой вкладки."""
+        self._drain_one_history(self._measurement_history_cursor, self._measurement_history)
+        self._drain_one_history(self._sensor_history_cursor, self._sensor_graph_history)
+        self._autofill_measurement_lambda0()
+
+    def _sensor_history_positions(self) -> tuple[tuple[int, int], ...]:
+        by_id = {sensor.id: sensor for sensor in self._sensors}
+        channels: set[int] = set()
+        for sensor_id in self._sensor_graph_ids:
+            sensor = by_id.get(sensor_id)
+            if sensor is None:
+                continue
+            channels.add(sensor.channel)
+            if sensor.compensation is not None:
+                reference = by_id.get(sensor.compensation.reference)
+                if reference is not None:
+                    channels.add(reference.channel)
+        return tuple(
+            (channel, position)
+            for channel in sorted(channels)
+            for position in range(self._config.profile.fbg_per_channel)
+        )
+
     def set_measurement_trace_request(
         self,
         positions: Sequence[tuple[int, int]],
@@ -1030,40 +1245,26 @@ class AppController:
     def _sensor_snapshot(
         self,
         ui_snapshot: UiSnapshot | None,
-    ) -> tuple[tuple[SensorReading, ...], SensorHistorySnapshot | None]:
-        """Считает калибровку только по опубликованному UI-кадру (Р75).
+    ) -> tuple[SensorReading, ...]:
+        """Считает только текущие показания датчиков на пути снимка (Р75).
 
-        Метод вызывается из `snapshot()`, то есть около 10 Гц из GUI, а не из
-        `Pipeline.on_telemetry` на 2 кГц. При повторном чтении того же кадра
-        расчёт и история не дублируются.
+        Долгая история физических величин здесь больше не существует: график
+        хранит первичные λ в ``_sensor_graph_history`` и применяет текущую
+        калибровку при построении. Поэтому изменение набора датчиков не требует
+        очищать историю и не оставляет строки старой формы в скрытом кэше.
         """
         if not self._sensors or ui_snapshot is None:
-            return (), None
+            return ()
 
         ui = ui_snapshot
         seq = int(ui.seq)
         if seq != self._sensor_last_ui_seq:
-            readings = calibration.evaluate_all(
+            self._sensor_readings = calibration.evaluate_all(
                 self._sensors,
                 ui.wavelength_nm,
             )
-            self._sensor_readings = readings
             self._sensor_last_ui_seq = seq
-            self._sensor_history_t.append(float(ui.t_mono))
-            self._sensor_history_values.append(
-                tuple(readings[sensor.id].value for sensor in self._sensors)
-            )
-
-        ordered = tuple(self._sensor_readings[sensor.id] for sensor in self._sensors)
-        if not self._sensor_history_t:
-            history = None
-        else:
-            history = SensorHistorySnapshot(
-                t_mono=np.fromiter(self._sensor_history_t, dtype=np.float64),
-                sensor_ids=tuple(sensor.id for sensor in self._sensors),
-                values=np.asarray(tuple(self._sensor_history_values), dtype=np.float64),
-            )
-        return ordered, history
+        return tuple(self._sensor_readings[sensor.id] for sensor in self._sensors)
 
     def _stream_gap_snapshot(self) -> tuple[tuple[float, float], ...]:
         """Копия границ сетевых разрывов без гонки с dispatcher-потоком."""
@@ -1082,6 +1283,7 @@ class AppController:
         ядра и не могла случайно удержать кольцо (Р36).
         """
         self._reap_failed_recorder()
+        self._advance_graph_histories()
         session = self._session
         recorder = self._recorder
         recorder_stats = recorder.stats if recorder is not None else self._last_recorder_stats
@@ -1094,8 +1296,13 @@ class AppController:
             if include_trace_history
             else None
         )
+        measurement_history = (
+            self._measurement_history.snapshot(self._measurement_history_positions)
+            if include_trace_history
+            else None
+        )
         if include_sensor_data:
-            sensor_readings, sensor_history = self._sensor_snapshot(ui_snapshot)
+            sensor_readings = self._sensor_snapshot(ui_snapshot)
             sensor_trace_history = (
                 self._pipeline.trace_history(
                     self._sensor_trace_positions,
@@ -1104,9 +1311,13 @@ class AppController:
                 if self._sensor_trace_positions
                 else None
             )
+            sensor_wavelength_history = self._sensor_graph_history.snapshot(
+                self._sensor_history_positions()
+            )
         else:
-            sensor_readings, sensor_history = (), None
+            sensor_readings = ()
             sensor_trace_history = None
+            sensor_wavelength_history = None
         return AppSnapshot(
             endpoint=self._config.endpoint,
             profile=self._config.profile,
@@ -1127,6 +1338,8 @@ class AppController:
             metrics=self._pipeline.metrics(),
             ui=ui_snapshot,
             trace_history=trace_history,
+            measurement_history=measurement_history,
+            measurement_lambda0_nm=self._config.measurement_lambda0_nm,
             stream_gaps=self._stream_gap_snapshot(),
             log=self._packet_log.stats,
             recorder_config=self._config.recorder,
@@ -1156,8 +1369,9 @@ class AppController:
             ),
             sensors=self._sensors,
             sensor_readings=sensor_readings,
-            sensor_history=sensor_history,
+            sensor_history=None,
             sensor_trace_history=sensor_trace_history,
+            sensor_wavelength_history=sensor_wavelength_history,
             sensor_version=self._sensor_version,
             connected=session.state is not SessionState.DISCONNECTED,
             recording=recorder is not None,

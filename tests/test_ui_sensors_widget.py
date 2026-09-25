@@ -420,7 +420,7 @@ def test_усреднение_датчиков_имеет_те_же_контро
         assert panel.averaging_window.minimum() == pytest.approx(models.MIN_AVERAGING_MS)
         assert panel.averaging_window.maximum() == pytest.approx(models.MAX_AVERAGING_MS)
         assert panel.averaging_window.isEnabled()
-        assert not panel.averaging_sigma.isEnabled()
+        assert panel.averaging_sigma.isEnabled()
         assert panel.averaging_n.text() == texts.UNKNOWN
 
         panel.averaging_enabled.setChecked(True)
@@ -433,7 +433,7 @@ def test_усреднение_датчиков_имеет_те_же_контро
         panel.deleteLater()
 
 
-def test_полоса_sigma_датчиков_имеет_путь_и_разрывается_на_nan(
+def test_диапазон_min_max_датчиков_имеет_путь_и_разрывается_на_nan(
     application: QApplication,
     controller: AppController,
     monkeypatch: pytest.MonkeyPatch,
@@ -445,25 +445,26 @@ def test_полоса_sigma_датчиков_имеет_путь_и_разрыв
         panel.sensor_tree.blockSignals(True)
         item.setCheckState(0, Qt.CheckState.Checked)
         panel.sensor_tree.blockSignals(False)
-        panel.averaging_enabled.blockSignals(True)
-        panel.averaging_enabled.setChecked(True)
-        panel.averaging_enabled.blockSignals(False)
-        t_s = np.asarray([-6.0, -5.0, -4.0, -3.0, -2.0, -1.0, 0.0])
+        t_s = np.asarray([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
         values = np.asarray([1.0, 1.1, 1.2, np.nan, 1.3, 1.4, 1.5])
-        sigma = np.asarray([0.02, 0.02, 0.02, np.nan, 0.02, 0.02, 0.02])
-        graph = models.SensorGraphModel(
+        graph = models.SensorHistoryGraphModel(
             t_s=t_s,
             traces=(
-                models.SensorGraphTrace(
+                models.SensorHistoryGraphTrace(
                     "T1",
                     values,
-                    sigma=sigma,
-                    n=np.asarray([10, 10, 10, 0, 10, 10, 10]),
+                    values - 0.02,
+                    values + 0.02,
+                    np.asarray([10, 10, 10, 0, 10, 10, 10]),
                 ),
             ),
-            averaging_window_s=0.05,
+            version=1,
+            sensor_version=1,
+            running=True,
+            averaging_window_s=None,
+            selected=("T1",),
         )
-        monkeypatch.setattr(models, "sensor_graph_model", lambda *args, **kwargs: graph)
+        monkeypatch.setattr(models, "sensor_history_graph_model", lambda *args, **kwargs: graph)
 
         panel._update_graph()
         application.processEvents()
