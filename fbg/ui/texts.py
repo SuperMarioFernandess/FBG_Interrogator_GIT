@@ -157,7 +157,30 @@ LABEL_AVERAGING_ENABLED = "Усреднение на графике"
 LABEL_AVERAGING_WINDOW = "Окно усреднения, мс"
 LABEL_AVERAGING_FRAMES = "Кадров в окне (ожидаемо)"
 LABEL_AVERAGING_SIGMA = "Полоса ±σ"
-LABEL_AVERAGING_N = "n последнего окна"
+LABEL_AVERAGING_N = "n последней точки"
+LABEL_GRAPH_BAND = "Полоса"
+GRAPH_BAND_LABELS = {
+    "none": "только линия",
+    "sigma": "±σ",
+    "range": "min…max",
+}
+LABEL_GRAPH_RESOLUTION = "Точка на графике"
+
+
+def graph_resolution(seconds: float | None, averaging_window_s: float | None) -> str:
+    """Фактический интервал одной точки на экране (№38), а не запрошенный.
+
+    Если окно усреднения мельче того, что помещается на экран, это видно
+    сразу: подпись показывает грубый интервал и напоминает, как вернуть окно.
+    """
+    if seconds is None:
+        return UNKNOWN
+    text = f"{seconds:g} с"
+    if averaging_window_s is not None and seconds > averaging_window_s * (1.0 + 1e-9):
+        text += f" (грубее окна {averaging_window_s:g} с — приблизьте участок)"
+    return text
+
+
 LABEL_RECORD_DIRECTORY = "Папка"
 LABEL_RECORD_DECIMATION = "Децимация записи"
 LABEL_RECORD_FBG_LIMIT = "Позиций на канал"
@@ -543,6 +566,28 @@ BUTTON_SENSOR_SAVE = "Сохранить датчик"
 BUTTON_SENSOR_DELETE = "Удалить"
 BUTTON_SENSOR_TAKE_WAVELENGTH = "Взять текущую λ"
 BUTTON_SENSOR_ADD_POINT = "Взять точку"
+SENSOR_PEAK_CHOOSE = "выберите пик"
+
+
+def sensor_peak_status(status: str, wavelength_nm: float | None, tolerance_nm: float) -> str:
+    """Почему «Взять точку» и «Взять текущую λ» недоступны — или что выбрано."""
+    if status == "none" or wavelength_nm is None:
+        return "Пик не выбран: выберите его в списке."
+    if status == "found":
+        return (
+            f"Выбран пик {wavelength_nm:.4f} нм (отслеживается в пределах ±{tolerance_nm:.3f} нм)."
+        )
+    if status == "ambiguous":
+        return (
+            f"Пик {wavelength_nm:.4f} нм неоднозначен: рядом два пика в пределах "
+            f"±{tolerance_nm:.3f} нм. Точку взять нельзя, выберите пик заново."
+        )
+    return (
+        f"Пик {wavelength_nm:.4f} нм потерян: в текущем кадре его нет в пределах "
+        f"±{tolerance_nm:.3f} нм. Точку взять нельзя; выбор вернётся, когда пик появится."
+    )
+
+
 BUTTON_SENSOR_REMOVE_POINT = "Удалить точку"
 BUTTON_SENSOR_FIT = "Подогнать"
 BUTTON_RECALIBRATE = "Пересчитать CSV"

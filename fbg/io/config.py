@@ -230,6 +230,16 @@ def _default_packet_log() -> PacketLogConfig:
     return PacketLogConfig(directory=_default_log_dir())
 
 
+GRAPH_BAND_NONE = "none"
+GRAPH_BAND_SIGMA = "sigma"
+GRAPH_BAND_RANGE = "range"
+GRAPH_BAND_MODES: dict[str, frozenset[str]] = {
+    # У датчиков σ физической величины не хранится: только огибающая.
+    "measurement": frozenset({GRAPH_BAND_NONE, GRAPH_BAND_SIGMA, GRAPH_BAND_RANGE}),
+    "sensors": frozenset({GRAPH_BAND_NONE, GRAPH_BAND_RANGE}),
+}
+
+
 @dataclass(frozen=True)
 class AppConfig:
     """Все настройки приложения одним объектом.
@@ -263,6 +273,37 @@ class AppConfig:
     Значения принадлежат оператору и живут в основном ``fbg_config.json``.
     Отсутствующая позиция означает пустое поле, а не нулевую длину волны.
     """
+
+    graph_bands: tuple[tuple[str, str], ...] = ()
+    """Выбор полосы временных графиков по вкладкам: ``(вкладка, режим)``.
+
+    Отсутствие записи означает умолчание — только линия (Р88). Хранится
+    здесь, а не в файле раскладки, потому что это Qt-свободная настройка.
+    """
+
+    def graph_band(self, tab: str) -> str:
+        """Режим полосы вкладки; неизвестная вкладка — ошибка вызывающего."""
+        allowed = GRAPH_BAND_MODES.get(tab)
+        if allowed is None:
+            raise ValueError(f"неизвестная вкладка графика: {tab!r}")
+        for item_tab, mode in self.graph_bands:
+            if item_tab == tab:
+                return mode
+        return GRAPH_BAND_NONE
+
+    def with_graph_band(self, tab: str, mode: str) -> "AppConfig":
+        """Конфигурация с новым режимом полосы вкладки."""
+        allowed = GRAPH_BAND_MODES.get(tab)
+        if allowed is None:
+            raise ValueError(f"неизвестная вкладка графика: {tab!r}")
+        if mode not in allowed:
+            raise ValueError(f"режим полосы {mode!r} недоступен на вкладке {tab!r}")
+        mapping = dict(self.graph_bands)
+        if mode == GRAPH_BAND_NONE:
+            mapping.pop(tab, None)
+        else:
+            mapping[tab] = mode
+        return replace(self, graph_bands=tuple(sorted(mapping.items())))
 
     def measurement_lambda0(self, channel: int, position: int) -> float | None:
         """λ₀ позиции либо ``None``, если пользователь её ещё не задал."""
@@ -568,6 +609,7 @@ def to_json(config: AppConfig) -> dict[str, object]:
             f"{channel + 1}:{position + 1}": value
             for channel, position, value in config.measurement_lambda0_nm
         },
+        "graph_bands": dict(config.graph_bands),
         "endpoint": _section_to_json(config.endpoint),
         "profile": {
             name: getattr(config.profile, name)
@@ -589,6 +631,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "firmware",
         "calibration_path",
         "measurement_lambda0_nm",
+        "graph_bands",
         "endpoint",
         "profile",
         "session",
@@ -661,6 +704,42 @@ def _measurement_lambda0_from_json(
     return tuple(accepted)
 
 
+def _graph_bands_from_json(raw: object, issues: list[ConfigIssue]) -> tuple[tuple[str, str], ...]:
+    """Читает выбор полос; испорченная запись стоит одной вкладки (№32)."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, Mapping):
+        issues.append(
+            ConfigIssue(
+                IssueKind.WRONG_TYPE,
+                "graph_bands",
+                f"ожидался объект, получено {raw!r}; оставлено умолчание",
+            )
+        )
+        return ()
+    accepted: dict[str, str] = {}
+    for tab, mode in raw.items():
+        location = f"graph_bands.{tab}"
+        allowed = GRAPH_BAND_MODES.get(tab) if isinstance(tab, str) else None
+        if allowed is None:
+            issues.append(
+                ConfigIssue(IssueKind.UNKNOWN_FIELD, location, "вкладка неизвестна и пропущена")
+            )
+            continue
+        if not isinstance(mode, str) or mode not in allowed:
+            issues.append(
+                ConfigIssue(
+                    IssueKind.REJECTED_VALUE,
+                    location,
+                    f"допустимо {sorted(allowed)}, получено {mode!r}; оставлено умолчание",
+                )
+            )
+            continue
+        if mode != GRAPH_BAND_NONE:
+            accepted[tab] = mode
+    return tuple(sorted(accepted.items()))
+
+
 def from_json(raw: Mapping[str, object]) -> tuple[AppConfig, list[ConfigIssue]]:
     """Собирает настройки из уже разобранного JSON. Версию проверяет `load`."""
     issues: list[ConfigIssue] = []
@@ -715,6 +794,7 @@ def from_json(raw: Mapping[str, object]) -> tuple[AppConfig, list[ConfigIssue]]:
         measurement_lambda0_nm=_measurement_lambda0_from_json(
             raw.get("measurement_lambda0_nm"), issues
         ),
+        graph_bands=_graph_bands_from_json(raw.get("graph_bands"), issues),
     )
     valid_lambda0: list[tuple[int, int, float]] = []
     for channel, position, value in config.measurement_lambda0_nm:

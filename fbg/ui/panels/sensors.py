@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QAbstractItemModel, QModelIndex, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,6 +28,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QTreeWidget,
@@ -45,19 +47,51 @@ from fbg.core.calibration import (
     calibration_point_uncertainty,
     fit_calibration,
 )
+from fbg.io.config import GRAPH_BAND_NONE, GRAPH_BAND_RANGE
 from fbg.io.recalibrate import RecalibrationResult, recalibrate_recording
 from fbg.ui import models, texts
 from fbg.ui.app import AppController
 from fbg.ui.docking import MAX_UI_PERIOD_MS, DockTab, scrollable
 from fbg.ui.graph_range import GraphRangeControls
 from fbg.ui.history import can_aggregate_exactly, history_memory_estimate_bytes
-from fbg.ui.models import AppSnapshot, SensorPanelModel
+from fbg.ui.models import AppSnapshot, PeakTrack, SensorPanelModel
 
 _SENSOR_ID_ROLE = Qt.ItemDataRole.UserRole
 #: Запас к окну усреднения гарантирует, что при максимальном периоде UI
 #: предыдущий незавершённый bin ещё целиком есть в raw-кольце. Завершённые
 #: окна дальше сохраняются инкрементальной моделью и повторно не копируются.
 SENSOR_RAW_UI_MARGIN_S = MAX_UI_PERIOD_MS / 1000.0 + 0.1
+BAND_TAB = "sensors"
+POINT_VALUE_COLUMN = 1
+
+
+class _PointValueDelegate(QStyledItemDelegate):
+    """Правка значения эталона: ввод понимает запятую, ячейку не пишет сам.
+
+    Готовое число уходит в модель точек панели, и таблица перерисовывается
+    из неё. Разбор текста живёт в Qt-свободном ``models.parse_user_number``.
+    """
+
+    def __init__(self, panel: SensorsPanel) -> None:
+        super().__init__(panel)
+        self._panel = panel
+
+    def createEditor(  # noqa: N802 — Qt
+        self, parent: QWidget, option: QStyleOptionViewItem, index: QModelIndex
+    ) -> QWidget:
+        del option, index
+        return QLineEdit(parent)
+
+    def setEditorData(self, editor: QWidget, index: QModelIndex) -> None:  # noqa: N802
+        assert isinstance(editor, QLineEdit)
+        editor.setText(str(index.data() or ""))
+
+    def setModelData(  # noqa: N802 — Qt
+        self, editor: QWidget, model: QAbstractItemModel, index: QModelIndex
+    ) -> None:
+        del model
+        assert isinstance(editor, QLineEdit)
+        self._panel.edit_point_value(index.row(), editor.text())
 
 
 class SensorsPanel(DockTab):
@@ -71,6 +105,7 @@ class SensorsPanel(DockTab):
         self._items: dict[str, QTreeWidgetItem] = {}
         self._curves: dict[str, pg.PlotDataItem] = {}
         self._bands: dict[str, tuple[pg.PlotDataItem, pg.PlotDataItem, pg.FillBetweenItem]] = {}
+        self._colors: dict[str, object] = {}
         self._graph_model: models.SensorHistoryGraphModel | None = None
         self._map_regions: list[pg.LinearRegionItem] = []
         self._shown_sensor_version = -1
@@ -79,6 +114,11 @@ class SensorsPanel(DockTab):
         self._editing_id: str | None = None
         self._editing_compensation = None
         self._last_model: SensorPanelModel | None = None
+        self._peak_track = PeakTrack()
+        self._peak_channel = -1
+        self._shown_peaks: tuple[float, ...] | None = None
+        # Точки калибровки живут здесь; таблица — только их представление (Р89).
+        self._calibration_points: tuple[CalibrationPoint, ...] = ()
         self._last_snapshot: AppSnapshot | None = None
         self._recalc_thread: threading.Thread | None = None
         self._recalc_result: RecalibrationResult | None = None
@@ -127,12 +167,16 @@ class SensorsPanel(DockTab):
         self.up_limit_spin = self._value_spin()
 
         self.current_peak_combo = QComboBox()
+        self.current_peak_combo.setPlaceholderText(texts.SENSOR_PEAK_CHOOSE)
+        self.peak_status = QLabel(texts.sensor_peak_status("none", None, 0.0))
+        self.peak_status.setWordWrap(True)
         self.take_wavelength_button = QPushButton(texts.BUTTON_SENSOR_TAKE_WAVELENGTH)
 
         self.points_table = QTableWidget(0, 5)
         self.points_table.setHorizontalHeaderLabels(
             ["λ, нм", "Известное значение", "n", "σ, нм", "u, нм"]
         )
+        self.points_table.setItemDelegateForColumn(POINT_VALUE_COLUMN, _PointValueDelegate(self))
         self.known_value_spin = self._value_spin()
         self.add_point_button = QPushButton(texts.BUTTON_SENSOR_ADD_POINT)
         self.weighted_fit = QCheckBox(texts.LABEL_SENSOR_WEIGHTED_FIT)
@@ -162,8 +206,13 @@ class SensorsPanel(DockTab):
         self.averaging_window.setValue(models.DEFAULT_AVERAGING_MS)
         self.averaging_window.setMaximumWidth(140)
         self.averaging_frames = QLabel()
-        self.averaging_sigma = QCheckBox()
-        self.averaging_sigma.setChecked(True)
+        self.band_mode = QComboBox()
+        for mode in (GRAPH_BAND_NONE, GRAPH_BAND_RANGE):
+            self.band_mode.addItem(texts.GRAPH_BAND_LABELS[mode], mode)
+        self.band_mode.setCurrentIndex(
+            max(0, self.band_mode.findData(controller.graph_band(BAND_TAB)))
+        )
+        self.graph_resolution = QLabel(texts.UNKNOWN)
         self.averaging_n = QLabel()
         self.averaging_notice = QLabel()
         self.averaging_notice.setWordWrap(True)
@@ -271,6 +320,7 @@ class SensorsPanel(DockTab):
         peak_row.addWidget(self.current_peak_combo, 1)
         peak_row.addWidget(self.take_wavelength_button)
         editor_form.addRow(texts.LABEL_SENSOR_CURRENT_PEAK, peak_row)
+        editor_form.addRow("", self.peak_status)
         editor_form.addRow(self.save_button)
         editor_box = QGroupBox(texts.GROUP_SENSOR_EDITOR)
         editor_box.setLayout(editor_form)
@@ -310,11 +360,13 @@ class SensorsPanel(DockTab):
         graph_controls.addWidget(self.averaging_window, 2, 3)
         graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_FRAMES), 3, 0)
         graph_controls.addWidget(self.averaging_frames, 3, 1)
-        graph_controls.addWidget(QLabel("Диапазон min…max"), 3, 2)
-        graph_controls.addWidget(self.averaging_sigma, 3, 3)
+        graph_controls.addWidget(QLabel(texts.LABEL_GRAPH_BAND), 3, 2)
+        graph_controls.addWidget(self.band_mode, 3, 3)
         graph_controls.addWidget(QLabel(texts.LABEL_AVERAGING_N), 4, 0)
         graph_controls.addWidget(self.averaging_n, 4, 1)
         graph_controls.addWidget(self.averaging_notice, 4, 2, 1, 4)
+        graph_controls.addWidget(QLabel(texts.LABEL_GRAPH_RESOLUTION), 1, 3)
+        graph_controls.addWidget(self.graph_resolution, 1, 4, 1, 2)
         graph_controls.setColumnStretch(5, 1)
         graph_controls.setVerticalSpacing(0)
         graph_layout = QVBoxLayout()
@@ -391,7 +443,9 @@ class SensorsPanel(DockTab):
         )
         self.averaging_enabled.toggled.connect(self._on_averaging_changed)
         self.averaging_window.valueChanged.connect(self._on_averaging_changed)
-        self.averaging_sigma.toggled.connect(lambda _checked: self._refresh_from_controller())
+        self.band_mode.currentIndexChanged.connect(self._on_band_changed)
+        self.range_controls.view_changed.connect(self._sync_view_request)
+        self.current_peak_combo.activated.connect(self._on_peak_activated)
         self.history_spin.valueChanged.connect(self._on_history_changed)
         self.start_graph_button.clicked.connect(self._start_graph)
         self.stop_graph_button.clicked.connect(self._stop_graph)
@@ -412,6 +466,9 @@ class SensorsPanel(DockTab):
         self.recalibrate_button.clicked.connect(self._start_recalibration)
 
     def _on_editor_channel_changed(self) -> None:
+        # Смена канала — явное действие человека: прежний выбор пика к новому
+        # каналу отношения не имеет и сбрасывается, а не угадывается.
+        self._peak_track = PeakTrack()
         self._update_peak_combo()
         if self.averaging_enabled.isChecked():
             self._sync_sensor_trace_request()
@@ -470,7 +527,26 @@ class SensorsPanel(DockTab):
     def _on_averaging_changed(self, _value: object = None) -> None:
         self._graph_model = None
         self._sync_sensor_trace_request()
+        self._sync_view_request()
         self._refresh_from_controller()
+
+    def _sync_view_request(self) -> None:
+        """Видимая область графика датчиков для следующего снимка (Р88)."""
+        window = self._averaging_window_s()
+        if window is not None and not can_aggregate_exactly(window):
+            window = None
+        self._controller.set_sensor_history_view(self.range_controls.view_request(), window)
+
+    def _on_band_changed(self, _index: int) -> None:
+        self._controller.set_graph_band(BAND_TAB, str(self.band_mode.currentData()))
+        self._drop_bands()
+        self._graph_model = None
+        self._refresh_from_controller()
+
+    def _drop_bands(self) -> None:
+        for sensor_id in tuple(self._bands):
+            for item in self._bands.pop(sensor_id):
+                self.value_plot.removeItem(item)
 
     def _averaging_window_s(self) -> float | None:
         if not self.averaging_enabled.isChecked():
@@ -479,7 +555,6 @@ class SensorsPanel(DockTab):
 
     def _update_averaging_controls(self, snapshot: AppSnapshot) -> None:
         self.averaging_window.setEnabled(True)
-        self.averaging_sigma.setEnabled(True)
         frames = models.expected_averaging_frames(snapshot, self.averaging_window.value())
         self.averaging_frames.setText("—" if frames <= 0 else f"≈ {frames} кадров")
         window = self._averaging_window_s()
@@ -703,24 +778,62 @@ class SensorsPanel(DockTab):
         return tuple(float(value) for value in model.peaks_by_channel[channel])
 
     def _update_peak_combo(self) -> None:
-        current = self.current_peak_combo.currentData()
-        self.current_peak_combo.clear()
-        for wavelength_nm in self._current_peaks():
-            token = f"{wavelength_nm:.9f}"
-            self.current_peak_combo.addItem(f"{wavelength_nm:.4f} нм", token)
-        if current is not None:
-            index = self.current_peak_combo.findData(str(current))
-            if index >= 0:
-                self.current_peak_combo.setCurrentIndex(index)
-        available = self.current_peak_combo.count() > 0
-        self.take_wavelength_button.setEnabled(available)
-        self.add_point_button.setEnabled(available)
+        """Держит выбор за решёткой, а не за числом (Р89, №43).
+
+        Список не пересобирается вслепую: если число пиков то же, меняются
+        только подписи. Пересборка идёт под заблокированными сигналами, и Qt
+        не может молча выбрать первый элемент — индекс ставится явно, либо
+        ``-1`` с причиной в строке состояния.
+        """
+        channel = int(str(self.channel_combo.currentData()))
+        if channel != self._peak_channel:
+            self._peak_track = PeakTrack()
+            self._peak_channel = channel
+        peaks = np.asarray(self._current_peaks(), dtype=np.float64)
+        self._peak_track = models.follow_peak(self._peak_track, peaks)
+        labels = tuple(f"{value:.4f} нм" for value in peaks)
+        combo = self.current_peak_combo
+        was_blocked = combo.blockSignals(True)
+        try:
+            if self._shown_peaks is None or len(self._shown_peaks) != len(labels):
+                combo.clear()
+                combo.addItems(labels)
+            else:
+                for index, (old, new) in enumerate(zip(self._shown_peaks, labels, strict=True)):
+                    if old != new:
+                        combo.setItemText(index, new)
+            self._shown_peaks = labels
+            if combo.currentIndex() != self._peak_track.index:
+                combo.setCurrentIndex(self._peak_track.index)
+        finally:
+            combo.blockSignals(was_blocked)
+        track = self._peak_track
+        if track.wavelength_nm is not None and not track.usable:
+            combo.setPlaceholderText(f"{track.wavelength_nm:.4f} нм — нет в кадре")
+        else:
+            combo.setPlaceholderText(texts.SENSOR_PEAK_CHOOSE)
+        self.peak_status.setText(
+            texts.sensor_peak_status(track.status.value, track.wavelength_nm, track.tolerance_nm)
+        )
+        self.take_wavelength_button.setEnabled(track.usable)
+        self.add_point_button.setEnabled(track.usable)
+
+    def _on_peak_activated(self, index: int) -> None:
+        """Выбор оператора — единственный путь, которым выбор пика меняется."""
+        self._peak_track = models.select_peak(
+            np.asarray(self._current_peaks(), dtype=np.float64), index
+        )
+        self._update_peak_combo()
 
     def _selected_peak(self) -> float:
-        data = self.current_peak_combo.currentData()
-        if data is None:
-            raise ValueError("в текущем кадре выбранного канала нет пиков")
-        return float(str(data))
+        track = self._peak_track
+        if not track.usable or track.wavelength_nm is None:
+            raise ValueError(
+                texts.sensor_peak_status(
+                    track.status.value, track.wavelength_nm, track.tolerance_nm
+                )
+            )
+        return track.wavelength_nm
 
     def _quantization_nm(self, wavelength_nm: float) -> float:
         return self._controller.config.profile.wavelength_quantization_nm(wavelength_nm)
@@ -779,6 +892,12 @@ class SensorsPanel(DockTab):
             self._controller.note(str(exc))
 
     def _set_points(self, points: tuple[CalibrationPoint, ...]) -> None:
+        """Заменяет точки в модели и перерисовывает таблицу из неё."""
+        self._calibration_points = tuple(points)
+        self._render_points()
+
+    def _render_points(self) -> None:
+        points = self._calibration_points
         self.points_table.setRowCount(len(points))
         for row, point in enumerate(points):
             sigma_text = texts.UNKNOWN if point.sigma_nm is None else f"{point.sigma_nm:.9g}"
@@ -796,31 +915,32 @@ class SensorsPanel(DockTab):
                     item = QTableWidgetItem()
                     self.points_table.setItem(row, column, item)
                 item.setText(value)
-                if column >= 2:
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                # Измеренные λ, n, σ и u неизменяемы: правка λ руками оставила
+                # бы n и σ утверждать усреднение, которого у числа уже нет.
+                flags = item.flags() & ~Qt.ItemFlag.ItemIsEditable
+                if column == POINT_VALUE_COLUMN:
+                    flags |= Qt.ItemFlag.ItemIsEditable
+                item.setFlags(flags)
 
     def _points(self) -> tuple[CalibrationPoint, ...]:
-        points: list[CalibrationPoint] = []
-        for row in range(self.points_table.rowCount()):
-            wavelength_item = self.points_table.item(row, 0)
-            value_item = self.points_table.item(row, 1)
-            n_item = self.points_table.item(row, 2)
-            sigma_item = self.points_table.item(row, 3)
-            if wavelength_item is None or value_item is None:
-                continue
-            n = 1 if n_item is None else int(n_item.text())
-            sigma_nm = None
-            if sigma_item is not None and sigma_item.text() != texts.UNKNOWN:
-                sigma_nm = float(sigma_item.text())
-            points.append(
-                CalibrationPoint(
-                    float(wavelength_item.text()),
-                    float(value_item.text()),
-                    n,
-                    sigma_nm,
-                )
-            )
-        return tuple(points)
+        """Точки из модели, не из текста ячеек."""
+        return self._calibration_points
+
+    def edit_point_value(self, row: int, text: str) -> bool:
+        """Правка значения эталона — единственная разрешённая правка точки."""
+        points = list(self._calibration_points)
+        if not 0 <= row < len(points):
+            return False
+        try:
+            value = models.parse_user_number(text)
+        except ValueError as exc:
+            self._controller.note(f"значение эталона не изменено: {exc}")
+            self._render_points()
+            return False
+        old = points[row]
+        points[row] = CalibrationPoint(old.wavelength_nm, value, old.n, old.sigma_nm)
+        self._set_points(tuple(points))
+        return True
 
     def _calibration_wavelength(self) -> tuple[float, int, float | None]:
         selected = self._selected_peak()
@@ -849,14 +969,15 @@ class SensorsPanel(DockTab):
 
     def _remove_point(self) -> None:
         row = self.points_table.currentRow()
-        if row >= 0:
-            self.points_table.removeRow(row)
+        if 0 <= row < len(self._calibration_points):
+            points = list(self._calibration_points)
+            del points[row]
+            self._set_points(tuple(points))
 
     def _fit_points(self) -> None:
         try:
             kind = FitKind(str(self.fit_kind.currentData()))
             points = self._points()
-            self._set_points(points)
             fit = fit_calibration(
                 points,
                 self.expected_spin.value(),
@@ -885,6 +1006,7 @@ class SensorsPanel(DockTab):
             self.value_plot.hide()
             self.empty_graph_label.show()
             self.averaging_n.setText(texts.UNKNOWN)
+            self.graph_resolution.setText(texts.UNKNOWN)
             return
         graph = models.sensor_history_graph_model(
             snapshot,
@@ -898,12 +1020,14 @@ class SensorsPanel(DockTab):
         for sensor_id in tuple(self._curves):
             if sensor_id not in selected_set:
                 self.value_plot.removeItem(self._curves.pop(sensor_id))
+                self._colors.pop(sensor_id, None)
                 band = self._bands.pop(sensor_id, None)
                 if band is not None:
                     for item in band:
                         self.value_plot.removeItem(item)
         trace_by_id = {trace.sensor_id: trace for trace in graph.traces}
         latest_counts: list[int] = []
+        band = str(self.band_mode.currentData())
         for index, sensor_id in enumerate(selected):
             trace = trace_by_id.get(sensor_id)
             if trace is None:
@@ -913,10 +1037,13 @@ class SensorsPanel(DockTab):
                 color = pg.intColor(index, hues=max(1, len(selected)))
                 curve = self.value_plot.plot(pen=pg.mkPen(color), name=sensor_id)
                 self._curves[sensor_id] = curve
+                self._colors[sensor_id] = color
+                unchanged = False
+            if band != GRAPH_BAND_NONE and sensor_id not in self._bands:
                 transparent_pen = pg.mkPen(0, 0, 0, 0)
                 upper = pg.PlotDataItem(pen=transparent_pen)
                 lower = pg.PlotDataItem(pen=transparent_pen)
-                red, green, blue, _alpha = color.getRgb()
+                red, green, blue, _alpha = self._colors[sensor_id].getRgb()
                 fill = pg.FillBetweenItem(
                     upper,
                     lower,
@@ -927,13 +1054,13 @@ class SensorsPanel(DockTab):
                 self.value_plot.addItem(lower)
                 self.value_plot.addItem(fill)
                 self._bands[sensor_id] = (upper, lower, fill)
+                unchanged = False
             if not unchanged:
                 curve.setData(graph.t_s, trace.values, connect="finite")
-                band = self._bands[sensor_id]
-                band[0].setData(graph.t_s, trace.max_values, connect="finite")
-                band[1].setData(graph.t_s, trace.min_values, connect="finite")
-            for item in self._bands[sensor_id]:
-                item.setVisible(self.averaging_sigma.isChecked())
+                items = self._bands.get(sensor_id)
+                if items is not None:
+                    items[0].setData(graph.t_s, trace.max_values, connect="finite")
+                    items[1].setData(graph.t_s, trace.min_values, connect="finite")
             valid = trace.n[trace.n > 0]
             if valid.size:
                 latest_counts.append(int(valid[-1]))
@@ -949,7 +1076,13 @@ class SensorsPanel(DockTab):
         )
         self.value_plot.setVisible(has_data)
         self.empty_graph_label.setVisible(not has_data)
-        self.range_controls.apply_time_axis(graph.t_s)
+        if graph.t_first_s is not None and graph.t_last_s is not None:
+            self.range_controls.apply_time_bounds(graph.t_first_s, graph.t_last_s)
+        else:
+            self.range_controls.apply_time_axis(graph.t_s)
+        self.graph_resolution.setText(
+            texts.graph_resolution(graph.resolution_s, self._averaging_window_s())
+        )
         self.start_graph_button.setEnabled(not graph.running)
         self.stop_graph_button.setEnabled(graph.running)
 
@@ -1066,6 +1199,7 @@ class SensorsPanel(DockTab):
         self._update_graph()
         self._update_peak_map()
         self._poll_recalibration()
+        self._sync_view_request()
 
     def wait_for_background_work(self) -> None:
         """Дожидается собственного офлайн-потока перед закрытием приложения."""

@@ -106,6 +106,21 @@ def snapshot(controller: AppController, **kwargs: object) -> models.AppSnapshot:
     return models.AppSnapshot(**base)  # type: ignore[arg-type]
 
 
+def peaks_snapshot(controller: AppController, *peaks_nm: float) -> models.AppSnapshot:
+    """Кадр, где в канале 1 найдены ровно эти пики, в произвольных позициях."""
+    wavelengths = np.full((PROFILE.channels, PROFILE.fbg_per_channel), np.nan)
+    for offset, value in enumerate(peaks_nm):
+        wavelengths[0, 4 + offset] = value
+    return snapshot(controller, ui=SimpleNamespace(wavelength_nm=wavelengths))
+
+
+def choose_peak(panel: SensorsPanel, wavelength_nm: float) -> None:
+    """Выбор оператора: пункт списка с этой λ (сигнал ``activated``, как от мыши)."""
+    index = panel.current_peak_combo.findText(f"{wavelength_nm:.4f} нм")
+    assert index >= 0
+    panel.current_peak_combo.activated.emit(index)
+
+
 def test_пустой_график_датчиков_подсказывает_следующее_действие(
     application: QApplication, controller: AppController
 ) -> None:
@@ -286,10 +301,13 @@ def test_взять_текущую_лямбду_берёт_пик_из_теле�
 ) -> None:
     panel = SensorsPanel(controller)
     try:
-        wavelengths = np.full((PROFILE.channels, PROFILE.fbg_per_channel), np.nan)
-        wavelengths[0, 4] = 1544.812345  # позиция намеренно не нулевая
-        panel.refresh(snapshot(controller, ui=SimpleNamespace(wavelength_nm=wavelengths)))
+        panel.refresh(peaks_snapshot(controller, 1544.812345))
         assert panel.current_peak_combo.count() == 1
+        # Пока оператор не выбрал пик, брать нечего: Qt не выбирает за него.
+        assert panel.current_peak_combo.currentIndex() == -1
+        assert not panel.take_wavelength_button.isEnabled()
+        choose_peak(panel, 1544.812345)
+        assert panel.take_wavelength_button.isEnabled()
         panel.take_wavelength_button.click()
         assert panel.expected_spin.value() == pytest.approx(1544.8123, abs=5e-5)
     finally:
@@ -416,17 +434,15 @@ def test_усреднение_датчиков_имеет_те_же_контро
     try:
         assert not panel.averaging_enabled.isChecked()
         assert panel.averaging_window.value() == pytest.approx(models.DEFAULT_AVERAGING_MS)
-        assert panel.averaging_sigma.isChecked()
+        assert panel.band_mode.currentData() == "none"
         assert panel.averaging_window.minimum() == pytest.approx(models.MIN_AVERAGING_MS)
         assert panel.averaging_window.maximum() == pytest.approx(models.MAX_AVERAGING_MS)
         assert panel.averaging_window.isEnabled()
-        assert panel.averaging_sigma.isEnabled()
         assert panel.averaging_n.text() == texts.UNKNOWN
 
         panel.averaging_enabled.setChecked(True)
         panel.refresh(controller.snapshot(include_trace_history=False, include_sensor_data=True))
         assert panel.averaging_window.isEnabled()
-        assert panel.averaging_sigma.isEnabled()
         assert "100" in panel.averaging_frames.text()
     finally:
         panel.close()
@@ -465,6 +481,7 @@ def test_диапазон_min_max_датчиков_имеет_путь_и_раз
             selected=("T1",),
         )
         monkeypatch.setattr(models, "sensor_history_graph_model", lambda *args, **kwargs: graph)
+        panel.band_mode.setCurrentIndex(panel.band_mode.findData("range"))
 
         panel._update_graph()
         application.processEvents()
@@ -483,9 +500,8 @@ def test_калибровочная_точка_без_усреднения_им�
 ) -> None:
     panel = SensorsPanel(controller)
     try:
-        wavelengths = np.full((PROFILE.channels, PROFILE.fbg_per_channel), np.nan)
-        wavelengths[0, 4] = 1544.812345
-        panel.refresh(snapshot(controller, ui=SimpleNamespace(wavelength_nm=wavelengths)))
+        panel.refresh(peaks_snapshot(controller, 1544.812345))
+        choose_peak(panel, 1544.812345)
         panel.known_value_spin.setValue(25.0)
 
         panel._add_point()
@@ -527,6 +543,7 @@ def test_калибровочная_точка_с_усреднением_бер�
                 sensor_trace_history=history,
             )
         )
+        choose_peak(panel, 1550.108)
 
         panel._add_point()
 
@@ -573,8 +590,8 @@ def test_смена_expected_nm_переподгоняет_сохраненны�
         assert panel.value0_spin.value() == pytest.approx(0.0)
         assert panel.fit_residual.text().startswith("—")
 
-        panel.current_peak_combo.clear()
-        panel.current_peak_combo.addItem("1550.2500 нм", "1550.25")
+        panel.refresh(peaks_snapshot(controller, 1550.25))
+        choose_peak(panel, 1550.25)
         panel._take_current_wavelength()
 
         assert panel.expected_spin.value() == pytest.approx(1550.25)
@@ -593,8 +610,8 @@ def test_смена_expected_nm_без_точек_сбрасывает_стар�
         panel.k1_spin.setValue(100.0)
         panel.k2_spin.setValue(5.0)
         panel.value0_spin.setValue(25.0)
-        panel.current_peak_combo.clear()
-        panel.current_peak_combo.addItem("1550.2500 нм", "1550.25")
+        panel.refresh(peaks_snapshot(controller, 1550.25))
+        choose_peak(panel, 1550.25)
 
         panel._take_current_wavelength()
 

@@ -6,7 +6,7 @@ import math
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QSignalBlocker
+from PySide6.QtCore import QSignalBlocker, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
@@ -17,20 +17,24 @@ from PySide6.QtWidgets import (
 )
 
 from fbg.ui import texts
+from fbg.ui.history import VIEW_ALL, VIEW_FOLLOW, VIEW_MANUAL, HistoryViewRequest
 
 
 class GraphRangeControls(QWidget):
     """X: follow/all/manual; Y: auto/manual. Мышь всегда отдаёт власть человеку."""
 
-    FOLLOW = "follow"
-    ALL = "all"
-    MANUAL = "manual"
+    FOLLOW = VIEW_FOLLOW
+    ALL = VIEW_ALL
+    MANUAL = VIEW_MANUAL
     AUTO = "auto"
+
+    view_changed = Signal()
+    """Изменилась область по X: панель передаёт контроллеру новый запрос (Р88)."""
 
     def __init__(self, plot: pg.PlotWidget, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._plot = plot
-        self._last_t = np.empty(0, dtype=np.float64)
+        self._bounds: tuple[float, float] | None = None
         self._programmatic = False
 
         self.x_mode = QComboBox()
@@ -69,7 +73,7 @@ class GraphRangeControls(QWidget):
         layout.setColumnStretch(4, 1)
 
         self.x_mode.currentIndexChanged.connect(self._x_mode_changed)
-        self.follow_s.valueChanged.connect(lambda _value: self._apply_x_program_mode())
+        self.follow_s.valueChanged.connect(lambda _value: self._follow_changed())
         self.x_from.valueChanged.connect(lambda _value: self._apply_manual_x())
         self.x_to.valueChanged.connect(lambda _value: self._apply_manual_x())
         self.y_mode.currentIndexChanged.connect(self._y_mode_changed)
@@ -90,13 +94,39 @@ class GraphRangeControls(QWidget):
         return spin
 
     def apply_time_axis(self, t_s: np.ndarray) -> None:
+        """Совместимый вход: границы берутся из массива времени."""
+        values = np.asarray(t_s, dtype=np.float64)
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            return
+        self.apply_time_bounds(float(np.min(finite)), float(np.max(finite)))
+
+    def apply_time_bounds(self, low: float, high: float) -> None:
         """Применяет только явно выбранный программный X-режим.
 
-        В manual никакой такт графика диапазон не трогает.
+        Границы — вся история, а не скопированная для экрана область: после
+        Р88 модель несёт лишь видимую часть с полями. В manual никакой такт
+        диапазон не трогает.
         """
-        values = np.asarray(t_s, dtype=np.float64)
-        self._last_t = values[np.isfinite(values)]
+        if not math.isfinite(low) or not math.isfinite(high):
+            return
+        self._bounds = (low, high)
         self._apply_x_program_mode()
+
+    def view_request(self) -> HistoryViewRequest:
+        """Какую область копировать в следующий снимок истории."""
+        mode = str(self.x_mode.currentData())
+        if mode == self.FOLLOW:
+            return HistoryViewRequest(VIEW_FOLLOW, span_s=self.follow_s.value())
+        if mode == self.MANUAL:
+            low, high = self._plot.viewRange()[0]
+            if math.isfinite(low) and math.isfinite(high) and high > low:
+                return HistoryViewRequest(VIEW_MANUAL, low_s=float(low), high_s=float(high))
+        return HistoryViewRequest(VIEW_ALL)
+
+    def _follow_changed(self) -> None:
+        self._apply_x_program_mode()
+        self.view_changed.emit()
 
     def show_all(self) -> None:
         self._set_combo_data(self.x_mode, self.ALL)
@@ -104,10 +134,12 @@ class GraphRangeControls(QWidget):
         self._update_enabled()
         self._plot.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
         self._apply_x_program_mode()
+        self.view_changed.emit()
 
     def _x_mode_changed(self, _index: int) -> None:
         self._update_enabled()
         self._apply_x_program_mode()
+        self.view_changed.emit()
 
     def _y_mode_changed(self, _index: int) -> None:
         self._update_enabled()
@@ -118,15 +150,12 @@ class GraphRangeControls(QWidget):
             self._apply_manual_y()
 
     def _apply_x_program_mode(self) -> None:
-        if self._programmatic or self._last_t.size == 0:
+        if self._programmatic or self._bounds is None:
             return
         mode = str(self.x_mode.currentData())
         if mode == self.MANUAL:
             return
-        low = float(np.min(self._last_t))
-        high = float(np.max(self._last_t))
-        if not math.isfinite(low) or not math.isfinite(high):
-            return
+        low, high = self._bounds
         if high <= low:
             high = low + 1.0e-6
         if mode == self.FOLLOW:
@@ -148,6 +177,7 @@ class GraphRangeControls(QWidget):
             self._plot.setXRange(low, high, padding=0.0)
         finally:
             self._programmatic = False
+        self.view_changed.emit()
 
     def _apply_manual_y(self) -> None:
         if self._programmatic or self.y_mode.currentData() != self.MANUAL:
@@ -178,6 +208,7 @@ class GraphRangeControls(QWidget):
         finally:
             self._programmatic = False
         self._update_enabled()
+        self.view_changed.emit()
 
     def _update_enabled(self) -> None:
         x_mode = str(self.x_mode.currentData())

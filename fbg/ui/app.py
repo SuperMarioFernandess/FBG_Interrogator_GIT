@@ -67,10 +67,7 @@ from fbg.io.config import PROFILE_DEVICE_FIELDS, AppConfig
 from fbg.io.packet_log import Direction, PacketLog, PacketRecord, filter_records
 from fbg.io.recorder import Recorder, RecorderConfig, RecorderStats
 from fbg.ui import texts
-from fbg.ui.history import (
-    CompressedHistoryRecorder,
-    aggregate_history,
-)
+from fbg.ui.history import CompressedHistoryRecorder, HistoryViewRequest
 from fbg.ui.models import (
     AppSnapshot,
     ProfileDifference,
@@ -171,6 +168,12 @@ class AppController:
         self._lambda0_autofill_pending: set[tuple[int, int]] = set()
         self._lambda0_autofill_window_s: float | None = None
         self._lambda0_autofill_segment: int | None = None
+        # Какую область истории копировать в снимок (Р88). Запрос не данные:
+        # от него зависит только объём копии, а не накопление.
+        self._measurement_view = HistoryViewRequest()
+        self._measurement_view_window_s: float | None = None
+        self._sensor_view = HistoryViewRequest()
+        self._sensor_view_window_s: float | None = None
 
         self._last_device: DeviceConfig | None = None
         self._last_error: SessionError | None = None
@@ -889,6 +892,36 @@ class AppController:
         self._sensor_graph_ids = tuple(sensor_ids)
         self._sensor_graph_history.set_depth(depth_s)
 
+    def set_measurement_history_view(
+        self, request: HistoryViewRequest, averaging_window_s: float | None
+    ) -> None:
+        """Видимая область графика измерения для следующих снимков (Р88).
+
+        Копируется только она и только с уровня, помещающегося в пиксели;
+        накопление самописца от запроса не зависит.
+        """
+        self._measurement_view = request
+        self._measurement_view_window_s = averaging_window_s
+
+    def set_sensor_history_view(
+        self, request: HistoryViewRequest, averaging_window_s: float | None
+    ) -> None:
+        """То же для графика датчиков."""
+        self._sensor_view = request
+        self._sensor_view_window_s = averaging_window_s
+
+    def graph_band(self, tab: str) -> str:
+        """Сохранённый выбор полосы графика вкладки (``measurement``/``sensors``)."""
+        return self._config.graph_band(tab)
+
+    def set_graph_band(self, tab: str, mode: str) -> None:
+        """Меняет полосу графика и сразу сохраняет выбор между запусками."""
+        updated = self._config.with_graph_band(tab, mode)
+        if updated == self._config:
+            return
+        self._config = updated
+        self._save()
+
     def start_measurement_history(self, *, averaging_window_s: float | None = None) -> None:
         """Запускает/возобновляет самописец измерения без очистки прежней истории."""
         if self._measurement_history.running:
@@ -970,22 +1003,16 @@ class AppController:
                 pending.remove(slot)
                 changed = True
         else:
-            history = self._measurement_history.snapshot(tuple(pending))
-            if history.windows:
-                try:
-                    averaged = aggregate_history(history, window_s)
-                except ValueError:
-                    return
-                for column, slot in enumerate(history.positions):
-                    candidates = np.flatnonzero(
-                        (averaged.segment == target_segment) & (averaged.n[:, column] > 0)
-                    )
-                    if candidates.size == 0:
-                        continue
-                    value = float(averaged.mean_nm[int(candidates[0]), column])
-                    self._config = self._config.with_measurement_lambda0(*slot, value)
-                    pending.discard(slot)
-                    changed = True
+            # Одно окно W на слот, найденное по номеру первого валидного
+            # интервала: прежде здесь вся история копировалась и сворачивалась
+            # на каждом такте, пока у позиции не появится пик.
+            for slot in tuple(pending):
+                value = self._measurement_history.first_window_mean(slot, target_segment, window_s)
+                if value is None:
+                    continue
+                self._config = self._config.with_measurement_lambda0(*slot, value)
+                pending.discard(slot)
+                changed = True
         if changed:
             self._save()
 
@@ -1297,7 +1324,11 @@ class AppController:
             else None
         )
         measurement_history = (
-            self._measurement_history.snapshot(self._measurement_history_positions)
+            self._measurement_history.view(
+                self._measurement_history_positions,
+                self._measurement_view,
+                averaging_window_s=self._measurement_view_window_s,
+            )
             if include_trace_history
             else None
         )
@@ -1311,8 +1342,10 @@ class AppController:
                 if self._sensor_trace_positions
                 else None
             )
-            sensor_wavelength_history = self._sensor_graph_history.snapshot(
-                self._sensor_history_positions()
+            sensor_wavelength_history = self._sensor_graph_history.view(
+                self._sensor_history_positions(),
+                self._sensor_view,
+                averaging_window_s=self._sensor_view_window_s,
             )
         else:
             sensor_readings = ()

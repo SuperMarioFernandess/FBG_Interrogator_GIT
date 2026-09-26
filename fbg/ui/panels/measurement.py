@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from fbg.core.session import SessionState
 from fbg.io.averaging import AveragingExportResult, average_recording
+from fbg.io.config import GRAPH_BAND_MODES, GRAPH_BAND_NONE, GRAPH_BAND_RANGE, GRAPH_BAND_SIGMA
 from fbg.ui import models, texts
 from fbg.ui.app import AppController
 from fbg.ui.docking import DockTab
@@ -37,6 +38,7 @@ from fbg.ui.history import can_aggregate_exactly, history_memory_estimate_bytes
 from fbg.ui.models import AppSnapshot, MeasurementTableModel, SlotRef
 
 DEFAULT_SELECTED_SLOTS = 4
+BAND_TAB = "measurement"
 MIN_HISTORY_HOURS = 0.01
 MAX_HISTORY_HOURS = 168.0
 
@@ -112,10 +114,13 @@ class MeasurementPanel(DockTab):
         self._record_settings_loading = False
         self._record_settings_dirty = False
         self._curves: dict[SlotRef, pg.PlotDataItem] = {}
+        # Одна полоса на линию и только если выбрана (Р88): каждая заливка —
+        # полупрозрачный полигон, самое дорогое в программной отрисовке Qt.
         self._bands: dict[SlotRef, tuple[pg.PlotDataItem, pg.PlotDataItem, pg.FillBetweenItem]] = {}
-        self._range_bands: dict[
-            SlotRef, tuple[pg.PlotDataItem, pg.PlotDataItem, pg.FillBetweenItem]
-        ] = {}
+        self._colors: dict[SlotRef, object] = {}
+        self._shown_current: dict[SlotRef, str] = {}
+        self._shown_lambda0: tuple[tuple[int, int, float], ...] | None = None
+        self._shown_lambda0_mode: str | None = None
         self._graph_model: models.MeasurementHistoryGraphModel | None = None
         self._slot_checks: dict[SlotRef, QCheckBox] = {}
         self._slot_current: dict[SlotRef, QTableWidgetItem] = {}
@@ -162,8 +167,14 @@ class MeasurementPanel(DockTab):
         self.averaging_window.setValue(models.DEFAULT_AVERAGING_MS)
         self.averaging_window.setMaximumWidth(140)
         self.averaging_frames = QLabel()
-        self.averaging_sigma = QCheckBox()
-        self.averaging_sigma.setChecked(True)
+        self.band_mode = QComboBox()
+        for mode in (GRAPH_BAND_NONE, GRAPH_BAND_SIGMA, GRAPH_BAND_RANGE):
+            if mode in GRAPH_BAND_MODES[BAND_TAB]:
+                self.band_mode.addItem(texts.GRAPH_BAND_LABELS[mode], mode)
+        self.band_mode.setCurrentIndex(
+            max(0, self.band_mode.findData(controller.graph_band(BAND_TAB)))
+        )
+        self.graph_resolution = QLabel(texts.UNKNOWN)
         self.averaging_n = QLabel()
         self.averaging_notice = QLabel()
         self.averaging_notice.setWordWrap(True)
@@ -282,8 +293,8 @@ class MeasurementPanel(DockTab):
         controls.addWidget(self.averaging_window, 2, 3)
         controls.addWidget(QLabel(texts.LABEL_AVERAGING_FRAMES), 3, 0)
         controls.addWidget(self.averaging_frames, 3, 1)
-        controls.addWidget(QLabel(texts.LABEL_AVERAGING_SIGMA), 3, 2)
-        controls.addWidget(self.averaging_sigma, 3, 3)
+        controls.addWidget(QLabel(texts.LABEL_GRAPH_BAND), 3, 2)
+        controls.addWidget(self.band_mode, 3, 3)
         controls.addWidget(QLabel(texts.LABEL_AVERAGING_N), 4, 0)
         controls.addWidget(self.averaging_n, 4, 1)
         controls.addWidget(self.averaging_notice, 4, 2, 1, 4)
@@ -297,7 +308,13 @@ class MeasurementPanel(DockTab):
         selection_box.setLayout(selection_layout)
 
         graph_layout = QVBoxLayout()
-        graph_layout.addWidget(self.quality_label)
+        # Разрешение делит строку с темпом: новая строка подняла бы минимальную
+        # высоту окна выше 1366×720 (регресс чата №16).
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.quality_label, 1)
+        status_row.addWidget(QLabel(texts.LABEL_GRAPH_RESOLUTION))
+        status_row.addWidget(self.graph_resolution, 1)
+        graph_layout.addLayout(status_row)
         graph_layout.addWidget(self.range_controls)
         graph_layout.addWidget(self.empty_graph_label, 1)
         graph_layout.addWidget(self.plot, 1)
@@ -374,7 +391,8 @@ class MeasurementPanel(DockTab):
         self.graph_mode.currentIndexChanged.connect(self._on_graph_mode_changed)
         self.averaging_enabled.toggled.connect(self._on_averaging_changed)
         self.averaging_window.valueChanged.connect(self._on_averaging_changed)
-        self.averaging_sigma.toggled.connect(lambda _checked: self._refresh_from_controller())
+        self.band_mode.currentIndexChanged.connect(self._on_band_changed)
+        self.range_controls.view_changed.connect(self._sync_view_request)
         self.start_graph_button.clicked.connect(self._start_graph)
         self.stop_graph_button.clicked.connect(self._stop_graph)
         self.clear_graph_button.clicked.connect(self._clear_graph)
@@ -431,6 +449,23 @@ class MeasurementPanel(DockTab):
         return window is None or can_aggregate_exactly(window)
 
     def _on_averaging_changed(self, _value: object = None) -> None:
+        self._graph_model = None
+        self._sync_view_request()
+        self._refresh_from_controller()
+
+    def _sync_view_request(self) -> None:
+        """Передаёт контроллеру видимую область для следующего снимка (Р88)."""
+        window = self._averaging_window_s() if self._averaging_available() else None
+        self._controller.set_measurement_history_view(self.range_controls.view_request(), window)
+
+    def _band(self) -> str:
+        return str(self.band_mode.currentData())
+
+    def _on_band_changed(self, _index: int) -> None:
+        self._controller.set_graph_band(BAND_TAB, self._band())
+        for slot in tuple(self._bands):
+            for item in self._bands.pop(slot):
+                self.plot.removeItem(item)
         self._graph_model = None
         self._refresh_from_controller()
 
@@ -504,28 +539,55 @@ class MeasurementPanel(DockTab):
         self._refresh_from_controller()
 
     def _update_lambda0_table(self, snapshot: AppSnapshot) -> None:
-        current = models.measurement_table_model(snapshot)
+        """Обновляет таблицу позиций только там, где что-то изменилось.
+
+        Прежде такт делал около 360 операций с виджетами на 120 слотах.
+        Текущая λ пишется только у слотов с пиком и у тех, где пик только что
+        пропал (там появляется прочерк, а не старое число — №7). Поле λ₀ на
+        такте не трогается вовсе: его меняет пользователь либо однократное
+        автозаполнение Р86, и оба случая видны как изменение ``snapshot``.
+        """
+        current = models.current_wavelength_texts(snapshot)
+        for slot in set(self._shown_current) | set(current):
+            text = current.get(slot, texts.UNKNOWN)
+            if self._shown_current.get(slot, texts.UNKNOWN) != text:
+                self._slot_current[slot].setText(text)
+            if text == texts.UNKNOWN:
+                self._shown_current.pop(slot, None)
+            else:
+                self._shown_current[slot] = text
+
+        mode = str(self.graph_mode.currentData())
+        if (
+            snapshot.measurement_lambda0_nm == self._shown_lambda0
+            and mode == self._shown_lambda0_mode
+        ):
+            return
+        previous = {
+            (channel, position): value for channel, position, value in (self._shown_lambda0 or ())
+        }
         lambda0 = {
             (channel, position): value
             for channel, position, value in snapshot.measurement_lambda0_nm
         }
-        for slot, item in self._slot_current.items():
-            value = float(current.wavelength_nm[slot.channel, slot.position])
-            item.setText(texts.UNKNOWN if not math.isfinite(value) else f"{value:.6f}")
-            edit = self._slot_lambda0[slot]
-            reference = lambda0.get((slot.channel, slot.position))
+        refresh_all = self._shown_lambda0 is None or mode != self._shown_lambda0_mode
+        for slot, edit in self._slot_lambda0.items():
+            key = (slot.channel, slot.position)
+            reference = lambda0.get(key)
+            if not refresh_all and previous.get(key) == reference:
+                continue
             if not edit.hasFocus():
                 edit.setText("" if reference is None else f"{reference:.6f}")
-            missing = self.graph_mode.currentData() == "delta" and reference is None
+            missing = mode == "delta" and reference is None
             edit.setToolTip(
                 "Нет λ₀: линия Δλ не рисуется. " + texts.GRAPH_LAMBDA0_SLOT_WARNING
                 if missing
                 else texts.GRAPH_LAMBDA0_SLOT_WARNING
             )
+        self._shown_lambda0 = snapshot.measurement_lambda0_nm
+        self._shown_lambda0_mode = mode
 
     def _update_averaging_controls(self, snapshot: AppSnapshot) -> None:
-        enabled = self.averaging_enabled.isChecked()
-        self.averaging_sigma.setEnabled(enabled)
         frames = models.expected_averaging_frames(snapshot, self.averaging_window.value())
         self.averaging_frames.setText("—" if frames <= 0 else f"≈ {frames} кадров")
         self.averaging_notice.setText(
@@ -556,13 +618,13 @@ class MeasurementPanel(DockTab):
 
     def _remove_trace(self, slot: SlotRef) -> None:
         curve = self._curves.pop(slot, None)
+        self._colors.pop(slot, None)
         if curve is not None:
             self.plot.removeItem(curve)
-        for collection in (self._bands, self._range_bands):
-            band = collection.pop(slot, None)
-            if band is not None:
-                for item in band:
-                    self.plot.removeItem(item)
+        band = self._bands.pop(slot, None)
+        if band is not None:
+            for item in band:
+                self.plot.removeItem(item)
 
     def _update_graph(self, snapshot: AppSnapshot) -> None:
         selected = self.selected_slots()
@@ -572,6 +634,7 @@ class MeasurementPanel(DockTab):
             self.plot.hide()
             self.empty_graph_label.show()
             self.averaging_n.setText(texts.UNKNOWN)
+            self.graph_resolution.setText(texts.UNKNOWN)
             return
         model = models.measurement_history_graph_model(
             snapshot,
@@ -587,6 +650,7 @@ class MeasurementPanel(DockTab):
             if slot not in selected_set:
                 self._remove_trace(slot)
 
+        band = self._band()
         for index, trace in enumerate(model.traces):
             curve = self._curves.get(trace.slot)
             if curve is None:
@@ -596,22 +660,27 @@ class MeasurementPanel(DockTab):
                     name=texts.slot_label(trace.slot.channel, trace.slot.position),
                 )
                 self._curves[trace.slot] = curve
-                self._range_bands[trace.slot] = self._new_band(color, alpha=24)
-                self._bands[trace.slot] = self._new_band(color, alpha=45)
-            if not unchanged:
-                curve.setData(model.t_s, trace.values_nm, connect="finite")
-                extrema = self._range_bands[trace.slot]
-                extrema[0].setData(model.t_s, trace.max_nm, connect="finite")
-                extrema[1].setData(model.t_s, trace.min_nm, connect="finite")
-                sigma_band = self._bands[trace.slot]
-                sigma_band[0].setData(model.t_s, trace.values_nm + trace.sigma_nm, connect="finite")
-                sigma_band[1].setData(model.t_s, trace.values_nm - trace.sigma_nm, connect="finite")
-            for item in self._range_bands[trace.slot]:
-                item.setVisible(True)
-            for item in self._bands[trace.slot]:
-                item.setVisible(
-                    self.averaging_enabled.isChecked() and self.averaging_sigma.isChecked()
+                self._colors[trace.slot] = color
+                unchanged = False
+            if band != GRAPH_BAND_NONE and trace.slot not in self._bands:
+                color = self._colors[trace.slot]
+                self._bands[trace.slot] = self._new_band(
+                    color, alpha=45 if band == GRAPH_BAND_SIGMA else 24
                 )
+                unchanged = False
+            if unchanged:
+                continue
+            curve.setData(model.t_s, trace.values_nm, connect="finite")
+            upper_lower = self._bands.get(trace.slot)
+            if upper_lower is None:
+                continue
+            if band == GRAPH_BAND_SIGMA:
+                upper = trace.values_nm + trace.sigma_nm
+                lower = trace.values_nm - trace.sigma_nm
+            else:
+                upper, lower = trace.max_nm, trace.min_nm
+            upper_lower[0].setData(model.t_s, upper, connect="finite")
+            upper_lower[1].setData(model.t_s, lower, connect="finite")
 
         counts: list[int] = []
         for trace in model.traces:
@@ -624,7 +693,13 @@ class MeasurementPanel(DockTab):
         else:
             self.averaging_n.setText(texts.UNKNOWN)
 
-        self.range_controls.apply_time_axis(model.t_s)
+        if model.t_first_s is not None and model.t_last_s is not None:
+            self.range_controls.apply_time_bounds(model.t_first_s, model.t_last_s)
+        else:
+            self.range_controls.apply_time_axis(model.t_s)
+        self.graph_resolution.setText(
+            texts.graph_resolution(model.resolution_s, self._averaging_window_s())
+        )
         missing = [
             trace.slot
             for trace in model.traces
@@ -861,6 +936,8 @@ class MeasurementPanel(DockTab):
         self._update_table(snapshot)
         self._update_recording(snapshot)
         self._update_quality(snapshot)
+        # Запрос на следующий такт: в ручном режиме область двигает мышь.
+        self._sync_view_request()
 
     def wait_for_background_work(self) -> None:
         thread = self._average_thread

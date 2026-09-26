@@ -260,6 +260,7 @@ def test_полоса_sigma_имеет_непустой_путь_и_разрыв
         lambda0_key=((0, 0, 1550.0),),
     )
     monkeypatch.setattr(models, "measurement_history_graph_model", lambda *args, **kwargs: graph)
+    panel.band_mode.setCurrentIndex(panel.band_mode.findData("sigma"))
     panel.averaging_enabled.blockSignals(True)
     panel.averaging_enabled.setChecked(True)
     panel.averaging_window.setValue(100.0)
@@ -341,16 +342,14 @@ def test_усреднение_измерения_выключено_по_умо�
 ) -> None:
     assert not panel.averaging_enabled.isChecked()
     assert panel.averaging_window.value() == pytest.approx(models.DEFAULT_AVERAGING_MS)
-    assert panel.averaging_sigma.isChecked()
+    assert panel.band_mode.currentData() == "none"
     assert panel.averaging_window.isEnabled()
-    assert not panel.averaging_sigma.isEnabled()
     assert panel.averaging_n.text() == texts.UNKNOWN
     assert texts.LABEL_RECORD_DECIMATION == "Децимация записи"
 
     panel.averaging_enabled.setChecked(True)
     panel.refresh(controller.snapshot(include_sensor_data=False))
     assert panel.averaging_window.isEnabled()
-    assert panel.averaging_sigma.isEnabled()
     assert "100" in panel.averaging_frames.text()
 
 

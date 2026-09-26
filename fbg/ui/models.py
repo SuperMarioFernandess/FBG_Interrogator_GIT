@@ -13,6 +13,7 @@ import math
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 
 import numpy as np
@@ -744,6 +745,12 @@ class MeasurementHistoryGraphModel:
     averaging_window_s: float | None
     selected: tuple[SlotRef, ...]
     lambda0_key: tuple[tuple[int, int, float], ...]
+    view_key: tuple[object, ...] = ()
+    resolution_s: float | None = None
+    """Фактический интервал одной точки на экране: окно W либо уровень пирамиды."""
+    t_first_s: float | None = None
+    t_last_s: float | None = None
+    """Границы **всей** истории в координатах графика, а не скопированной области."""
 
 
 @dataclass(frozen=True)
@@ -756,13 +763,24 @@ class _CompressedView:
     max_nm: np.ndarray
     sigma_nm: np.ndarray
     n: np.ndarray
+    resolution_s: float
+    pooled_level: bool
+    """Строки — грубый уровень пирамиды, а не окна W и не базовые 100 мс."""
 
 
 def _compressed_view(
     history: CompressedHistorySnapshot,
     averaging_window_s: float | None,
 ) -> _CompressedView:
-    if averaging_window_s is None:
+    """Строки для экрана: уровень пирамиды как есть либо свёрнутый в окна W.
+
+    Окна W строятся только если строки не грубее W; иначе снимок уже взят
+    с уровня грубее окна (``history.view``), и мельче его показывать нечего.
+    """
+    aggregate = averaging_window_s is not None and averaging_window_s >= history.interval_s * (
+        1.0 - 1e-9
+    )
+    if not aggregate:
         return _CompressedView(
             history.start_mono,
             history.stop_mono,
@@ -772,7 +790,10 @@ def _compressed_view(
             history.max_nm,
             history.sigma_nm,
             history.n,
+            history.interval_s,
+            history.level > 0,
         )
+    assert averaging_window_s is not None
     averaged: HistoryAggregate = aggregate_history(history, averaging_window_s)
     return _CompressedView(
         averaged.start_mono,
@@ -783,7 +804,16 @@ def _compressed_view(
         averaged.max_nm,
         averaged.sigma_nm,
         averaged.n,
+        averaging_window_s,
+        False,
     )
+
+
+def _history_bounds(history: CompressedHistorySnapshot, origin: float) -> tuple[float, float]:
+    """Границы всей истории на оси графика; у ручных снимков — границы строк."""
+    first = history.first_mono if history.first_mono is not None else float(history.start_mono[0])
+    last = history.last_mono if history.last_mono is not None else float(history.stop_mono[-1])
+    return first - origin, last - origin
 
 
 def _history_axis(
@@ -792,25 +822,26 @@ def _history_axis(
     segment: np.ndarray,
     origin_mono: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Добавляет строку-разрыв между сегментами и возвращает карту исходных строк."""
+    """Добавляет строку-разрыв между сегментами и возвращает карту исходных строк.
+
+    Векторно: прежний цикл по всем строкам истории при любом разрыве стоил
+    O(истории) на такте.
+    """
     rows = int(start_mono.size)
     if rows == 0:
         return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.int64)
     centers = (start_mono + stop_mono) / 2.0 - origin_mono
-    transitions = np.flatnonzero(segment[1:] != segment[:-1]) if rows > 1 else np.empty(0, int)
+    if rows == 1:
+        return centers, np.zeros(1, dtype=np.int64)
+    transitions = np.flatnonzero(segment[1:] != segment[:-1])
+    mapping = np.arange(rows, dtype=np.int64)
     if transitions.size == 0:
-        return centers, np.arange(rows, dtype=np.int64)
-    transition_set = {int(value) for value in transitions}
-    expanded_t: list[float] = []
-    mapping: list[int] = []
-    for index in range(rows):
-        expanded_t.append(float(centers[index]))
-        mapping.append(index)
-        if index in transition_set:
-            gap_t = (float(stop_mono[index]) + float(start_mono[index + 1])) / 2.0 - origin_mono
-            expanded_t.append(gap_t)
-            mapping.append(-1)
-    return np.asarray(expanded_t, dtype=np.float64), np.asarray(mapping, dtype=np.int64)
+        return centers, mapping
+    gap_t = (stop_mono[transitions] + start_mono[transitions + 1]) / 2.0 - origin_mono
+    return (
+        np.insert(centers, transitions + 1, gap_t),
+        np.insert(mapping, transitions + 1, -1),
+    )
 
 
 def _expand_float(values: np.ndarray, mapping: np.ndarray) -> np.ndarray:
@@ -848,6 +879,7 @@ def measurement_history_graph_model(
     history = snapshot.measurement_history
     version = -1 if history is None else history.version
     running = False if history is None else history.running
+    view_key = () if history is None else history.view_key
     if (
         previous is not None
         and previous.version == version
@@ -856,10 +888,12 @@ def measurement_history_graph_model(
         and previous.averaging_window_s == averaging_window_s
         and previous.selected == selected_tuple
         and previous.lambda0_key == lambda0_key
+        and previous.view_key == view_key
     ):
         return previous
     if history is None or history.windows == 0:
         low, high = _visible_y_range(())
+        bounds = _empty_history_bounds(history)
         return MeasurementHistoryGraphModel(
             np.empty(0),
             (),
@@ -871,6 +905,9 @@ def measurement_history_graph_model(
             averaging_window_s,
             selected_tuple,
             lambda0_key,
+            view_key,
+            None if history is None else history.interval_s,
+            *bounds,
         )
 
     view = _compressed_view(history, averaging_window_s)
@@ -878,6 +915,7 @@ def measurement_history_graph_model(
     if origin is None:
         origin = float(view.start_mono[0]) if view.start_mono.size else 0.0
     t_s, mapping = _history_axis(view.start_mono, view.stop_mono, view.segment, origin)
+    t_first, t_last = _history_bounds(history, origin)
     columns = {SlotRef(*slot): index for index, slot in enumerate(history.positions)}
     lambda0 = {(channel, position): value for channel, position, value in lambda0_key}
     traces: list[MeasurementHistoryTrace] = []
@@ -936,7 +974,24 @@ def measurement_history_graph_model(
         averaging_window_s,
         selected_tuple,
         lambda0_key,
+        view_key,
+        view.resolution_s,
+        t_first,
+        t_last,
     )
+
+
+def _empty_history_bounds(
+    history: CompressedHistorySnapshot | None,
+) -> tuple[float | None, float | None]:
+    if (
+        history is None
+        or history.origin_mono is None
+        or history.first_mono is None
+        or history.last_mono is None
+    ):
+        return None, None
+    return history.first_mono - history.origin_mono, history.last_mono - history.origin_mono
 
 
 def averaged_slot_wavelength(
@@ -1003,6 +1058,22 @@ def measurement_current_wavelengths(
         if finite.size:
             result[SlotRef(*pair)] = float(view.mean_nm[int(finite[-1]), column])
     return result
+
+
+def current_wavelength_texts(snapshot: AppSnapshot) -> dict[SlotRef, str]:
+    """Текст текущей λ только для слотов с пиком в последнем кадре.
+
+    Слот без пика в словарь не попадает: панель сама ставит прочерк там, где
+    число было и пропало, и не трогает остальные ~110 пустых слотов на такте.
+    """
+    if snapshot.ui is None:
+        return {}
+    wavelengths = np.asarray(snapshot.ui.wavelength_nm, dtype=np.float64)
+    channels, positions = np.nonzero(np.isfinite(wavelengths))
+    return {
+        SlotRef(int(channel), int(position)): f"{float(wavelengths[channel, position]):.6f}"
+        for channel, position in zip(channels, positions, strict=True)
+    }
 
 
 @dataclass(frozen=True)
@@ -1370,6 +1441,10 @@ class SensorHistoryGraphModel:
     running: bool
     averaging_window_s: float | None
     selected: tuple[str, ...]
+    view_key: tuple[object, ...] = ()
+    resolution_s: float | None = None
+    t_first_s: float | None = None
+    t_last_s: float | None = None
 
 
 def _sensor_polynomial(sensor: Sensor, wavelength_nm: np.ndarray) -> np.ndarray:
@@ -1382,7 +1457,18 @@ def _sensor_wavelength_series(
     history: CompressedHistorySnapshot,
     view: _CompressedView,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Находит ровно один слот в окне датчика для каждого интервала истории."""
+    """Находит ровно один слот в окне датчика для каждого интервала истории.
+
+    На базовом уровне и в окнах W критерий прежний (чат №20): среднее слота
+    в окне датчика и кандидат ровно один. На **грубом уровне пирамиды** он
+    строже, потому что свёртка идёт по слоту, а слоты переставляются (Р30):
+    если внутри 100-секундного интервала решётка переехала в соседний слот,
+    среднее слота смешает две решётки. Грубая строка принимается, только если
+    огибающая выбранного слота целиком лежит в окне, а огибающая остальных
+    окна не касается. Тогда в каждом базовом интервале внутри неё выбран тот
+    же слот, и результат **в точности** равен свёртке базовых значений
+    датчика. Иначе — NaN: смесь решёток не выдаётся за измерение (№7).
+    """
     columns = [
         column
         for column, (channel, _position) in enumerate(history.positions)
@@ -1397,13 +1483,21 @@ def _sensor_wavelength_series(
     if not columns or rows == 0:
         return mean, minimum, maximum, sigma, count
     selected = np.asarray(columns, dtype=np.intp)
-    wavelengths = view.mean_nm[:, selected]
-    inside = np.isfinite(wavelengths) & (
-        np.abs(wavelengths - sensor.expected_nm) <= sensor.window_nm
-    )
-    candidates = np.count_nonzero(inside, axis=1)
+    low_nm, high_nm = sensor.expected_nm - sensor.window_nm, sensor.expected_nm + sensor.window_nm
+    if view.pooled_level:
+        low_env = view.min_nm[:, selected]
+        high_env = view.max_nm[:, selected]
+        present = np.isfinite(low_env) & np.isfinite(high_env)
+        inside = present & (low_env >= low_nm) & (high_env <= high_nm)
+        touches = present & (high_env >= low_nm) & (low_env <= high_nm)
+        ok = (np.count_nonzero(inside, axis=1) == 1) & (np.count_nonzero(touches, axis=1) == 1)
+    else:
+        wavelengths = view.mean_nm[:, selected]
+        inside = np.isfinite(wavelengths) & (
+            np.abs(wavelengths - sensor.expected_nm) <= sensor.window_nm
+        )
+        ok = np.count_nonzero(inside, axis=1) == 1
     chosen = np.argmax(inside, axis=1)
-    ok = candidates == 1
     if not np.any(ok):
         return mean, minimum, maximum, sigma, count
     rows_idx = np.flatnonzero(ok)
@@ -1469,6 +1563,7 @@ def sensor_history_graph_model(
     history = snapshot.sensor_wavelength_history
     version = -1 if history is None else history.version
     running = False if history is None else history.running
+    view_key = () if history is None else history.view_key
     if (
         previous is not None
         and previous.version == version
@@ -1476,11 +1571,21 @@ def sensor_history_graph_model(
         and previous.running == running
         and previous.averaging_window_s == averaging_window_s
         and previous.selected == selected
+        and previous.view_key == view_key
     ):
         return previous
     if history is None or history.windows == 0:
         return SensorHistoryGraphModel(
-            np.empty(0), (), version, snapshot.sensor_version, running, averaging_window_s, selected
+            np.empty(0),
+            (),
+            version,
+            snapshot.sensor_version,
+            running,
+            averaging_window_s,
+            selected,
+            view_key,
+            None if history is None else history.interval_s,
+            *_empty_history_bounds(history),
         )
 
     view = _compressed_view(history, averaging_window_s)
@@ -1488,6 +1593,7 @@ def sensor_history_graph_model(
     if origin is None:
         origin = float(view.start_mono[0]) if view.start_mono.size else 0.0
     t_s, mapping = _history_axis(view.start_mono, view.stop_mono, view.segment, origin)
+    t_first, t_last = _history_bounds(history, origin)
     by_id = {sensor.id: sensor for sensor in snapshot.sensors}
     needed: list[str] = [sensor_id for sensor_id in selected if sensor_id in by_id]
     for sensor_id in tuple(needed):
@@ -1565,6 +1671,10 @@ def sensor_history_graph_model(
         running,
         averaging_window_s,
         selected,
+        view_key,
+        view.resolution_s,
+        t_first,
+        t_last,
     )
 
 
@@ -2403,3 +2513,118 @@ def spectrum_model(block: AdcBlock, profile: DeviceProfile, threshold_adc: int) 
         int(np.count_nonzero(saturated_mask)),
         tuple(regions),
     )
+
+
+# --------------------------------------------------------------------------------------
+# Выбранный пик и ввод чисел на вкладке «Датчики» (Р89)
+# --------------------------------------------------------------------------------------
+
+PEAK_TRACK_MAX_TOLERANCE_NM = 0.5
+"""Верхний предел допуска слежения за выбранным пиком.
+
+Квант положения пика около 8 пм (``peak_quantization_ghz = 1`` ГГц): 0.5 нм —
+это ~60 квантов на дрожание и дрейф между тактами и около 50 °C дрейфа
+температурной решётки за время, пока пик отсутствовал. Сверху допуск ещё
+ограничен половиной расстояния до ближайшего соседа (см. ``peak_tolerance_nm``).
+"""
+
+
+class PeakTrackStatus(StrEnum):
+    """Состояние выбора «Текущий пик»."""
+
+    NONE = "none"
+    FOUND = "found"
+    LOST = "lost"
+    AMBIGUOUS = "ambiguous"
+
+
+@dataclass(frozen=True)
+class PeakTrack:
+    """Выбор пика, привязанный к решётке, а не к числу.
+
+    ``wavelength_nm`` — λ пика в последнем кадре, где он был найден: при
+    ``FOUND`` она обновляется каждым тактом, при ``LOST``/``AMBIGUOUS`` остаётся
+    последней известной и служит только центром поиска. ``index`` — номер пика
+    в отсортированном списке текущего кадра, ``-1`` если пика нет.
+    """
+
+    status: PeakTrackStatus = PeakTrackStatus.NONE
+    wavelength_nm: float | None = None
+    index: int = -1
+    tolerance_nm: float = PEAK_TRACK_MAX_TOLERANCE_NM
+
+    @property
+    def usable(self) -> bool:
+        """Можно ли взять λ этого пика для калибровки или λ₀."""
+        return self.status is PeakTrackStatus.FOUND
+
+
+def peak_tolerance_nm(peaks: np.ndarray, index: int) -> float:
+    """Допуск слежения: ``min(0.5 нм, половина расстояния до ближайшего соседа)``.
+
+    Половина расстояния — гарантия, а не эвристика: если выбранный пик
+    пропадёт, его сосед окажется дальше допуска и выбор не перейдёт на него.
+    На линии заказчика ближайшая пара 1549.68/1551.35 даёт 0.835 нм, и работает
+    потолок 0.5 нм; паразитный пик 1545.34 рядом с 1544.78 (N19) сужает допуск
+    до 0.28 нм — по-прежнему в 35 раз больше кванта.
+    """
+    values = np.asarray(peaks, dtype=np.float64)
+    tolerance = PEAK_TRACK_MAX_TOLERANCE_NM
+    if values.size > 1:
+        others = np.delete(values, index)
+        tolerance = min(tolerance, float(np.min(np.abs(others - values[index]))) / 2.0)
+    return tolerance
+
+
+def select_peak(peaks: np.ndarray, index: int) -> PeakTrack:
+    """Явный выбор оператора из списка текущего кадра."""
+    values = np.asarray(peaks, dtype=np.float64)
+    if not 0 <= index < values.size:
+        return PeakTrack()
+    return PeakTrack(
+        PeakTrackStatus.FOUND,
+        float(values[index]),
+        index,
+        peak_tolerance_nm(values, index),
+    )
+
+
+def follow_peak(track: PeakTrack, peaks: np.ndarray) -> PeakTrack:
+    """Сопоставляет выбранный пик с пиками нового кадра.
+
+    Ровно один пик в допуске — выбор держится и его λ обновляется. Ни одного —
+    выбор потерян, но **ни на какой другой пик не переходит** (№43). Два и
+    больше — неоднозначно, брать нельзя. Когда пик вернётся в допуск, выбор
+    восстановится на нём же.
+    """
+    if track.status is PeakTrackStatus.NONE or track.wavelength_nm is None:
+        return PeakTrack()
+    values = np.asarray(peaks, dtype=np.float64)
+    distance = np.abs(values - track.wavelength_nm)
+    candidates = np.flatnonzero(distance <= track.tolerance_nm)
+    if candidates.size == 0:
+        return PeakTrack(PeakTrackStatus.LOST, track.wavelength_nm, -1, track.tolerance_nm)
+    if candidates.size > 1:
+        return PeakTrack(PeakTrackStatus.AMBIGUOUS, track.wavelength_nm, -1, track.tolerance_nm)
+    return select_peak(values, int(candidates[0]))
+
+
+def parse_user_number(text: str) -> float:
+    """Число, набранное человеком в русской или английской раскладке.
+
+    Принимается одна десятичная запятая или точка: «20,5» и «20.5» дают 20.5.
+    Разделители тысяч не принимаются — «1,234.5» отвергается, а не читается
+    как 1.2345. Пустой ввод, бесконечность и NaN — ``ValueError``.
+    """
+    stripped = text.strip().replace("\u2212", "-")
+    if not stripped:
+        raise ValueError("пустое значение")
+    if stripped.count(",") + stripped.count(".") > 1:
+        raise ValueError(f"не число: {text!r}")
+    try:
+        value = float(stripped.replace(",", "."))
+    except ValueError as exc:
+        raise ValueError(f"не число: {text!r}") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"не конечное число: {text!r}")
+    return value
