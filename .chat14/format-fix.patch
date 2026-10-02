@@ -1,0 +1,36 @@
+--- a/tests/test_recorder.py
++++ b/tests/test_recorder.py
+@@ -385,9 +385,7 @@
+     recorder.close()
+ 
+     marks = gap_lines(recorder.path)  # type: ignore[arg-type]
+-    assert marks == [
+-        "# GAP frames=unknown t_mono_from=10.001500 t_mono_to=20.000000"
+-    ]
++    assert marks == ["# GAP frames=unknown t_mono_from=10.001500 t_mono_to=20.000000"]
+     assert frame_numbers([recorder.path]) == list(range(7))  # type: ignore[list-item]
+     assert recorder.stats.gaps == 1
+     assert recorder.stats.lost_frames == 0, "неизвестное число кадров нельзя выдавать за оценку"
+--- a/tests/test_session.py
++++ b/tests/test_session.py
+@@ -1125,8 +1125,7 @@
+         stand.sim.go_silent(0.6)
+         stand.sim.reboot()
+         assert wait_until(
+-            lambda: stand.session.stream_recovery_outcome
+-            is StreamRecoveryOutcome.BLOCKED_CONFIG
++            lambda: stand.session.stream_recovery_outcome is StreamRecoveryOutcome.BLOCKED_CONFIG
+         )
+         assert stand.session.state is SessionState.IDLE
+         assert not stand.sim.streaming
+--- a/tests/test_ui_widgets.py
++++ b/tests/test_ui_widgets.py
+@@ -199,7 +199,9 @@
+         assert panel.disconnect_button.isEnabled()
+         assert panel.disconnect_button.text() == texts.BUTTON_CANCEL_RECOVERY
+ 
+-    panel.refresh(models.AppSnapshot(endpoint=endpoint, profile=DeviceProfile(), state=SessionState.IDLE))
++    panel.refresh(
++        models.AppSnapshot(endpoint=endpoint, profile=DeviceProfile(), state=SessionState.IDLE)
++    )
+     assert panel.disconnect_button.text() == texts.BUTTON_DISCONNECT
